@@ -11,6 +11,8 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dflash2.lookup import (
@@ -33,6 +35,22 @@ def _requires_sm70_tail(device: torch.device, num_steps: int) -> bool:
 
 
 @triton.jit
+def _proposal_nucleus_logits(
+    scores,
+    mask,
+    top_p: tl.constexpr,
+):
+    sorted_scores = tl.sort(tl.where(mask, scores, float("-inf")), descending=True)
+    row_max = tl.max(sorted_scores, axis=0)
+    unnormalized = tl.exp(sorted_scores - row_max)
+    probs = unnormalized / tl.sum(unnormalized, axis=0)
+    cumulative_before = tl.cumsum(probs, axis=0) - probs
+    keep_sorted = cumulative_before < top_p
+    cutoff = tl.min(tl.where(keep_sorted, sorted_scores, float("inf")), axis=0)
+    return tl.where(mask & (scores >= cutoff), scores, float("-inf"))
+
+
+@triton.jit
 def _selector_walk_kernel(
     scores_ptr,
     candidate_ptr,
@@ -49,6 +67,8 @@ def _selector_walk_kernel(
     BLOCK_K: tl.constexpr,
     SAMPLE_PROBABILISTIC: tl.constexpr,
     USE_FP64: tl.constexpr,
+    PROPOSAL_TEMPERATURE_SCALE: tl.constexpr,
+    PROPOSAL_TOP_P: tl.constexpr,
 ):
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_K)
@@ -65,12 +85,15 @@ def _selector_walk_kernel(
             scores_ptr + score_base + offsets,
             mask=mask & valid,
             other=float("-inf"),
-        ).to(tl.float64 if USE_FP64 else tl.float32)
+        ).to(tl.float32)
         if SAMPLE_PROBABILISTIC and temperature != 0.0:
             # Cache the exact temperature-applied proposal scores expected by
             # the shared rejection sampler. This keeps Eagle/MTP's established
             # contract unchanged while matching the DFlash2 selector draw.
-            scores = scores / temperature
+            scores = scores / (temperature * PROPOSAL_TEMPERATURE_SCALE)
+            if PROPOSAL_TOP_P < 1.0:
+                scores = _proposal_nucleus_logits(scores, mask, PROPOSAL_TOP_P)
+        scores = scores.to(tl.float64 if USE_FP64 else tl.float32)
         candidate_base = flat * top_k
         candidates = tl.load(
             candidate_ptr + candidate_base + offsets,
@@ -78,7 +101,7 @@ def _selector_walk_kernel(
             other=0,
         )
 
-        # Candidate token IDs key the noise, matching the target sampler.
+        # Candidate token IDs key an independent draft-noise stream.
         position = tl.load(sample_pos_ptr + flat) - 1
         _, index = gumbel_noised_argmax(
             scores,
@@ -87,6 +110,7 @@ def _selector_walk_kernel(
             seed,
             position,
             temperature if SAMPLE_PROBABILISTIC else 0.0,
+            IS_DRAFTING=True,
             USE_FP64=USE_FP64,
             APPLY_TEMPERATURE=False,
         )
@@ -120,6 +144,8 @@ def _selector_walk_tail_kernel(
     BLOCK_K: tl.constexpr,
     SAMPLE_PROBABILISTIC: tl.constexpr,
     USE_FP64: tl.constexpr,
+    PROPOSAL_TEMPERATURE_SCALE: tl.constexpr,
+    PROPOSAL_TOP_P: tl.constexpr,
 ):
     """Write the final dependent slot separately on SM70.
 
@@ -142,15 +168,19 @@ def _selector_walk_tail_kernel(
         scores_ptr + score_base + offsets,
         mask=mask & valid,
         other=float("-inf"),
-    ).to(tl.float64 if USE_FP64 else tl.float32)
+    ).to(tl.float32)
     if SAMPLE_PROBABILISTIC and temperature != 0.0:
-        scores = scores / temperature
+        scores = scores / (temperature * PROPOSAL_TEMPERATURE_SCALE)
+        if PROPOSAL_TOP_P < 1.0:
+            scores = _proposal_nucleus_logits(scores, mask, PROPOSAL_TOP_P)
+    scores = scores.to(tl.float64 if USE_FP64 else tl.float32)
     candidate_base = flat * top_k
     candidates = tl.load(
         candidate_ptr + candidate_base + offsets,
         mask=mask & valid,
         other=0,
     )
+    # Candidate token IDs key an independent draft-noise stream.
     position = tl.load(sample_pos_ptr + flat) - 1
     _, index = gumbel_noised_argmax(
         scores,
@@ -159,6 +189,7 @@ def _selector_walk_tail_kernel(
         seed,
         position,
         temperature if SAMPLE_PROBABILISTIC else 0.0,
+        IS_DRAFTING=True,
         USE_FP64=USE_FP64,
         APPLY_TEMPERATURE=False,
     )
@@ -324,8 +355,33 @@ class DFlash2Speculator(DFlashSpeculator):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        self._context_kv_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._context_compute_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._context_store_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._context_projected_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._context_target_positions: torch.Tensor | None = None
+        self._prepared_context_batch: InputBatch | None = None
+        self._draft_metadata_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self._debug_token_dump_count = 0
         draft_config = self.draft_model_config.hf_config.dflash_config
         self.selector_top_k = int(draft_config["selector_top_k"])
+        self.proposal_temperature_scale = (
+            envs.VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE
+        )
+        self.proposal_top_p = envs.VLLM_SM70_DFLASH2_PROPOSAL_TOP_P
+        if self.proposal_temperature_scale <= 0.0:
+            raise ValueError(
+                "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE must be positive"
+            )
+        if not 0.0 < self.proposal_top_p <= 1.0:
+            raise ValueError("VLLM_SM70_DFLASH2_PROPOSAL_TOP_P must be in (0, 1]")
+        if self.proposal_temperature_scale != 1.0 or self.proposal_top_p != 1.0:
+            logger.info_once(
+                "Using DFlash2 proposal calibration: temperature_scale=%.3f, "
+                "top_p=%.3f. Cached q logits preserve exact rejection sampling.",
+                self.proposal_temperature_scale,
+                self.proposal_top_p,
+            )
         self._anchor_indices = (
             torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
             * self.num_query_per_req
@@ -352,7 +408,7 @@ class DFlash2Speculator(DFlashSpeculator):
         )
         self._cached_candidate_scores = None
         if (
-            self.draft_logits is not None
+            self._draft_logits_init is not None
             and envs.VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION
         ):
             self._cached_candidate_scores = torch.full(
@@ -364,6 +420,34 @@ class DFlash2Speculator(DFlashSpeculator):
         self._selector_path_state = torch.empty(
             self.max_num_reqs, dtype=torch.int32, device=device
         )
+        self._debug_backbone_hidden_states: torch.Tensor | None = None
+        self._debug_candidate_ids: torch.Tensor | None = None
+        self._debug_unary_logits: torch.Tensor | None = None
+        self._debug_lattice_scores: torch.Tensor | None = None
+        if getattr(self, "_debug_tensor_dump_dir", ""):
+            packed_shape = (
+                self.max_num_reqs,
+                self.draft_block,
+                self.selector_top_k,
+            )
+            self._debug_backbone_hidden_states = torch.empty(
+                self.max_num_reqs,
+                self.draft_block,
+                self.hidden_size,
+                dtype=self.dtype,
+                device=device,
+            )
+            self._debug_candidate_ids = torch.empty(
+                packed_shape, dtype=torch.int64, device=device
+            )
+            self._debug_unary_logits = torch.empty(
+                packed_shape, dtype=torch.float32, device=device
+            )
+            self._debug_lattice_scores = torch.empty(
+                (*packed_shape, self.selector_top_k),
+                dtype=torch.float32,
+                device=device,
+            )
         self._alignment_candidate_ids: torch.Tensor | None = None
         self._alignment_unary_logits: torch.Tensor | None = None
         self._alignment_lattice_scores: torch.Tensor | None = None
@@ -388,10 +472,6 @@ class DFlash2Speculator(DFlashSpeculator):
                 device=device,
             )
         self._use_sm70_tail = _requires_sm70_tail(device, self.draft_block)
-        if self.draft_logits is not None:
-            # The cache kernel writes only K columns; all other vocabulary
-            # columns must remain impossible.
-            self.draft_logits.fill_(-float("inf"))
 
         self._ngram_assist: DFlash2NgramAssist | None = None
         self._ngram_num_hits = 0
@@ -676,6 +756,201 @@ class DFlash2Speculator(DFlashSpeculator):
         reason = "strong-copy" if self._lookup_long_active else "adaptive-default"
         return self._record_lookup_width(width, reason)
 
+    def capture(self) -> None:
+        super().capture()
+        if (
+            not (
+                envs.VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH
+                or envs.VLLM_SM70_DFLASH2_CONTEXT_PIPELINE
+            )
+            or self.device.type != "cuda"
+            or torch.cuda.get_device_capability(self.device) != (7, 0)
+            or self.num_query_per_req != 8
+            or self.query_cudagraph_manager is None
+            or not self.query_cudagraph_manager.graphs
+        ):
+            return
+        # Match the existing FULL query graphs, rather than a model name or a
+        # concurrency whitelist. Context graphs use exact real token counts;
+        # padding target context would otherwise write stale rejected rows.
+        shapes = sorted(
+            {
+                (desc.num_reqs, desc.num_tokens)
+                for desc in self.query_cudagraph_manager.graphs
+                if desc.cg_mode == CUDAGraphMode.FULL
+                and desc.num_reqs is not None
+                and desc.num_tokens == desc.num_reqs * self.num_query_per_req
+                and desc.num_tokens <= self.hidden_states.shape[0]
+            }
+        )
+        if not shapes:
+            return
+        # Capturing a write graph must not race multiple dummy rows into the
+        # null KV block. Real accepted slots are refreshed before each replay.
+        self._context_slot_mappings.fill_(PAD_SLOT_ID)
+        pipeline = envs.VLLM_SM70_DFLASH2_CONTEXT_PIPELINE
+        if pipeline:
+            self._context_target_positions = torch.zeros_like(
+                self.context_positions[: max(tokens for _, tokens in shapes)]
+            )
+        for _, num_tokens in shapes:
+            slots = (
+                [
+                    self._context_slot_mappings[i][:num_tokens]
+                    for i in self._layer_group_idx
+                ]
+                if self._layer_group_idx is not None
+                else self._context_slot_mappings[0][:num_tokens]
+            )
+            graph = torch.cuda.CUDAGraph()
+            # All inputs are persistent draft buffers refreshed by propose().
+            # Separate pools keep these intermediates independent of query graphs.
+            with torch.cuda.graph(graph):
+                super()._precompute_context_kv(
+                    self.hidden_states[:num_tokens],
+                    self.context_positions[:num_tokens],
+                    slots,
+                )
+            self._context_kv_graphs[num_tokens] = graph
+            if not pipeline:
+                continue
+            assert self._context_target_positions is not None
+            compute = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(compute):
+                all_k, all_v = self.model.model.compute_context_kv(
+                    self.hidden_states[:num_tokens],
+                    self._context_target_positions[:num_tokens],
+                )
+            write = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(write):
+                self.model.model.store_context_kv(all_k, all_v, slots)
+            self._context_compute_graphs[num_tokens] = compute
+            self._context_store_graphs[num_tokens] = write
+            self._context_projected_kv[num_tokens] = (all_k, all_v)
+        logger.info(
+            "SM70 DFlash2 context KV CUDA graphs captured for token counts %s; "
+            "pre-sampling projection=%s.",
+            sorted(self._context_kv_graphs),
+            pipeline,
+        )
+        self._capture_draft_metadata_graph(shapes)
+
+    def _capture_draft_metadata_graph(self, shapes: list[tuple[int, int]]) -> None:
+        from vllm.v1.attention.backends.flash_attn_v100 import (
+            FlashAttnV100Impl,
+            FlashAttnV100MetadataBuilder,
+        )
+
+        has_causal = (
+            any(self._group_causal.values())
+            if isinstance(self._group_causal, dict)
+            else self._group_causal
+        )
+        if self.block_tables.cp_size != 1 or has_causal:
+            return
+        if any(
+            not isinstance(a.impl, FlashAttnV100Impl)
+            or a.impl.use_triton_prefill
+            or not a.impl.use_flash_v100_prefill_paged
+            or a.impl.prefix_anchored_decode_window is not None
+            for a in self.model.model._attn_layers
+        ):
+            return
+        builders = []
+        for gid, groups in enumerate(self.attn_groups):
+            for group in groups:
+                builder = group.get_metadata_builder(0)
+                if (
+                    not isinstance(builder, FlashAttnV100MetadataBuilder)
+                    or not builder._is_dflash_draft_model
+                    or builder._flash_draft_buffer_shape is None
+                ):
+                    return
+                builders.append((gid, builder))
+        if not builders:
+            return
+        for num_reqs, num_tokens in shapes:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                for gid, builder in builders:
+                    builder.copy_dflash_graph_metadata(
+                        self.block_tables.input_block_tables[gid][:num_reqs],
+                        self.input_buffers.seq_lens[:num_reqs],
+                        self.input_buffers.query_start_loc[: num_reqs + 1],
+                    )
+            self._draft_metadata_graphs[num_reqs, num_tokens] = graph
+        logger.info("SM70 DFlash2 paged graph metadata refresh captured: %s.", shapes)
+
+    def _refresh_draft_graph_metadata(self, num_reqs: int, num_tokens: int) -> bool:
+        graph = self._draft_metadata_graphs.get((num_reqs, num_tokens))
+        if graph is None:
+            return False
+        # prepare_dflash_inputs refreshes real rows and zeroes padded seq_lens.
+        # Copy the entire captured batch so shrinking batches cannot retain
+        # another request's metadata from a previous replay.
+        graph.replay()
+        return True
+
+    def prepare_target_context(
+        self,
+        input_batch: InputBatch,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+    ) -> None:
+        self._prepared_context_batch = None
+        num_tokens = input_batch.num_tokens
+        graph = self._context_compute_graphs.get(num_tokens)
+        if (
+            graph is None
+            or input_batch.num_reqs * self.num_query_per_req != num_tokens
+            or input_batch.num_draft_tokens
+            != input_batch.num_reqs * (self.num_query_per_req - 1)
+            or np.any(input_batch.is_prefilling_np)
+            or np.any(input_batch.num_scheduled_tokens != self.num_query_per_req)
+        ):
+            return
+        if aux_hidden_states:
+            hidden_states = self._combine_aux_hidden_states(aux_hidden_states)
+        self.hidden_states[:num_tokens].copy_(hidden_states[:num_tokens])
+        assert self._context_target_positions is not None
+        self._context_target_positions[:num_tokens].copy_(
+            input_batch.positions[:num_tokens]
+        )
+        # Each request's accepted rows retain their original positions. Only
+        # after sampling does prepare_dflash_inputs mark rejected KV slots PAD.
+        graph.replay()
+        self._prepared_context_batch = input_batch
+        logger.info_once("Using SM70 DFlash2 context pipeline before target sampling.")
+
+    def _get_prepared_context_hidden(
+        self, input_batch: InputBatch
+    ) -> torch.Tensor | None:
+        if self._prepared_context_batch is input_batch:
+            return self.hidden_states[: input_batch.num_tokens]
+        return None
+
+    def _precompute_context_kv(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        slots: torch.Tensor | list[torch.Tensor | None] | None,
+    ) -> None:
+        num_tokens = hidden_states.shape[0]
+        prepared = self._prepared_context_batch
+        self._prepared_context_batch = None
+        if (
+            prepared is not None
+            and prepared.num_tokens == num_tokens
+            and slots is not None
+        ):
+            self._context_store_graphs[num_tokens].replay()
+            return
+        graph = self._context_kv_graphs.get(num_tokens)
+        if graph is not None and slots is not None:
+            graph.replay()
+            return
+        super()._precompute_context_kv(hidden_states, positions, slots)
+
     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
         # The selector walk and rejection sampler must consume identical scores.
         # BF16 rounding measurably changes candidate order, so keep this FP32.
@@ -710,6 +985,8 @@ class DFlash2Speculator(DFlashSpeculator):
             BLOCK_K=block_k,
             SAMPLE_PROBABILISTIC=self.draft_logits is not None,
             USE_FP64=self.use_fp64_gumbel,
+            PROPOSAL_TEMPERATURE_SCALE=self.proposal_temperature_scale,
+            PROPOSAL_TOP_P=self.proposal_top_p,
             num_warps=1,
         )
         if self._use_sm70_tail:
@@ -728,6 +1005,8 @@ class DFlash2Speculator(DFlashSpeculator):
                 BLOCK_K=block_k,
                 SAMPLE_PROBABILISTIC=self.draft_logits is not None,
                 USE_FP64=self.use_fp64_gumbel,
+                PROPOSAL_TEMPERATURE_SCALE=self.proposal_temperature_scale,
+                PROPOSAL_TOP_P=self.proposal_top_p,
                 num_warps=1,
             )
 
@@ -913,6 +1192,7 @@ class DFlash2Speculator(DFlashSpeculator):
             nmin_tail=self._lookup_nmin_tail,
             long_min=self._lookup_long_min,
             take_flags=self._lookup_take_flags,
+            probabilistic=self.draft_logits is not None,
         )
 
         draft_logits = self.draft_logits
@@ -974,6 +1254,14 @@ class DFlash2Speculator(DFlashSpeculator):
             hidden_states,
             anchor_token_ids,
         )
+        if self._debug_candidate_ids is not None:
+            assert self._debug_backbone_hidden_states is not None
+            assert self._debug_unary_logits is not None
+            assert self._debug_lattice_scores is not None
+            self._debug_backbone_hidden_states[:num_reqs].copy_(hidden_states)
+            self._debug_candidate_ids[:num_reqs].copy_(candidate_ids)
+            self._debug_unary_logits[:num_reqs].copy_(unary_logits)
+            self._debug_lattice_scores[:num_reqs].copy_(scores)
         if self._alignment_candidate_ids is not None:
             assert self._alignment_unary_logits is not None
             assert self._alignment_lattice_scores is not None
@@ -984,6 +1272,44 @@ class DFlash2Speculator(DFlashSpeculator):
         self.draft_tokens[:num_reqs, : self.draft_block].copy_(
             self._selector_tokens[:num_reqs]
         )
+        if (
+            getattr(self, "_debug_proposal_stages", False)
+            and getattr(self, "_debug_real_proposal", False)
+            and self._debug_token_dump_count < 2
+        ):
+            first_scores = scores[0, 0, 0]
+            first_unary = unary_logits[0, 0]
+            first_bilinear = first_scores - first_unary
+            greedy_path = []
+            predecessor = 0
+            for step in range(self.draft_block):
+                score_row = scores[0, step, predecessor]
+                successor = int(score_row.argmax().item())
+                greedy_path.append(
+                    (
+                        successor,
+                        int(candidate_ids[0, step, successor].item()),
+                        float(score_row[successor].item()),
+                    )
+                )
+                predecessor = successor
+            logger.info(
+                "DFlash2 token diagnostic: finite_hidden=%s max_abs_hidden=%s "
+                "query_input_ids=%s anchor_token_id=%s candidate_ids=%s "
+                "unary_logits=%s first_bilinear=%s first_total=%s "
+                "greedy_path=%s draft_tokens=%s",
+                bool(torch.isfinite(hidden_states).all().item()),
+                float(hidden_states.abs().max().item()),
+                self.input_buffers.input_ids[: self.num_query_per_req].tolist(),
+                int(anchor_token_ids[0].item()),
+                candidate_ids[0].tolist(),
+                unary_logits[0].tolist(),
+                first_bilinear.tolist(),
+                first_scores.tolist(),
+                greedy_path,
+                self.draft_tokens[0, : self.draft_block].tolist(),
+            )
+            self._debug_token_dump_count += 1
         if self.draft_block < self.num_speculative_steps:
             self.draft_tokens[:num_reqs, self.draft_block :].zero_()
         if self.draft_logits is not None:

@@ -26,7 +26,7 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     CapturedAttentionState,
-    get_uniform_token_count,
+    get_uniform_decode_token_count,
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
@@ -39,6 +39,27 @@ from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import (
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
 logger = init_logger(__name__)
+
+
+def _mtp_decode_warmup_request_sizes(
+    capture_sizes: list[int] | None,
+    decode_query_len: int,
+    max_num_reqs: int,
+) -> tuple[int, ...]:
+    """Return production request counts represented by verifier graph shapes."""
+    if decode_query_len <= 0 or max_num_reqs <= 0:
+        return ()
+
+    # A single-request decode is always a valid eager fallback even when the
+    # user disables graphs or supplies only prefill-oriented capture sizes.
+    request_sizes = {1}
+    for num_tokens in capture_sizes or ():
+        if num_tokens <= 0 or num_tokens % decode_query_len:
+            continue
+        num_reqs = num_tokens // decode_query_len
+        if 1 <= num_reqs <= max_num_reqs:
+            request_sizes.add(num_reqs)
+    return tuple(sorted(request_sizes))
 
 
 class EagleSpeculator:
@@ -237,11 +258,28 @@ class EagleSpeculator:
                 dummy_run(16)
                 warmed.append("mtp_draft_moe_prefill_m16")
 
-            # One real decode-shaped round executes the M5 verifier window
-            # followed by all three M1 continuation passes.
-            dummy_run(1, uniform_decode=True)
+            decode_query_len = 1 + self.num_speculative_steps
+            request_sizes = _mtp_decode_warmup_request_sizes(
+                self.vllm_config.compilation_config.cudagraph_capture_sizes,
+                decode_query_len,
+                self.max_num_reqs,
+            )
+            executed_request_sizes = []
+            for num_reqs in request_sizes:
+                num_tokens = decode_query_len * num_reqs
+                if num_tokens > self.max_num_tokens:
+                    continue
+                # Exercise the same verifier/draft row counts that production
+                # graphs advertise. This avoids a first-request JIT without
+                # tying the tuned MoE path to a fixed concurrency.
+                dummy_run(num_tokens, uniform_decode=True)
+                executed_request_sizes.append(num_reqs)
             torch.accelerator.synchronize()
-            warmed.append("mtp_draft_moe_decode_m5_m1")
+            if executed_request_sizes:
+                warmed.append(
+                    "mtp_draft_moe_decode_reqs_"
+                    + "_".join(str(size) for size in executed_request_sizes)
+                )
         except Exception as err:  # pragma: no cover - best-effort warmup
             logger.warning_once("SM70 V2 MTP MoE warmup skipped: %s", err)
             return ()
@@ -325,8 +363,7 @@ class EagleSpeculator:
     ) -> torch.Tensor:
         if draft_logits is not None:
             logits = self.model.compute_logits(hidden_states)
-            # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
-            # used for draft and target sampling.
+            # This drafter's position contract keys the proposed token at pos + 1.
             return gumbel_sample(
                 logits,
                 idx_mapping,
@@ -334,6 +371,7 @@ class EagleSpeculator:
                 self.seeds,
                 pos + 1,
                 apply_temperature=True,
+                is_drafting=True,
                 output_processed_logits=draft_logits,
                 output_processed_logits_col=draft_step,
                 use_fp64=self.use_fp64_gumbel,
@@ -525,6 +563,9 @@ class EagleSpeculator:
         attn_states: dict[BatchExecutionDescriptor, CapturedAttentionState],
     ) -> None:
         logger.info("Capturing model for Eagle speculator...")
+        prepare_decode = getattr(self.model, "prepare_sm70_decode_graph_model", None)
+        if prepare_decode is not None:
+            prepare_decode()
         # Reset indices to zeros to prevent stale values from prior
         # dummy runs to cause out-of-bounds indexing during capture.
         self.last_token_indices.zero_()
@@ -640,12 +681,13 @@ class EagleSpeculator:
 
         # When all requests are decoding (no true prefills), each has
         # num_speculative_steps + 1 tokens, enabling FULL graph replay.
-        uniform_token_count = get_uniform_token_count(
+        uniform_token_count = get_uniform_decode_token_count(
             num_reqs,
             # Use the actual number of tokens without padding added by
             # the target model during FULL cudagraph.
             input_batch.num_tokens,
             max_query_len,
+            has_prefill=bool(input_batch.is_prefilling_np.any()),
         )
         prefill_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.prefill_cudagraph_manager,

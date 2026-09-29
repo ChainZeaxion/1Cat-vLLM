@@ -4,12 +4,14 @@
 
 import json
 import os
+from typing import Final
 
 import torch
 from torch.nn import Parameter
 
 from vllm import _sm70_ops as sm70_ops
 from vllm import envs
+from vllm.config import get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -19,6 +21,10 @@ from vllm.model_executor.layers.fused_moe import (
     SharedExperts,
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.quantization.awq_qpn_sm70 import (
+    initialize_qpn_m1,
+    use_qpn_m1,
+)
 from vllm.model_executor.layers.quantization.sm70_moe_router import (
     Sm70MoeStageRoute,
     select_sm70_quantized_moe_route,
@@ -28,6 +34,47 @@ from vllm.model_executor.utils import set_weight_attrs
 logger = init_logger(__name__)
 
 _DEFAULT_PERSISTENT_MAX_TOKENS = 32
+_QWEN38_INDEXED_PREFILL_MIN_TOKENS: Final = 128
+_QWEN38_CHUNKED_W2_SUPPORTED_TOKENS: Final = (4096, 6144)
+
+
+def _resolve_persistent_max_tokens(
+    max_num_seqs: int,
+    verifier_width: int = 1,
+    override: int = 0,
+) -> int:
+    """Size resident decode/verifier scratch up to the legacy ceiling."""
+    scheduler_cap = max(1, int(max_num_seqs)) * max(1, int(verifier_width))
+    requested_cap = int(override)
+    if requested_cap <= 0:
+        return min(scheduler_cap, _DEFAULT_PERSISTENT_MAX_TOKENS)
+    return min(requested_cap, _DEFAULT_PERSISTENT_MAX_TOKENS)
+
+
+def _persistent_max_tokens_for_runtime() -> int:
+    vllm_config = get_current_vllm_config_or_none()
+    scheduler_config = None if vllm_config is None else vllm_config.scheduler_config
+    max_num_seqs = (
+        _DEFAULT_PERSISTENT_MAX_TOKENS
+        if scheduler_config is None
+        else scheduler_config.max_num_seqs
+    )
+    speculative_config = None if vllm_config is None else vllm_config.speculative_config
+    verifier_width = (
+        speculative_config.num_speculative_state_tokens() + 1
+        if speculative_config is not None and speculative_config.method == "mtp"
+        else 1
+    )
+    return _resolve_persistent_max_tokens(
+        max_num_seqs,
+        verifier_width,
+        envs.VLLM_SM70_AWQ_MOE_PERSISTENT_MAX_TOKENS,
+    )
+
+
+_QWEN38_TP4_NUM_EXPERTS = 512
+_QWEN38_TP4_W13_QWEIGHT_SHAPE = (2560, 40)
+_QWEN38_TP4_W2_QWEIGHT_SHAPE = (160, 320)
 
 
 def _log_runtime_route_once(message: str, *args) -> None:
@@ -36,11 +83,93 @@ def _log_runtime_route_once(message: str, *args) -> None:
     logger.info_once(message, *args)
 
 
+def _qwen38_active_grouped_layer_contract(
+    layer: RoutedExperts, group_size: int
+) -> bool:
+    return bool(
+        int(layer.moe_config.tp_size) == 4
+        and layer.sm70_num_experts == 512
+        and group_size == 32
+        and layer.sm70_hidden_logical_size == layer.sm70_w13_k_dim == 2560
+        and layer.sm70_w13_n_dim == 320
+        and layer.sm70_w2_k_dim == 160
+        and layer.sm70_w2_n_dim == 2560
+    )
+
+
+def _use_qwen38_active_grouped_decode(
+    layer: RoutedExperts, num_tokens: int, top_k: int
+) -> bool:
+    """Share the runtime admission policy with pre-capture warmup."""
+    max_tokens = envs.VLLM_SM70_AWQ_MOE_BATCHED_DECODE_MAX_TOKENS
+    return bool(
+        getattr(layer, "sm70_awq_qwen38_active_grouped_decode", False)
+        and layer.sm70_awq_moe_batched_gemm
+        and 2 <= num_tokens <= 8
+        and top_k == 10
+        and (max_tokens <= 0 or num_tokens <= max_tokens)
+        and not envs.VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13
+        and not envs.VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2
+        and not envs.VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2
+    )
+
+
 def _use_temporary_buffers_for_dummy_or_capture() -> bool:
-    # CUDA graph replay is address-fixed. Use the per-layer persistent buffers
-    # during capture too, so the captured indexed MoE scratch/output lifetimes
-    # do not depend on graph-pool temporary allocation analysis.
+    # Dummy/profile and CUDA graph capture allocate temporary tensors. Captured
+    # addresses subsequently remain fixed in the graph pool; normal eager
+    # decode can reuse the smaller per-layer resident buffers below.
     return is_forward_context_available() and get_forward_context().is_dummy_run
+
+
+def _use_qwen38_indexed_prefill(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    """Admit only the exact Qwen3.8 TP4 g32 W13 prefill contract."""
+    return bool(
+        getattr(layer, "sm70_awq_qwen38_indexed_prefill", False)
+        and getattr(layer, "sm70_awq_moe_batched_gemm", False)
+        and x.ndim == 2
+        and x.shape[0] >= _QWEN38_INDEXED_PREFILL_MIN_TOKENS
+        and x.shape[1] == 2560
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and topk_ids.shape == (x.shape[0], 10)
+        and int(layer.moe_config.tp_size) == 4
+        and int(layer.sm70_num_experts) == 512
+        and int(layer.sm70_hidden_logical_size) == 2560
+        and int(layer.sm70_intermediate_size) == 160
+        and int(layer.sm70_w13_k_dim) == 2560
+        and int(layer.sm70_w13_n_dim) == 320
+        and int(layer.sm70_awq_checkpoint_group_size) == 32
+        and int(layer.sm70_awq_group_size) == 32
+    )
+
+
+def _use_qwen38_chunked_w2(
+    layer: RoutedExperts,
+    num_tokens: int,
+    indexed_w13: bool,
+) -> bool:
+    chunk_tokens = int(layer.sm70_awq_qwen38_w2_chunk_tokens)
+    if (
+        not indexed_w13
+        or chunk_tokens not in _QWEN38_CHUNKED_W2_SUPPORTED_TOKENS
+        or chunk_tokens >= num_tokens
+    ):
+        return False
+
+    # The native loop rebalances short tails, avoiding a small tail that would
+    # otherwise force a larger-than-profiled full-output allocation.
+    top_k = int(layer._awq_moe_buf_top_k)
+    chunk_slots = chunk_tokens * top_k
+    full_scratch_bytes = num_tokens * top_k * int(layer.sm70_w2_n_dim) * 2
+    chunk_scratch_bytes = (
+        chunk_slots * (int(layer.sm70_w2_n_dim) * 2 + 2 * 4)
+        + (3 * int(layer.sm70_num_experts) + 1) * 4
+    )
+    return chunk_scratch_bytes < full_scratch_bytes
 
 
 def _single_token_weighted_reduce_enabled() -> bool:
@@ -80,6 +209,50 @@ def _legacy_single_token_compact_enabled() -> bool:
     if not envs.VLLM_SM70_AWQ_MOE_LEGACY_SINGLE_TOKEN_COMPACT:
         return False
     return hasattr(torch.ops._C, "awq_moe_single_token_sm70_out")
+
+
+def _is_qwen38_tp4_compact_metadata_shape(
+    layer: RoutedExperts, group_size: int
+) -> bool:
+    """Return whether the loaded tensors match the validated compact lane."""
+    return (
+        group_size == 32
+        and tuple(layer.w13_qweight.shape)
+        == (_QWEN38_TP4_NUM_EXPERTS, *_QWEN38_TP4_W13_QWEIGHT_SHAPE)
+        and tuple(layer.w2_qweight.shape)
+        == (_QWEN38_TP4_NUM_EXPERTS, *_QWEN38_TP4_W2_QWEIGHT_SHAPE)
+    )
+
+
+def _resolve_compact_metadata(
+    *, requested: bool, explicit: bool, native_available: bool, shape_ok: bool
+) -> bool:
+    """Decide the prepared metadata layout.
+
+    The default-on compact layout silently falls back to the 4-byte layout
+    when the build or the layer shape does not support it. An explicit
+    VLLM_SM70_AWQ_MOE_COMPACT_METADATA=1 fails closed instead.
+    """
+    if not requested:
+        return False
+    if native_available and shape_ok:
+        return True
+    if explicit:
+        if not native_available:
+            raise RuntimeError(
+                "VLLM_SM70_AWQ_MOE_COMPACT_METADATA=1 requires an SM70 "
+                "build with awq_sm70_prepare_compact."
+            )
+        raise RuntimeError(
+            "VLLM_SM70_AWQ_MOE_COMPACT_METADATA=1 currently requires "
+            "the exact Qwen3.8 TP4 E512 native-g32 W13/W2 shapes."
+        )
+    logger.info_once(
+        "SM70 AWQ MoE compact metadata default skipped (%s); "
+        "using the 4-byte scale/bias layout.",
+        "unsupported layer shape" if native_available else "no compact prepare op",
+    )
+    return False
 
 
 def _silu_and_mul_w13(
@@ -330,7 +503,14 @@ def _set_parameter(
     name: str,
     value: torch.Tensor,
 ) -> None:
-    param = value if isinstance(value, Parameter) else Parameter(value)
+    # Required by int32 torch.empty(int32) buffers: the Parameter ctor itself
+    # refuses or warns when an int tensor is registered with requires_grad=True
+    # (the default). Pass the flag in directly so the constructor sees it from
+    # line one. The trailing param.requires_grad_(False) stays as a no-op
+    # idempotent guard for the already-Parameter path.
+    param = (
+        value if isinstance(value, Parameter) else Parameter(value, requires_grad=False)
+    )
     param.requires_grad_(False)
     setattr(layer, name, param)
 
@@ -556,6 +736,17 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             )
 
         num_experts = int(layer.w13_qweight.shape[0])
+        compact_metadata = _resolve_compact_metadata(
+            requested=envs.VLLM_SM70_AWQ_MOE_COMPACT_METADATA,
+            explicit="VLLM_SM70_AWQ_MOE_COMPACT_METADATA" in os.environ,
+            native_available=hasattr(torch.ops._C, "awq_sm70_prepare_compact"),
+            shape_ok=_is_qwen38_tp4_compact_metadata_shape(layer, self.group_size),
+        )
+        prepare_awq = (
+            sm70_ops.awq_sm70_prepare_compact
+            if compact_metadata
+            else sm70_ops.awq_sm70_prepare
+        )
         w13_tm_weights, w13_tm_scales, w13_meta = [], [], []
         w2_tm_weights, w2_tm_scales, w2_meta = [], [], []
         build_legacy_w13 = (
@@ -568,7 +759,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         # carrying a second per-expert W13 TurboMind copy.
         w13_interleaved = build_legacy_w13
         for expert_id in range(num_experts):
-            r13 = sm70_ops.awq_sm70_prepare(
+            r13 = prepare_awq(
                 layer.w13_qweight[expert_id],
                 layer.w13_scales[expert_id],
                 layer.w13_qzeros[expert_id],
@@ -579,7 +770,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             w13_tm_scales.append(r13[1])
             w13_meta.append(r13[2])
 
-            r2 = sm70_ops.awq_sm70_prepare(
+            r2 = prepare_awq(
                 layer.w2_qweight[expert_id],
                 layer.w2_scales[expert_id],
                 layer.w2_qzeros[expert_id],
@@ -646,13 +837,100 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         layer.sm70_w2_q_ld = w2_q_ld
         layer.sm70_intermediate_size = layer.sm70_w2_k_dim
         layer.sm70_awq_moe_batched_gemm = batched_gemm
+        checkpoint_group_size = int(
+            getattr(self, "checkpoint_group_size", self.group_size)
+        )
+        layer.sm70_awq_checkpoint_group_size = checkpoint_group_size
+        layer.sm70_awq_group_size = self.group_size
         layer.sm70_awq_moe_layer_id = _get_layer_id(layer)
         layer.sm70_awq_moe_w13_interleaved = w13_interleaved
         layer.sm70_awq_moe_legacy_single_token_compact = build_legacy_w13
+        layer.sm70_awq_moe_compact_metadata = compact_metadata
+
+        indexed_prefill_contract = bool(
+            batched_gemm
+            and self.group_size == 32
+            and int(layer.moe_config.tp_size) == 4
+            and self.moe.experts_per_token == 10
+            and num_experts == 512
+            and hidden_logical_size == 2560
+            and intermediate_logical_size == 160
+            and layer.sm70_w13_k_dim == 2560
+            and layer.sm70_w13_n_dim == 320
+            and checkpoint_group_size == 32
+        )
+        indexed_prefill_requested = bool(envs.VLLM_SM70_AWQ_QWEN38_MOE_INDEXED_PREFILL)
+        indexed_prefill_ops = {
+            "awq_moe_indexed_dense_w13_sm70_out": hasattr(
+                torch.ops._C, "awq_moe_indexed_dense_w13_sm70_out"
+            ),
+            "moe_permute_metadata_with_scratch": hasattr(
+                torch.ops._moe_C, "moe_permute_metadata_with_scratch"
+            ),
+        }
+        indexed_prefill_available = all(indexed_prefill_ops.values())
+        indexed_prefill_explicit = (
+            "VLLM_SM70_AWQ_QWEN38_MOE_INDEXED_PREFILL" in os.environ
+        )
+        if (
+            indexed_prefill_contract
+            and indexed_prefill_requested
+            and not indexed_prefill_available
+        ):
+            missing = [
+                name for name, available in indexed_prefill_ops.items() if not available
+            ]
+            if indexed_prefill_explicit:
+                raise RuntimeError(
+                    "The explicit SM70 Qwen3.8 AWQ indexed-A prefill route "
+                    "requires " + ", ".join(missing) + "."
+                )
+            logger.warning_once(
+                "The default SM70 Qwen3.8 AWQ indexed-A prefill route is not "
+                "present in the loaded extension; falling back to the "
+                "materialized-input route. Explicitly setting "
+                "VLLM_SM70_AWQ_QWEN38_MOE_INDEXED_PREFILL=1 fails closed."
+            )
+        layer.sm70_awq_qwen38_indexed_prefill = bool(
+            indexed_prefill_contract
+            and indexed_prefill_requested
+            and indexed_prefill_available
+        )
+        layer.sm70_awq_qwen38_active_grouped_decode = bool(
+            envs.VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE
+            and _qwen38_active_grouped_layer_contract(layer, self.group_size)
+        )
+        layer.sm70_awq_qwen38_qpn_m1 = initialize_qpn_m1(
+            layer, _qwen38_active_grouped_layer_contract(layer, self.group_size)
+        )
+        w2_chunk_tokens = int(envs.VLLM_SM70_AWQ_QWEN38_MOE_W2_CHUNK_TOKENS)
+        if w2_chunk_tokens not in (0, *_QWEN38_CHUNKED_W2_SUPPORTED_TOKENS):
+            raise ValueError(
+                "VLLM_SM70_AWQ_QWEN38_MOE_W2_CHUNK_TOKENS must be one of "
+                "0, 4096, or 6144."
+            )
+        chunked_w2_available = hasattr(torch.ops._C, "awq_moe_chunked_w2_sm70_out")
+        if (
+            w2_chunk_tokens > 0
+            and layer.sm70_awq_qwen38_indexed_prefill
+            and not chunked_w2_available
+        ):
+            raise RuntimeError(
+                "The SM70 Qwen3.8 AWQ chunked W2 path requires its CUDA extension."
+            )
+        layer.sm70_awq_qwen38_w2_chunk_tokens = int(
+            w2_chunk_tokens
+            if layer.sm70_awq_qwen38_indexed_prefill and chunked_w2_available
+            else 0
+        )
 
         self._allocate_buffers(layer)
         del layer.w13_qweight, layer.w13_scales, layer.w13_qzeros
         del layer.w2_qweight, layer.w2_scales, layer.w2_qzeros
+        # Release unused conversion blocks between layers instead of retaining
+        # their high-water mark throughout model loading. Live prepared weights
+        # and inference buffers are unaffected; this is not an inference hook.
+        torch.accelerator.empty_cache()
         if (
             envs.VLLM_SM70_AWQ_MOE_BATCHED_LAYER_ALLOWLIST is not None
             or envs.VLLM_SM70_AWQ_MOE_BATCHED_LAYER_DENYLIST is not None
@@ -667,15 +945,24 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             "batched" if batched_gemm else "per-expert dense",
             num_experts,
         )
+        if compact_metadata:
+            logger.info_once(
+                "SM70 Qwen3.8 TP4 AWQ compact scale/zero metadata enabled."
+            )
 
     def _allocate_buffers(self, layer: RoutedExperts) -> None:
         device = layer.w13_tm_weight.device
         top_k = self.moe.experts_per_token
-        persistent_tokens = _DEFAULT_PERSISTENT_MAX_TOKENS
+        persistent_tokens = _persistent_max_tokens_for_runtime()
         max_slots = persistent_tokens * top_k
         layer._awq_moe_buf_max_tokens = persistent_tokens
         layer._awq_moe_buf_max_slots = max_slots
         layer._awq_moe_buf_top_k = top_k
+        logger.info_once(
+            "SM70 AWQ MoE persistent scratch cap=%d tokens (legacy ceiling=%d).",
+            persistent_tokens,
+            _DEFAULT_PERSISTENT_MAX_TOKENS,
+        )
         layer._awq_moe_buf_output = torch.empty(
             persistent_tokens,
             layer.sm70_hidden_logical_size,
@@ -687,6 +974,9 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             layer.sm70_hidden_logical_size,
             dtype=torch.float16,
             device=device,
+        )
+        layer._awq_moe_buf_input_row_indices = torch.empty(
+            max_slots, dtype=torch.int32, device=device
         )
         layer._awq_moe_buf_gate_up = torch.empty(
             max_slots, layer.sm70_w13_n_dim, dtype=torch.float16, device=device
@@ -782,16 +1072,25 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         layer: RoutedExperts,
         total_slots: int,
         num_tokens: int,
+        indexed_w13: bool,
     ) -> dict[str, torch.Tensor]:
+        w2_chunk_tokens = int(layer.sm70_awq_qwen38_w2_chunk_tokens)
+        chunked_w2 = _use_qwen38_chunked_w2(layer, num_tokens, indexed_w13)
+        max_chunk_slots = min(num_tokens, w2_chunk_tokens) * layer._awq_moe_buf_top_k
         use_temporary_buffers = _use_temporary_buffers_for_dummy_or_capture()
         if (
             not use_temporary_buffers
             and total_slots <= layer._awq_moe_buf_max_slots
             and num_tokens <= layer._awq_moe_buf_max_tokens
         ):
+            assert not chunked_w2, (
+                "Qwen3.8 indexed prefill starts above the persistent AWQ MoE "
+                "buffer cap."
+            )
             return {
                 "output": layer._awq_moe_buf_output[:num_tokens],
                 "permuted_input": layer._awq_moe_buf_permuted_input[:total_slots],
+                "input_row_indices": layer._awq_moe_buf_input_row_indices[:total_slots],
                 "gate_up": layer._awq_moe_buf_gate_up[:total_slots],
                 "intermediate": layer._awq_moe_buf_intermediate[:total_slots],
                 "sorted_output": layer._awq_moe_buf_sorted_output[:total_slots],
@@ -868,11 +1167,25 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 dtype=torch.float16,
                 device=device,
             ),
-            "permuted_input": torch.empty(
-                total_slots,
-                layer.sm70_hidden_logical_size,
-                dtype=torch.float16,
-                device=device,
+            "permuted_input": (
+                torch.empty(
+                    0,
+                    layer.sm70_hidden_logical_size,
+                    dtype=torch.float16,
+                    device=device,
+                )
+                if indexed_w13
+                else torch.empty(
+                    total_slots,
+                    layer.sm70_hidden_logical_size,
+                    dtype=torch.float16,
+                    device=device,
+                )
+            ),
+            "input_row_indices": (
+                torch.empty(total_slots, dtype=torch.int32, device=device)
+                if indexed_w13
+                else torch.empty(0, dtype=torch.int32, device=device)
             ),
             "gate_up": torch.empty(
                 total_slots,
@@ -887,9 +1200,34 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 device=device,
             ),
             "sorted_output": torch.empty(
-                total_slots,
+                max_chunk_slots if chunked_w2 else total_slots,
                 layer.sm70_w2_n_dim,
                 dtype=torch.float16,
+                device=device,
+            ),
+            "chunk_expert_offsets": torch.empty(
+                layer.sm70_num_experts + 1 if chunked_w2 else 0,
+                dtype=torch.int32,
+                device=device,
+            ),
+            "chunk_range_begin": torch.empty(
+                layer.sm70_num_experts if chunked_w2 else 0,
+                dtype=torch.int32,
+                device=device,
+            ),
+            "chunk_range_end": torch.empty(
+                layer.sm70_num_experts if chunked_w2 else 0,
+                dtype=torch.int32,
+                device=device,
+            ),
+            "chunk_a_indices": torch.empty(
+                max_chunk_slots if chunked_w2 else 0,
+                dtype=torch.int32,
+                device=device,
+            ),
+            "chunk_inv_permuted_idx": torch.empty(
+                max_chunk_slots if chunked_w2 else 0,
+                dtype=torch.int32,
                 device=device,
             ),
             "expert_offsets": torch.empty(
@@ -955,6 +1293,23 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         top_k: int,
         output: torch.Tensor,
     ) -> torch.Tensor:
+        if use_qpn_m1(layer, x, topk_weights, topk_ids_i32):
+            _log_runtime_route_once(
+                "SM70 AWQ Qwen3.8 QPN M1 W13/W2 enabled "
+                "(existing prepared banks, direct route order)."
+            )
+            sm70_ops.awq_moe_qpn_m1_sm70_out(
+                output,
+                buffers["intermediate"],
+                x,
+                layer.w13_tm_weight,
+                layer.w13_tm_scales,
+                layer.w2_tm_weight,
+                layer.w2_tm_scales,
+                topk_ids_i32,
+                topk_weights,
+            )
+            return output
         _log_runtime_route_once(
             "SM70 AWQ MoE legacy single-token monolithic compact path enabled "
             "(top_k=%d, experts=%d).",
@@ -1011,7 +1366,8 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         num_tokens = x.shape[0]
         top_k = topk_ids.shape[1]
         total_slots = num_tokens * top_k
-        buffers = self._get_buffers(layer, total_slots, num_tokens)
+        indexed_w13 = _use_qwen38_indexed_prefill(layer, x, topk_ids)
+        buffers = self._get_buffers(layer, total_slots, num_tokens, indexed_w13)
         output = buffers["output"]
         output.zero_()
         if total_slots == 0:
@@ -1217,23 +1573,42 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 )
             output = _dump_awq_moe_buffer(layer, output, "st_output")
             return output
-        torch.ops._moe_C.moe_permute_with_scratch(
-            x,
-            topk_ids_i32,
-            buffers["token_expert_indices"],
-            layer.expert_map,
-            layer.global_num_experts,
-            layer.local_num_experts,
-            top_k,
-            buffers["permuted_input"],
-            buffers["expert_offsets64"],
-            buffers["inv_permuted_idx"],
-            buffers["permuted_idx"],
-            buffers["sort_workspace"],
-            buffers["permuted_experts_id"],
-            buffers["sorted_row_idx"],
-            buffers["topk_ids_for_sort"],
-        )
+        if indexed_w13:
+            torch.ops._moe_C.moe_permute_metadata_with_scratch(
+                x,
+                topk_ids_i32,
+                buffers["token_expert_indices"],
+                layer.expert_map,
+                layer.global_num_experts,
+                layer.local_num_experts,
+                top_k,
+                buffers["expert_offsets64"],
+                buffers["inv_permuted_idx"],
+                buffers["permuted_idx"],
+                buffers["input_row_indices"],
+                buffers["sort_workspace"],
+                buffers["permuted_experts_id"],
+                buffers["sorted_row_idx"],
+                buffers["topk_ids_for_sort"],
+            )
+        else:
+            torch.ops._moe_C.moe_permute_with_scratch(
+                x,
+                topk_ids_i32,
+                buffers["token_expert_indices"],
+                layer.expert_map,
+                layer.global_num_experts,
+                layer.local_num_experts,
+                top_k,
+                buffers["permuted_input"],
+                buffers["expert_offsets64"],
+                buffers["inv_permuted_idx"],
+                buffers["permuted_idx"],
+                buffers["sort_workspace"],
+                buffers["permuted_experts_id"],
+                buffers["sorted_row_idx"],
+                buffers["topk_ids_for_sort"],
+            )
         buffers["expert_offsets"].copy_(buffers["expert_offsets64"], non_blocking=True)
         buffers["expert_offsets"] = _dump_awq_moe_buffer(
             layer, buffers["expert_offsets"], "expert_offsets"
@@ -1267,7 +1642,9 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         use_batched_moe_gemm = route_plan.use_batched_moe_gemm
         use_batched_active_exact_w2 = route_plan.use_batched_active_exact_w2
         use_batched_exact_w2 = route_plan.use_batched_exact_w2
-        use_active_exact_small_batched_moe = False
+        use_active_exact_small_batched_moe = _use_qwen38_active_grouped_decode(
+            layer, num_tokens, top_k
+        )
         compare_dense_step = None
         compare_dense_w13_stats = None
         compare_dense_w2_stats = None
@@ -1280,18 +1657,38 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         if num_tokens <= 8 and use_batched_moe_gemm:
             compare_dense_step = _compare_dense_decode_step(layer)
 
-        if use_active_exact_small_batched_moe:
+        if indexed_w13:
             _log_runtime_route_once(
-                "SM70 AWQ MoE batched path using active-route exact "
-                "dense-stage route (tokens=%d, routes=%d).",
+                "SM70 Qwen3.8 AWQ indexed-A W13 prefill route enabled "
+                "(tokens=%d, routes=%d).",
                 num_tokens,
                 total_slots,
             )
-            sm70_ops.awq_moe_single_token_dense_stage_sm70_out(
+            sm70_ops.awq_moe_indexed_dense_w13_sm70_out(
+                buffers["gate_up"],
+                x,
+                buffers["input_row_indices"],
+                buffers["expert_offsets"],
+                layer._awq_moe_buf_dense_expert_ids,
+                layer.w13_strided_ptrs_w,
+                layer.w13_strided_ptrs_s,
+                layer.sm70_num_experts,
+                layer.sm70_w13_k_dim,
+                layer.sm70_w13_n_dim,
+                self.group_size,
+            )
+        elif use_active_exact_small_batched_moe:
+            _log_runtime_route_once(
+                "SM70 Qwen3.8 AWQ active grouped decode (tokens=%d, routed_slots=%d).",
+                num_tokens,
+                total_slots,
+            )
+            sm70_ops.awq_moe_active_dense_stage_sm70_out(
                 buffers["gate_up"],
                 buffers["permuted_input"],
-                buffers["active_expert_offsets"],
                 buffers["permuted_experts_id"],
+                buffers["active_expert_offsets"],
+                buffers["sorted_expert_ids"],
                 layer.w13_strided_ptrs_w,
                 layer.w13_strided_ptrs_s,
                 total_slots,
@@ -1299,6 +1696,21 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w13_n_dim,
                 self.group_size,
             )
+            if compare_dense_step is not None:
+                dense_gate_up = torch.empty_like(buffers["gate_up"])
+                sm70_ops.awq_moe_dense_stage_sm70_out(
+                    dense_gate_up,
+                    buffers["permuted_input"],
+                    buffers["expert_offsets"],
+                    layer._awq_moe_buf_dense_expert_ids,
+                    layer.w13_strided_ptrs_w,
+                    layer.w13_strided_ptrs_s,
+                    layer.sm70_num_experts,
+                    layer.sm70_w13_k_dim,
+                    layer.sm70_w13_n_dim,
+                    self.group_size,
+                )
+                compare_dense_w13_stats = _diff_stats(buffers["gate_up"], dense_gate_up)
         elif route_plan.w13 == Sm70MoeStageRoute.PER_EXPERT_DISPATCH:
             _log_runtime_route_once(
                 "SM70 AWQ MoE batched W13 using per-expert dispatch "
@@ -1365,20 +1777,40 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         buffers["intermediate"] = _dump_awq_moe_buffer(
             layer, buffers["intermediate"], "silu_out"
         )
-        if use_active_exact_small_batched_moe:
-            sm70_ops.awq_moe_single_token_dense_stage_sm70_out(
+        w2_chunk_tokens = int(layer.sm70_awq_qwen38_w2_chunk_tokens)
+        if _use_qwen38_chunked_w2(layer, num_tokens, indexed_w13):
+            _log_runtime_route_once(
+                "SM70 Qwen3.8 AWQ chunked W2 enabled "
+                "(tokens=%d, routes=%d, chunk_tokens=%d).",
+                num_tokens,
+                total_slots,
+                w2_chunk_tokens,
+            )
+            sm70_ops.awq_moe_chunked_w2_sm70_out(
+                output,
                 buffers["sorted_output"],
                 buffers["intermediate"],
-                buffers["active_expert_offsets"],
-                buffers["permuted_experts_id"],
+                buffers["expert_offsets"],
+                buffers["permuted_idx"],
+                topk_weights,
+                buffers["chunk_expert_offsets"],
+                buffers["chunk_range_begin"],
+                buffers["chunk_range_end"],
+                buffers["chunk_a_indices"],
+                buffers["chunk_inv_permuted_idx"],
                 layer.w2_strided_ptrs_w,
                 layer.w2_strided_ptrs_s,
-                total_slots,
+                num_tokens,
+                top_k,
+                layer.sm70_num_experts,
                 layer.sm70_w2_k_dim,
                 layer.sm70_w2_n_dim,
+                layer.sm70_hidden_logical_size,
                 self.group_size,
+                w2_chunk_tokens,
             )
-        elif use_batched_active_exact_w2:
+            return _dump_awq_moe_buffer(layer, output, "chunked_w2_output")
+        if use_active_exact_small_batched_moe or use_batched_active_exact_w2:
             _log_runtime_route_once(
                 "SM70 AWQ MoE batched path using grouped-active exact W2 (routes=%d).",
                 total_slots,

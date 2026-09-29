@@ -36,6 +36,7 @@ from transformers import Qwen2MoeConfig
 
 import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
+from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
@@ -74,6 +75,8 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+_SM70_FUSED_SHARED_GATE_MAX_TOKENS = 16
+
 
 def _sm70_dump_qwen_mlp_tensor(
     label: str,
@@ -102,6 +105,38 @@ def _sm70_force_shared_expert_silu_custom_op(prefix: str) -> bool:
         return torch.cuda.get_device_capability() == (7, 0)
     except RuntimeError:
         return False
+
+
+def _sm70_fused_shared_expert_gate_shape_supported(
+    x: torch.Tensor,
+    out: torch.Tensor,
+) -> bool:
+    """Shared shape gate; the fused dot remains M1-only at its call site."""
+    return bool(
+        x.ndim == 2
+        and out.ndim == 2
+        and 0 < x.shape[0] <= _SM70_FUSED_SHARED_GATE_MAX_TOKENS
+        and out.shape[0] == x.shape[0]
+        and x.shape[1] == 2560
+        and out.shape[1] == 2560
+        and x.is_contiguous()
+        and out.is_contiguous()
+        and x.dtype == torch.float16
+        and out.dtype == torch.float16
+    )
+
+
+def _sm70_fused_shared_expert_gate_module_supported(
+    gate_up_proj: torch.nn.Module,
+    down_proj: torch.nn.Module,
+) -> bool:
+    """Match the local TP projection shape used by the native gate kernel."""
+    return bool(
+        int(getattr(gate_up_proj, "input_size_per_partition", 0)) == 2560
+        and tuple(getattr(gate_up_proj, "output_partition_sizes", ())) == (160, 160)
+        and int(getattr(down_proj, "input_size_per_partition", 0)) == 160
+        and int(getattr(down_proj, "output_size_per_partition", 0)) == 2560
+    )
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -143,16 +178,28 @@ class Qwen2MoeMLP(nn.Module):
             enforce_enable=_sm70_force_shared_expert_silu_custom_op(prefix)
         )
         self.expert_gate = expert_gate
-        self._sm70_fused_shared_expert_gate = (
+        self._sm70_exact_shared_expert_gate = (
             envs.VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION
             and expert_gate is not None
             and prefix.endswith(".mlp.shared_expert")
-            and hidden_size == 2560
-            and intermediate_size == 160
+            and _sm70_fused_shared_expert_gate_module_supported(
+                self.gate_up_proj,
+                self.down_proj,
+            )
             and not reduce_results
             and _sm70_force_shared_expert_silu_custom_op(prefix)
-            and hasattr(torch.ops._C, "sm70_f16_gate_mul_out")
         )
+        if self._sm70_exact_shared_expert_gate:
+            logger.info_once(
+                "SM70 Qwen3Next exact single-token shared-expert gate enabled."
+            )
+        self._sm70_batch_shared_expert_gate = False
+        if self._sm70_exact_shared_expert_gate and envs.VLLM_SM70_QWEN38_BATCH_FASTPATH:
+            from vllm.models.qwen4_exp.nvidia.sm70_fp16_gemv import (
+                _batch_runtime_contract,
+            )
+
+            self._sm70_batch_shared_expert_gate = _batch_runtime_contract()
 
     def forward(self, x):
         x = _sm70_dump_qwen_mlp_tensor("mlp_input", self.layer_idx, x)
@@ -166,35 +213,66 @@ class Qwen2MoeMLP(nn.Module):
         out, _ = self.down_proj(out)
         out = _sm70_dump_qwen_mlp_tensor("mlp_down_out", self.layer_idx, out)
 
+        used_exact_gate = False
         if (
-            self._sm70_fused_shared_expert_gate
+            self._sm70_exact_shared_expert_gate
             and x.shape[0] == 1
-            and x.dtype == torch.float16
-            and out.dtype == torch.float16
+            and _sm70_fused_shared_expert_gate_shape_supported(x, out)
         ):
             from vllm import _sm70_ops as sm70_ops
 
-            assert self.expert_gate is not None
-            gate_weight = self.expert_gate.weight
-            if gate_weight.dtype != torch.float16 or not gate_weight.is_contiguous():
-                raise RuntimeError(
-                    "SM70 Qwen3Next fused shared-expert gate requires a "
-                    "contiguous FP16 gate weight."
-                )
-            sm70_ops.sm70_f16_gate_mul_out(out, x, gate_weight)
-            out = _sm70_dump_qwen_mlp_tensor(
-                "mlp_after_expert_gate", self.layer_idx, out
-            )
-        elif self.expert_gate is not None:
+            if sm70_ops.has_qwen38_shared_gate_exact():
+                assert self.expert_gate is not None
+                gate_weight = self.expert_gate.weight
+                if (
+                    gate_weight.dtype != torch.float16
+                    or not gate_weight.is_contiguous()
+                ):
+                    raise RuntimeError(
+                        "SM70 Qwen3.8 exact shared-expert gate requires a "
+                        "contiguous FP16 gate weight."
+                    )
+                logger.info_once("SM70 Qwen3.8 exact shared-expert gate path enabled.")
+                sm70_ops.qwen38_shared_gate_exact_out(out, x, gate_weight)
+                used_exact_gate = True
+        if self.expert_gate is not None and not used_exact_gate:
             expert_gate = self.expert_gate(x)[0]
             expert_gate = _sm70_dump_qwen_mlp_tensor(
                 "mlp_expert_gate", self.layer_idx, expert_gate
             )
-            expert_gate = F.sigmoid(expert_gate)
-            expert_gate = _sm70_dump_qwen_mlp_tensor(
-                "mlp_expert_gate_sigmoid", self.layer_idx, expert_gate
+            used_batch_epilogue = False
+            if (
+                self._sm70_batch_shared_expert_gate
+                and use_sm70_decode_graph_semantics()
+                and x.shape[0] > 1
+                and _sm70_fused_shared_expert_gate_shape_supported(x, out)
+            ):
+                from vllm import _sm70_ops as sm70_ops
+
+                if sm70_ops.has_qwen38_shared_gate_sigmoid_mul():
+                    sm70_ops.qwen38_shared_gate_sigmoid_mul_out(out, expert_gate)
+                    used_batch_epilogue = True
+                    logger.info_once(
+                        "SM70 Qwen3.8 batch shared-expert sigmoid/multiply "
+                        "fusion enabled (linear unchanged)."
+                    )
+            if not used_batch_epilogue and (
+                getattr(self.gate_up_proj, "_sm70_mtp_prepare_shared_batch", False)
+                and use_sm70_decode_graph_semantics()
+            ):
+                out = torch.ops.vllm.qwen38_sm70_shared_gate_mul(expert_gate, out)
+                used_batch_epilogue = True
+            if not used_batch_epilogue:
+                expert_gate = F.sigmoid(expert_gate)
+                expert_gate = _sm70_dump_qwen_mlp_tensor(
+                    "mlp_expert_gate_sigmoid", self.layer_idx, expert_gate
+                )
+                out = expert_gate * out
+            out = _sm70_dump_qwen_mlp_tensor(
+                "mlp_after_expert_gate", self.layer_idx, out
             )
-            out = expert_gate * out
+
+        if used_exact_gate:
             out = _sm70_dump_qwen_mlp_tensor(
                 "mlp_after_expert_gate", self.layer_idx, out
             )

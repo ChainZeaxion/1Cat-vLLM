@@ -26,19 +26,20 @@ logger = init_logger(__name__)
 
 def _is_sm70_tp4_nvfp4_gate_up(layer: torch.nn.Module) -> bool:
     return bool(
-        getattr(layer, "tp_size", 1) == 4
-        and getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "gate_up_proj"
+        getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "gate_up_proj"
         and getattr(layer, "input_size_per_partition", 0) == 5120
-        and getattr(layer, "output_size_per_partition", 0) == 8704
-        and getattr(layer, "logical_widths", None) == [4352, 4352]
+        and getattr(layer, "output_size_per_partition", 0) > 0
+        and layer.output_size_per_partition % 64 == 0
+        and getattr(layer, "logical_widths", None)
+        == [layer.output_size_per_partition // 2] * 2
     )
 
 
 def _is_sm70_tp4_nvfp4_down(layer: torch.nn.Module) -> bool:
     return bool(
-        getattr(layer, "tp_size", 1) == 4
-        and getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "down_proj"
-        and getattr(layer, "input_size_per_partition", 0) == 4352
+        getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "down_proj"
+        and getattr(layer, "input_size_per_partition", 0) > 0
+        and layer.input_size_per_partition % 128 == 0
         and getattr(layer, "output_size_per_partition", 0) == 5120
     )
 
@@ -53,22 +54,28 @@ def _is_sm70_nvfp4_qpn4_runtime_contract() -> bool:
 
 
 def _is_sm70_dflash2_nvfp4_qpn2_runtime_contract() -> bool:
-    """Admit the quality-audited bounded-concurrency DFlash2 TP4 route.
+    """Admit the DFlash2 operator contract independently of TP size.
 
-    opt-3a: the audited route was gated to a single in-flight request
-    (``max_num_seqs == 1``) and ``num_speculative_tokens == 7`` (the audited
-    checkpoint's trained width). Widen it to
-    ``1 <= max_num_seqs <= 10`` and ``num_speculative_tokens >= 3``: with
-    speculative decoding the verifier batch width is ``1 + NST``, so
-    ``3 <= NST <= 7`` keeps M in [4, 8], the QPN2 fast-kernel regime
-    (``nvfp4_qpn2_dispatch_sm70_out`` falls back to the bitwise-equal
-    TurboMind gemm for M > 8 anyway); smaller NSTs never reach this route's
-    target model. The explicit env rollback (``VLLM_SM70_NVFP4_QPN2`` /
-    ``VLLM_SM70_NVFP4_QPN2_PREFILL``) still overrides this contract.
+    Scheduler capacity is intentionally not part of this model-load decision.
+    The opaque dispatcher selects QPN2 only from live ``M <= 32`` shapes and
+    retains the existing TurboMind path for larger dynamic M.  A server that
+    can hold many requests must therefore load the same small-M layout as a
+    server configured with ``max_num_seqs=1``.
+
+    opt-3a: the audited route originally also required
+    ``num_speculative_tokens == 7`` (the audited checkpoint's trained width).
+    Relaxed to ``>= 3`` so mid-width drafts fall into the same QPN2 layout:
+    with speculative decoding the verifier batch width is ``1 + NST``.  The
+    explicit env rollbacks (``VLLM_SM70_NVFP4_QPN2`` /
+    ``VLLM_SM70_NVFP4_QPN2_PREFILL``) still override this contract.
+
+    TODO(m<=64): the compiled SM70 gate admits ``M <= 64``, and that widening
+    was measured at 8-way concurrent DFlash2 NST=5.  The dispatcher's
+    ``M <= 32`` window is therefore tighter than the gate; revisit (raise the
+    dispatch window toward 64) if 33..64 shapes actually occur in serving.
     """
     vllm_config = get_current_vllm_config()
     parallel_config = vllm_config.parallel_config
-    scheduler_config = vllm_config.scheduler_config
     speculative_config = getattr(vllm_config, "speculative_config", None)
     draft_model_config = getattr(speculative_config, "draft_model_config", None)
     draft_hf_config = getattr(draft_model_config, "hf_config", None)
@@ -83,8 +90,6 @@ def _is_sm70_dflash2_nvfp4_qpn2_runtime_contract() -> bool:
         and int(getattr(speculative_config, "num_speculative_tokens", 0) or 0) >= 3
         and selector_top_k == 16
         and parallel_config.pipeline_parallel_size == 1
-        and parallel_config.tensor_parallel_size == 4
-        and 1 <= scheduler_config.max_num_seqs <= 10
         and not getattr(parallel_config, "enable_dbo", False)
         and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
     )
@@ -125,12 +130,21 @@ __all__ = ["CompressedTensorsW4A4Fp4"]
 
 _SM70_NVFP4_QPN2_CONFIGS = {
     # (K, N, fused gated-SiLU): (split-K, independent accumulator chains)
+    (1536, 5120, False): (8, 2),
+    (5120, 3584, False): (16, 2),
+    # Qwen3.8 GDN qkvzba is logically N=4120 on TP4.  QPN2 consumes the
+    # zero-padded physical N=4128 layout and the caller crops the result.
+    (5120, 4128, False): (16, 2),
     (5120, 8704, False): (8, 2),
     (5120, 8704, True): (8, 2),
     (4352, 5120, False): (16, 2),
 }
 _SM70_NVFP4_QPN2_SHAPES = {
     # Checkpoint-native packed tensors are [N, K/2].
+    "in_proj_qkvz": (4120, 2560),
+    "qkv_proj": (3584, 2560),
+    "out_proj": (5120, 768),
+    "o_proj": (5120, 768),
     "gate_up_proj": (8704, 2560),
     "down_proj": (5120, 2176),
 }
@@ -143,18 +157,43 @@ _SM70_NVFP4_QPN2_REQUIRED_OPS = (
 _SM70_NVFP4_QPN2_PREFILL_REQUIRED_OPS = ("nvfp4_qpn2_prefill_dispatch_sm70_out",)
 
 
-def _is_qpn2_layer(layer: torch.nn.Module) -> bool:
-    if getattr(layer, "tp_size", 1) != 4:
-        return False
-    suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
-    expected = _SM70_NVFP4_QPN2_SHAPES.get(suffix)
-    if expected is None or tuple(layer.weight.shape) != expected:
-        return False
-    expected_n, expected_packed_k = expected
-    return bool(
-        getattr(layer, "input_size_per_partition", 0) == expected_packed_k * 2
-        and getattr(layer, "output_size_per_partition", 0) == expected_n
+def _qpn2_config(k: int, n: int, gated: bool) -> tuple[int, int]:
+    # Keep existing tuned configurations; other aligned local projections use
+    # the same native kernels with a split count that divides K/16.
+    return _SM70_NVFP4_QPN2_CONFIGS.get(
+        (k, n, gated), (8 if gated or k % 256 else 16, 2)
     )
+
+
+def _is_qpn2_layer(layer: torch.nn.Module) -> bool:
+    suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
+    if suffix not in _SM70_NVFP4_QPN2_SHAPES or len(layer.weight.shape) != 2:
+        return False
+    n, packed_k = layer.weight.shape
+    k = packed_k * 2
+    return bool(
+        k > 0
+        and k % 128 == 0
+        and n > 0
+        and getattr(layer, "input_size_per_partition", 0) == k
+        and getattr(layer, "output_size_per_partition", 0) == n
+        and (suffix != "gate_up_proj" or n % 64 == 0)
+    )
+
+
+def _pad_qpn2_output_rows(
+    weight: torch.Tensor, scales: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Pad checkpoint-native output rows to QPN2's 32-column contract."""
+    logical_n = weight.shape[0]
+    physical_n = (logical_n + 31) // 32 * 32
+    if physical_n == logical_n:
+        return weight, scales, physical_n
+    padded_weight = weight.new_zeros((physical_n, weight.shape[1]))
+    padded_scales = scales.new_zeros((physical_n, scales.shape[1]))
+    padded_weight[:logical_n].copy_(weight)
+    padded_scales[:logical_n].copy_(scales)
+    return padded_weight, padded_scales, physical_n
 
 
 def _missing_qpn2_ops() -> list[str]:
@@ -165,12 +204,45 @@ def _missing_qpn2_ops() -> list[str]:
     ]
 
 
+def _missing_qpn2_shared_ops() -> list[str]:
+    return [
+        name
+        for name in (
+            "nvfp4_qpn2_prepare_scales_sm70",
+            "nvfp4_qpn2_tm_dispatch_sm70_out",
+        )
+        if not hasattr(torch.ops._C, name)
+    ]
+
+
 def _missing_qpn2_prefill_ops() -> list[str]:
     return [
         name
         for name in _SM70_NVFP4_QPN2_PREFILL_REQUIRED_OPS
         if not hasattr(torch.ops._C, name)
     ]
+
+
+def _compact_qpn2_scales_enabled() -> bool:
+    # At C8/M64 the TurboMind fallback consumes FP16 scales. Preserve its
+    # load-time-prepared scales for concurrent decode; otherwise every step
+    # expands all E4M3 scale tensors again before the GEMM.
+    if sm70_tm.use_batched_gemm_layouts():
+        return False
+    if not envs.VLLM_SM70_NVFP4_QPN2_SHARED_SCALES:
+        return False
+    version = getattr(torch.ops._C, "nvfp4_qpn2_compact_scales_version_sm70", None)
+    if (
+        not hasattr(torch.ops._C, "nvfp4_qpn2_compact_tm_gemm_sm70_out")
+        or version is None
+        or version() < 1
+    ):
+        logger.warning_once(
+            "Compact QPN2 scales require native operators with reusable graph scratch; "
+            "retaining persistent FP16 scales."
+        )
+        return False
+    return _is_sm70_dflash2_nvfp4_qpn2_runtime_contract()
 
 
 def _explicit_nvfp4_emulation_requested() -> bool:
@@ -363,13 +435,34 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                     )
                     use_qpn2 = False
             if use_qpn2:
-                qpn2_codes, qpn2_scales = sm70_ops.nvfp4_qpn2_prepare_sm70(
-                    layer.weight.data, layer.weight_scale.data
-                )
+                qpn2_shared = envs.VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT
+                if qpn2_shared and (missing_shared_ops := _missing_qpn2_shared_ops()):
+                    logger.warning_once(
+                        "SM70 NVFP4 shared QPN2 weights are unavailable; "
+                        "retaining separate layouts. Missing ops: %s.",
+                        str(missing_shared_ops),
+                    )
+                    qpn2_shared = False
+                if qpn2_shared:
+                    qpn2_output_size = (layer.weight.shape[0] + 31) // 32 * 32
+                    qpn2_scales = sm70_ops.nvfp4_qpn2_prepare_scales_sm70(
+                        layer.weight_scale.data
+                    )
+                else:
+                    qpn2_weight, qpn2_weight_scale, qpn2_output_size = (
+                        _pad_qpn2_output_rows(
+                            layer.weight.data, layer.weight_scale.data
+                        )
+                    )
+                    qpn2_codes, qpn2_scales = sm70_ops.nvfp4_qpn2_prepare_sm70(
+                        qpn2_weight, qpn2_weight_scale
+                    )
                 qpn2_global_scale = float(layer.weight_global_scale.item())
                 qpn2_prefill_enabled = False
                 if _sm70_nvfp4_qpn2_prefill_enabled():
-                    missing_prefill_ops = _missing_qpn2_prefill_ops()
+                    missing_prefill_ops = (
+                        [] if qpn2_shared else _missing_qpn2_prefill_ops()
+                    )
                     if missing_prefill_ops:
                         logger.warning_once(
                             "The requested SM70 NVFP4 QPN2-packed prefill "
@@ -385,28 +478,57 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             sm70_tm.prepare_nvfp4_linear(
                 layer,
                 interleave_gated_silu=use_gated_silu,
+                prescale_for_batch=(
+                    use_qpn2
+                    and qpn2_shared
+                    and sm70_tm.use_batched_gemm_layouts()
+                    and not (qpn2_shared and _compact_qpn2_scales_enabled())
+                ),
             )
             if use_qpn2:
                 suffix = layer.prefix.rsplit(".", 1)[-1]
                 k = layer.input_size_per_partition
-                n = layer.output_size_per_partition
-                split_k, nacc = _SM70_NVFP4_QPN2_CONFIGS[(k, n, False)]
-                layer.register_buffer(
-                    "sm70_nvfp4_qpn2_codes", qpn2_codes, persistent=False
-                )
+                n = qpn2_output_size
+                split_k, nacc = _qpn2_config(k, n, False)
+                if not qpn2_shared:
+                    layer.register_buffer(
+                        "sm70_nvfp4_qpn2_codes", qpn2_codes, persistent=False
+                    )
                 layer.register_buffer(
                     "sm70_nvfp4_qpn2_scales", qpn2_scales, persistent=False
                 )
                 layer.sm70_nvfp4_qpn2 = True
+                layer.sm70_nvfp4_qpn2_shared_weight = qpn2_shared
                 layer.sm70_nvfp4_qpn2_global_scale = qpn2_global_scale
+                layer.sm70_nvfp4_qpn2_output_size = qpn2_output_size
                 layer.sm70_nvfp4_qpn2_split_k = split_k
                 layer.sm70_nvfp4_qpn2_nacc = nacc
                 layer.sm70_nvfp4_qpn2_gated_silu = suffix == "gate_up_proj"
                 layer.sm70_nvfp4_qpn2_prefill_enabled = qpn2_prefill_enabled
+                if qpn2_shared and _compact_qpn2_scales_enabled():
+                    state = getattr(layer, sm70_tm.STATE_ATTR)
+                    state.scales = qpn2_scales
+                    state.global_scale = qpn2_global_scale
+                    state.use_scale_code = True
+                    logger.info_once(
+                        "SM70 QPN2 retains E4M3 scales only; TurboMind restores "
+                        "shared FP16 scratch for fallback shapes."
+                    )
+                elif qpn2_shared and sm70_tm.use_batched_gemm_layouts():
+                    logger.info_once(
+                        "SM70 batched NVFP4 keeps load-time FP16 TurboMind "
+                        "scales for M>32 while QPN2 retains compact E4M3 "
+                        "scales for small M."
+                    )
                 logger.info_once(
-                    "SM70 NVFP4 QPN2 M<=8 route enabled for a compatible "
-                    "TP4 projection contract."
+                    "SM70 NVFP4 QPN2 M<=32 route enabled for a compatible "
+                    "local projection layout contract."
                 )
+                if qpn2_shared:
+                    logger.info_once(
+                        "SM70 NVFP4 QPN2 shares TurboMind 4-bit weights; "
+                        "only QPN2 E4M3 scales are stored separately."
+                    )
                 if qpn2_prefill_enabled:
                     logger.info_once(
                         "SM70 NVFP4 opaque QPN2 decode plus QPN2-packed "
@@ -475,22 +597,48 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         x_2d = x.reshape(-1, x.shape[-1])
         if x_2d.stride(-1) != 1:
             x_2d = x_2d.contiguous()
-        output_size = layer.output_size_per_partition
+        logical_output_size = layer.output_size_per_partition
+        kernel_output_size = int(
+            getattr(layer, "sm70_nvfp4_qpn2_output_size", logical_output_size)
+        )
         if gated_silu:
-            output_size //= 2
+            logical_output_size //= 2
+            kernel_output_size //= 2
         out_2d = torch.empty(
-            (x_2d.shape[0], output_size), dtype=x.dtype, device=x.device
+            (x_2d.shape[0], kernel_output_size), dtype=x.dtype, device=x.device
         )
         if x_2d.shape[0] == 0:
-            return out_2d.reshape(*x.shape[:-1], output_size)
+            return out_2d[:, :logical_output_size].reshape(
+                *x.shape[:-1], logical_output_size
+            )
         state = getattr(layer, sm70_tm.STATE_ATTR)
         split_k = int(layer.sm70_nvfp4_qpn2_split_k)
         nacc = int(layer.sm70_nvfp4_qpn2_nacc)
         if gated_silu:
-            split_k, nacc = _SM70_NVFP4_QPN2_CONFIGS[
-                (x_2d.shape[1], output_size * 2, True)
-            ]
-        if getattr(layer, "sm70_nvfp4_qpn2_prefill_enabled", False):
+            split_k, nacc = _qpn2_config(x_2d.shape[1], kernel_output_size * 2, True)
+        if getattr(layer, "sm70_nvfp4_qpn2_shared_weight", False):
+            min_prefill_m = (
+                envs.VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M
+                if layer.sm70_nvfp4_qpn2_prefill_enabled
+                else 0
+            )
+            sm70_ops.nvfp4_qpn2_tm_dispatch_sm70_out(
+                out_2d,
+                x_2d,
+                state.weight,
+                layer.sm70_nvfp4_qpn2_scales,
+                float(layer.sm70_nvfp4_qpn2_global_scale),
+                split_k,
+                nacc,
+                state.scales,
+                state.group_size,
+                state.k_ld,
+                state.q_ld,
+                gated_silu,
+                min_prefill_m,
+                state.prescaled_scales,
+            )
+        elif getattr(layer, "sm70_nvfp4_qpn2_prefill_enabled", False):
             sm70_ops.nvfp4_qpn2_prefill_dispatch_sm70_out(
                 out_2d,
                 x_2d,
@@ -523,6 +671,8 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                 state.q_ld,
                 gated_silu,
             )
+        if kernel_output_size != logical_output_size:
+            out_2d = out_2d[:, :logical_output_size]
         if bias is not None:
             out_2d.add_(bias)
-        return out_2d.reshape(*x.shape[:-1], output_size)
+        return out_2d.reshape(*x.shape[:-1], logical_output_size)

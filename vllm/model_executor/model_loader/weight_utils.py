@@ -679,15 +679,22 @@ def filter_duplicate_safetensors_files(
 
 
 def get_safetensors_index_weights_by_file(
-    hf_folder: str, index_file: str
+    hf_folder: str, index_file: str, hf_weights_files: list[str]
 ) -> dict[str, set[str]] | None:
-    """Return the exact tensor names assigned to each indexed shard.
+    """Return per-shard tensor allowlists, but only when the index needs them.
 
     A safetensors shard can contain tensors that are not referenced by the
     checkpoint index (for example, when a checkpoint reuses part of another
     model's shard).  The index is authoritative in that case: loading every
     tensor from an otherwise referenced file can inject stale or incompatible
     weights into the model.
+
+    Almost every checkpoint stores in each shard exactly the tensors the index
+    assigns to it, and for those this returns ``None`` so that all loader paths
+    keep their current behavior, including the accelerated backends that cannot
+    filter within a shard.  An allowlist is returned only when a shard actually
+    stores tensors the index did not assign to it.  Detecting this reads
+    safetensors headers, not tensor data.
     """
     index_file_name = os.path.join(hf_folder, index_file)
     if not os.path.isfile(index_file_name):
@@ -700,7 +707,18 @@ def get_safetensors_index_weights_by_file(
     for weight_name, filename in weight_map.items():
         shard_path = os.path.normpath(os.path.join(hf_folder, filename))
         weights_by_file[shard_path].add(weight_name)
-    return dict(weights_by_file)
+
+    for st_file in hf_weights_files:
+        indexed_weights = weights_by_file.get(os.path.normpath(st_file))
+        if indexed_weights is None:
+            # Shard is not covered by the index, so there is nothing to
+            # enforce. Leave the existing behavior untouched.
+            return None
+        with safe_open(st_file, framework="pt") as f:
+            stored_weights = set(f.keys())
+        if stored_weights - indexed_weights:
+            return dict(weights_by_file)
+    return None
 
 
 def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[str]:
@@ -920,6 +938,20 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+def _keep_weight(
+    name: str,
+    indexed_weights: set[str] | None,
+    local_expert_ids: set[int] | None,
+    skip_weight: Callable[[str], bool] | None,
+) -> bool:
+    """Decide from the name alone whether a tensor is read at all."""
+    if indexed_weights is not None and name not in indexed_weights:
+        return False
+    if should_skip_weight(name, local_expert_ids):
+        return False
+    return skip_weight is None or not skip_weight(name)
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -927,6 +959,7 @@ def safetensors_weights_iterator(
     local_expert_ids: set[int] | None = None,
     *,
     indexed_weights_by_file: Mapping[str, set[str]] | None = None,
+    skip_weight: Callable[[str], bool] | None = None,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -935,6 +968,11 @@ def safetensors_weights_iterator(
     When *local_expert_ids* is provided, expert weights not belonging to
     this rank are skipped **before** reading from disk, which drastically
     reduces storage I/O for MoE models under EP.
+
+    When *skip_weight* is provided, every tensor whose name it accepts is
+    skipped the same way. It lets a model that loads only part of a shared
+    checkpoint (e.g. a drafter shipped inside its target's checkpoint) avoid
+    reading the rest.
     """
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
@@ -1032,9 +1070,7 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
             for name, param in state_dict.items():
-                if indexed_weights is not None and name not in indexed_weights:
-                    continue
-                if not should_skip_weight(name, local_expert_ids):
+                if _keep_weight(name, indexed_weights, local_expert_ids, skip_weight):
                     yield name, param
         elif safetensors_load_strategy == "torchao":
             # we can't load flattened torchao tensor subclasses directly into the model
@@ -1051,9 +1087,9 @@ def safetensors_weights_iterator(
             with safe_open(st_file, framework="pt") as f:
                 state_dict = {}
                 for name in f.keys():  # noqa: SIM118
-                    if indexed_weights is not None and name not in indexed_weights:
-                        continue
-                    if should_skip_weight(name, local_expert_ids):
+                    if not _keep_weight(
+                        name, indexed_weights, local_expert_ids, skip_weight
+                    ):
                         continue
                     state_dict[name] = f.get_tensor(name)
 
@@ -1071,9 +1107,9 @@ def safetensors_weights_iterator(
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
-                    if indexed_weights is not None and name not in indexed_weights:
-                        continue
-                    if should_skip_weight(name, local_expert_ids):
+                    if not _keep_weight(
+                        name, indexed_weights, local_expert_ids, skip_weight
+                    ):
                         continue
                     param = f.get_tensor(name)
                     yield name, param

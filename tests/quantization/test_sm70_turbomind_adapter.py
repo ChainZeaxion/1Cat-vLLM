@@ -5,6 +5,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 
@@ -81,6 +82,80 @@ def test_mxfp4_unpack_flattens_last_two_block_dims_like_lmdeploy():
 
     assert weight.dtype == torch.uint8
     assert weight.tolist() == [[0, 4], [1, 5], [2, 6], [3, 7]]
+
+
+@pytest.mark.parametrize("logical_n", [24, 48])
+def test_nvfp4_prepare_pads_output_to_converter_alignment(monkeypatch, logical_n):
+    tm = _load_adapter()
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(
+        torch.zeros((logical_n, 16), dtype=torch.uint8), requires_grad=False
+    )
+    layer.weight_scale = torch.nn.Parameter(
+        torch.ones((logical_n, 2), dtype=torch.float16), requires_grad=False
+    )
+    layer.weight_global_scale = torch.nn.Parameter(
+        torch.tensor(0.25, dtype=torch.float32), requires_grad=False
+    )
+
+    from vllm import _sm70_ops as sm70_ops
+
+    prepared = []
+    physical_n = (logical_n + 31) // 32 * 32
+
+    def fake_prepare(qweight, scales, group_size, interleave_gated_silu):
+        prepared.append(
+            (
+                tuple(qweight.shape),
+                tuple(scales.shape),
+                group_size,
+                interleave_gated_silu,
+            )
+        )
+        return (
+            torch.empty((32, physical_n // 8), dtype=torch.int32),
+            torch.empty((2, physical_n), dtype=torch.float16),
+            torch.tensor([32, physical_n], dtype=torch.int64),
+        )
+
+    monkeypatch.setattr(sm70_ops, "nvfp4_sm70_prepare", fake_prepare)
+
+    tm.prepare_nvfp4_linear(layer)
+
+    state = getattr(layer, tm.STATE_ATTR)
+    assert prepared == [((32, physical_n), (2, physical_n), 16, False)]
+    assert state.output_size == logical_n
+
+
+def test_nvfp4_apply_crops_converter_padding(monkeypatch):
+    tm = _load_adapter()
+    layer = torch.nn.Module()
+    state = tm.SM70TurboMindLinearState(
+        weight=torch.empty((32, 4), dtype=torch.int32),
+        scales=torch.empty((2, 32), dtype=torch.float16),
+        group_size=16,
+        k_ld=32,
+        q_ld=32,
+        output_size=24,
+        op_kind="nvfp4",
+        padded_output_size=32,
+    )
+    setattr(layer, tm.STATE_ATTR, state)
+
+    from vllm import _sm70_ops as sm70_ops
+
+    def fake_gemm(out, *args):
+        del args
+        out.copy_(torch.arange(32, dtype=out.dtype).view(1, 32))
+
+    monkeypatch.setattr(sm70_ops, "nvfp4_gemm_sm70_out", fake_gemm)
+
+    output = tm.apply_prepared_linear(
+        layer, torch.ones((1, 32), dtype=torch.float16), bias=None
+    )
+
+    assert output.shape == (1, 24)
+    assert output.tolist() == [list(map(float, range(24)))]
 
 
 def test_symmetric_int4_zero_points_are_eight():

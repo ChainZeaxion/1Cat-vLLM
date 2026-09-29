@@ -398,10 +398,17 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/tm_registry_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/fp8_qpn8_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/mxfp4_qpn_m1_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_qpn_m1_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_grouped_decode_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_gdn_input_batch_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_ple_spec_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/rmsnorm_gated_exact_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/mtp_moe_fp16_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_qpn4_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_prefill_cutlass.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_qpn2_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/glm53_fp16_gemv_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/glm53_cublaslt_sm70.cpp"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_sm70_gemm.cu")
 
     set_gencode_flags_for_srcs(
@@ -751,6 +758,51 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
     $<$<COMPILE_LANGUAGE:CUDA>:-UNDEBUG;-lineinfo>)
   target_link_libraries(_sm70_sampler_C PRIVATE
     "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so")
+
+  # Native H3 kernels use ordinary Torch/Python ABI and remain independent of
+  # the existing primary SM70 extension's registrations.
+  define_extension_target(
+    _h3_w8a16_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "csrc/sm70_turbomind/ops/h3_w8a16.cu"
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES "70"
+    LIBRARIES CUDA::cublas CUDA::cublasLt "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
+    WITH_SOABI)
+  define_extension_target(
+    _h3_flashinfer_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "flashinfer-sm70/csrc/h3_noncausal_sm70.cu"
+    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_LIST_DIR}/flashinfer-sm70/include"
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES "70"
+    LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
+    WITH_SOABI)
+  define_extension_target(
+    _h3_flashattn_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "flash-attention-v100/kernel/h3/forward.cu"
+    INCLUDE_DIRECTORIES
+      "${CUTLASS_INCLUDE_DIR}"
+      "${cutlass_SOURCE_DIR}/examples/41_fused_multi_head_attention"
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES "70"
+    LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
+    WITH_SOABI)
+  define_extension_target(
+    _sm70_exact_reduce_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "csrc/sm70_turbomind/ops/exact_row_reduce.cu"
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS} "--fmad=false"
+    ARCHITECTURES "70"
+    LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
+    WITH_SOABI)
+  define_extension_target(
+    _sm70_sparse_attention_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "flash-attention-v100/kernel/h3/forward_sparse.cu"
+    INCLUDE_DIRECTORIES
+      "${CUTLASS_INCLUDE_DIR}"
+      "${cutlass_SOURCE_DIR}/examples/41_fused_multi_head_attention"
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES "70"
+    LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
+    WITH_SOABI)
 endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")

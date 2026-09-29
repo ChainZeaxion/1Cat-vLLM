@@ -176,6 +176,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("awq_sm70_prepare", torch::kCUDA, &awq_sm70_prepare);
 
   ops.def(
+      "awq_sm70_prepare_compact(Tensor _kernel, Tensor _scaling_factors, "
+      "Tensor _zeros, int group_size, bool interleave_gated_silu) -> "
+      "Tensor[]");
+  ops.impl("awq_sm70_prepare_compact", torch::kCUDA, &awq_sm70_prepare_compact);
+
+  ops.def(
       "awq_sm70_dequantize_out(Tensor(a!) out, Tensor _kernel, "
       "Tensor _scaling_factors, int group_size) -> ()");
   ops.impl("awq_sm70_dequantize_out", torch::kCUDA, &awq_sm70_dequantize_out);
@@ -209,6 +215,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("sm70_f16_prepare", torch::kCUDA, &sm70_f16_prepare);
 
   ops.def(
+      "sm70_glm53_tp8_cublaslt_out("
+      "Tensor(a!) out, Tensor input, Tensor weight) -> ()");
+  ops.impl("sm70_glm53_tp8_cublaslt_out", torch::kCUDA,
+           &sm70_glm53_tp8_cublaslt_out);
+
+  ops.def(
       "awq_gemm_sm70(Tensor _in_feats, Tensor _kernel, Tensor "
       "_scaling_factors, int group_size, int k_ld, int q_ld) -> Tensor");
   ops.impl("awq_gemm_sm70", torch::kCUDA, &awq_gemm_sm70);
@@ -233,7 +245,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "fp8_gemm_sm70_out(Tensor(a!) out, Tensor _in_feats, Tensor _kernel, "
       "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
-      "bool gated_silu) -> ()");
+      "bool gated_silu, bool preserve_default_partition=False) -> ()");
   ops.impl("fp8_gemm_sm70_out", torch::kCUDA, &fp8_gemm_sm70_out);
 
   ops.def("fp8_qpn8_prepare_sm70(Tensor qweight, Tensor scales) -> Tensor[]");
@@ -346,6 +358,33 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor[]");
   ops.impl("nvfp4_qpn2_prepare_sm70", torch::kCUDA, &nvfp4_qpn2_prepare_sm70);
 
+  ops.def("nvfp4_qpn2_prepare_scales_sm70(Tensor weight_scale) -> Tensor");
+  ops.def(
+      "nvfp4_qpn2_restore_tm_scales_sm70_out(Tensor(a!) out, "
+      "Tensor scales, float global_scale) -> ()");
+  ops.impl("nvfp4_qpn2_restore_tm_scales_sm70_out", torch::kCUDA,
+           &nvfp4_qpn2_restore_tm_scales_sm70_out);
+  // Python may be newer than the loaded extension. Only this version retains
+  // compact-scale scratch across layers in larger CUDA graphs.
+  ops.def("nvfp4_qpn2_compact_scales_version_sm70() -> int",
+          []() -> int64_t { return 1; });
+  ops.def(
+      "nvfp4_qpn2_compact_tm_gemm_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor weight, Tensor scales, float global_scale, int k_ld, "
+      "int q_ld, bool gated_silu) -> ()");
+  ops.impl("nvfp4_qpn2_compact_tm_gemm_sm70_out", torch::kCUDA,
+           &nvfp4_qpn2_compact_tm_gemm_sm70_out);
+  ops.impl("nvfp4_qpn2_prepare_scales_sm70", torch::kCUDA,
+           &nvfp4_qpn2_prepare_scales_sm70);
+  ops.def(
+      "nvfp4_qpn2_tm_dispatch_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor tm_weight, Tensor scales, float global_scale, int split_k, "
+      "int accumulator_chains, Tensor tm_scales, int tm_group_size, "
+      "int tm_k_ld, int tm_q_ld, bool gated_silu, int min_prefill_m, "
+      "bool prescaled_scales=False) -> ()");
+  ops.impl("nvfp4_qpn2_tm_dispatch_sm70_out", torch::kCUDA,
+           &nvfp4_qpn2_tm_dispatch_sm70_out);
+
   ops.def(
       "nvfp4_qpn2_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
       "Tensor scales, float global_scale, int split_k, "
@@ -397,6 +436,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("nvfp4_gemm_sm70_out", torch::kCUDA, &nvfp4_gemm_sm70_out);
 
   ops.def(
+      "nvfp4_gemm_sm70_prescaled_out(Tensor(a!) out, Tensor input, "
+      "Tensor weight, Tensor scales, int group_size, int k_ld, int q_ld, "
+      "bool gated_silu) -> ()");
+  ops.impl("nvfp4_gemm_sm70_prescaled_out", torch::kCUDA,
+           &nvfp4_gemm_sm70_prescaled_out);
+
+  ops.def(
       "nvfp4_gemv_sm70_raw_out(Tensor(a!) out, Tensor _in_feats, "
       "Tensor _kernel, Tensor _scaling_factors, Tensor(b!) partials, "
       "int group_size, int split_k) -> ()");
@@ -440,6 +486,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &sm70_glm_mhc_pre_norm_out);
 
   ops.def(
+      "sm70_glm_mhc_post_dot_q8_out("
+      "Tensor(a!) residual_out, Tensor(b!) gemm_mul, "
+      "Tensor(c!) gemm_sqrsum, Tensor comb_mix, Tensor residual, "
+      "Tensor post_mix, Tensor x, Tensor weight, int tile_n) -> ()");
+  ops.impl("sm70_glm_mhc_post_dot_q8_out", torch::kCUDA,
+           &sm70_glm_mhc_post_dot_q8_out);
+
+  ops.def(
       "sm70_glm_kda_fg_b_out(Tensor(a!) f_out, Tensor(b!) g_out, "
       "Tensor f_input, Tensor g_input, Tensor f_weight, Tensor g_weight) -> "
       "()");
@@ -449,6 +503,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "sm70_glm53_fp16_gemv_out(Tensor(a!) output, Tensor input, Tensor "
       "weight) -> ()");
   ops.impl("sm70_glm53_fp16_gemv_out", torch::kCUDA, &sm70_glm53_fp16_gemv_out);
+
+  ops.def(
+      "sm70_glm53_moe_permute_q8_out("
+      "Tensor input, Tensor topk_ids, Tensor(a!) permuted_input, "
+      "Tensor(b!) sorted_row_idx, Tensor(c!) inv_permuted_idx, "
+      "Tensor(d!) compact_offsets, Tensor(e!) active_expert_ids) -> ()");
+  ops.impl("sm70_glm53_moe_permute_q8_out", torch::kCUDA,
+           &sm70_glm53_moe_permute_q8_out);
 
   ops.def(
       "sm70_f16_indexed_rerank_out(Tensor(a!) out, Tensor _in_feats, "
@@ -534,6 +596,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor _gate_weight) -> ()");
   ops.impl("sm70_f16_gate_mul_out", torch::kCUDA, &sm70_f16_gate_mul_out);
 
+  ops.def(
+      "qwen38_shared_gate_exact_out(Tensor(a!) out, Tensor input, "
+      "Tensor weight) -> ()");
+  ops.impl("qwen38_shared_gate_exact_out", torch::kCUDA,
+           &qwen38_shared_gate_exact_out);
+  ops.def(
+      "qwen38_shared_gate_sigmoid_mul_out(Tensor(a!) out, Tensor logits) -> "
+      "()");
+  ops.impl("qwen38_shared_gate_sigmoid_mul_out", torch::kCUDA,
+           &qwen38_shared_gate_sigmoid_mul_out);
+
   ops.def("sm70_gemm_import_cache(Tensor device_hint, str path) -> int");
   ops.impl("sm70_gemm_import_cache", torch::kCUDA, &sm70_gemm_import_cache);
 
@@ -569,12 +642,33 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &awq_moe_dense_stage_sm70_out);
 
   ops.def(
+      "awq_moe_indexed_dense_w13_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor input_row_indices, "
+      "Tensor expert_offsets, Tensor dense_expert_ids, Tensor ptrs_w, "
+      "Tensor ptrs_s, int num_experts, int k, int n, int group_size) -> ()");
+  ops.impl("awq_moe_indexed_dense_w13_sm70_out", torch::kCUDA,
+           &awq_moe_indexed_dense_w13_sm70_out);
+
+  ops.def(
       "awq_moe_active_dense_stage_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor permuted_experts_id, "
-      "Tensor active_expert_offsets, Tensor active_expert_ids, Tensor ptrs_w, "
+      "Tensor(b!) active_expert_offsets, Tensor(c!) active_expert_ids, Tensor "
+      "ptrs_w, "
       "Tensor ptrs_s, int total_slots, int k, int n, int group_size) -> ()");
   ops.impl("awq_moe_active_dense_stage_sm70_out", torch::kCUDA,
            &awq_moe_active_dense_stage_sm70_out);
+
+  ops.def(
+      "awq_moe_chunked_w2_sm70_out("
+      "Tensor(a!) out, Tensor(b!) chunk_output, Tensor input, "
+      "Tensor expert_offsets, Tensor permuted_idx, Tensor topk_weights, "
+      "Tensor(c!) chunk_expert_offsets, Tensor(d!) chunk_range_begin, "
+      "Tensor(e!) chunk_range_end, Tensor(f!) chunk_a_indices, "
+      "Tensor(g!) chunk_inv_permuted_idx, Tensor ptrs_w, Tensor ptrs_s, "
+      "int num_tokens, int top_k, int num_experts, int k, int n, "
+      "int hidden_logical_size, int group_size, int chunk_tokens) -> ()");
+  ops.impl("awq_moe_chunked_w2_sm70_out", torch::kCUDA,
+           &awq_moe_chunked_w2_sm70_out);
 
   ops.def(
       "awq_moe_single_token_dense_stage_sm70_out("
@@ -654,6 +748,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &awq_moe_single_token_sm70_out);
 
   ops.def(
+      "awq_moe_qpn_m1_sm70_out(Tensor(a!) out, Tensor(b!) intermediate, "
+      "Tensor input, Tensor w13, Tensor s13, Tensor w2, Tensor s2, "
+      "Tensor ids, Tensor topk) -> ()");
+  ops.impl("awq_moe_qpn_m1_sm70_out", torch::kCUDA, &awq_moe_qpn_m1_sm70_out);
+
+  ops.def(
       "fp8_moe_gemm_sm70_out(Tensor(a!) out, Tensor sorted_input, "
       "Tensor expert_offsets, Tensor strided_ptrs_w, Tensor strided_ptrs_s, "
       "int num_experts, int k, int n, int group_size, bool gated_silu) -> ()");
@@ -696,6 +796,79 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor expert_ids, bool broadcast_input, int split_k) -> ()");
   ops.impl("nvfp4_moe_qpn_m1_sm70_out", torch::kCUDA,
            &nvfp4_moe_qpn_m1_sm70_out);
+
+  ops.def(
+      "nvfp4_expand_raw_scales_sm70_out("
+      "Tensor(a!) out, Tensor scale_codes, Tensor global_scales, "
+      "bool interleaved_w13, bool fast_decode_rounding) -> ()");
+  ops.impl("nvfp4_expand_raw_scales_sm70_out", torch::kCUDA,
+           &nvfp4_expand_raw_scales_sm70_out);
+
+  ops.def(
+      "nvfp4_moe_qpn_raw_scale_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scale_codes, "
+      "Tensor global_scales, Tensor expert_ids, bool broadcast_input, "
+      "bool interleaved_w13, int split_k) -> ()");
+  ops.impl("nvfp4_moe_qpn_raw_scale_sm70_out", torch::kCUDA,
+           &nvfp4_moe_qpn_raw_scale_sm70_out);
+
+  ops.def(
+      "nvfp4_moe_qpn_w13_swiglu_batch_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids, bool interleaved) -> ()");
+  ops.impl("nvfp4_moe_qpn_w13_swiglu_batch_sm70_out", torch::kCUDA,
+           &nvfp4_moe_qpn_w13_swiglu_batch_sm70_out);
+
+  ops.def(
+      "nvfp4_moe_qpn_raw_w13_swiglu_batch_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scale_codes, "
+      "Tensor global_scales, Tensor expert_ids, bool interleaved) -> ()");
+  ops.impl("nvfp4_moe_qpn_raw_w13_swiglu_batch_sm70_out", torch::kCUDA,
+           &nvfp4_moe_qpn_raw_w13_swiglu_batch_sm70_out);
+
+  ops.def(
+      "nvfp4_moe_qpn_w2_reduce_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids, Tensor topk_weights) -> ()");
+  ops.impl("nvfp4_moe_qpn_w2_reduce_sm70_out", torch::kCUDA,
+           &nvfp4_moe_qpn_w2_reduce_sm70_out);
+
+  ops.def(
+      "nvfp4_moe_qpn_raw_w2_reduce_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scale_codes, "
+      "Tensor global_scales, Tensor expert_ids, Tensor topk_weights) -> ()");
+  ops.impl("nvfp4_moe_qpn_raw_w2_reduce_sm70_out", torch::kCUDA,
+           &nvfp4_moe_qpn_raw_w2_reduce_sm70_out);
+
+  ops.def(
+      "nvfp4_qwen38_w2_direct_reduce_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids, Tensor topk_weights) -> ()");
+  ops.impl("nvfp4_qwen38_w2_direct_reduce_out", torch::kCUDA,
+           &nvfp4_qwen38_w2_direct_reduce_out);
+
+  ops.def(
+      "nvfp4_qwen38_w13_fused_swiglu_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids) -> ()");
+  ops.impl("nvfp4_qwen38_w13_fused_swiglu_out", torch::kCUDA,
+           &nvfp4_qwen38_w13_fused_swiglu_out);
+
+  // Keep the five-row verifier on a distinct schema so an old extension that
+  // only supports the ten-route M=1 contract cannot be selected accidentally.
+  ops.def(
+      "nvfp4_moe_qpn_mtp5_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids, bool broadcast_input, int split_k) -> ()");
+  ops.impl("nvfp4_moe_qpn_mtp5_sm70_out", torch::kCUDA,
+           &nvfp4_moe_qpn_mtp5_sm70_out);
+
+  ops.def(
+      "nvfp4_glm53_moe_q8_qpn_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids, Tensor sorted_row_idx, bool w13) -> ()");
+  ops.impl("nvfp4_glm53_moe_q8_qpn_sm70_out", torch::kCUDA,
+           &nvfp4_glm53_moe_q8_qpn_sm70_out);
 
   ops.def(
       "nvfp4_moe_dense_stage_sm70_out("
@@ -895,6 +1068,33 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
       "all_reduce_sum2(int fa, Tensor inp_a, Tensor inp_b, Tensor! out) -> ()");
   custom_ar.impl("all_reduce_sum2", torch::kCUDA, &all_reduce_sum2);
   custom_ar.def(
+      "sm70_qwen38_hc_down_allgather(int fa, Tensor inp, Tensor! out) -> ()");
+  custom_ar.impl("sm70_qwen38_hc_down_allgather", torch::kCUDA,
+                 &sm70_qwen38_hc_down_allgather);
+  custom_ar.def(
+      "sm70_qwen38_hc_batch(int fa, Tensor input, Tensor packed_down, "
+      "Tensor packed_up, Tensor(a!) partials, Tensor(b!) lora, "
+      "Tensor(c!) local_output, Tensor(d!) output, Tensor(e!) injection, "
+      "bool round_down_partials=False, bool cooperative=False, bool "
+      "full_unroll=False, bool fused_chain=False) -> "
+      "()");
+  custom_ar.impl("sm70_qwen38_hc_batch", torch::kCUDA, &sm70_qwen38_hc_batch);
+  custom_ar.def(
+      "sm70_qwen38_hc_gate_mix(int fa, Tensor local_gate, Tensor branches, "
+      "Tensor! out) -> ()");
+  custom_ar.impl("sm70_qwen38_hc_gate_mix", torch::kCUDA,
+                 &sm70_qwen38_hc_gate_mix);
+  custom_ar.def(
+      "sm70_qwen38_hc_output_allgather(int fa, Tensor local_block, "
+      "Tensor! out) -> ()");
+  custom_ar.impl("sm70_qwen38_hc_output_allgather", torch::kCUDA,
+                 &sm70_qwen38_hc_output_allgather);
+  custom_ar.def(
+      "sm70_qwen38_hc_up_mix_allgather(int fa, Tensor lora, Tensor weight, "
+      "Tensor branches, Tensor! out) -> ()");
+  custom_ar.impl("sm70_qwen38_hc_up_mix_allgather", torch::kCUDA,
+                 &sm70_qwen38_hc_up_mix_allgather);
+  custom_ar.def(
       "top1_argmax(int fa, Tensor input_pair, Tensor! output, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
   custom_ar.impl("top1_argmax", torch::kCUDA, &top1_argmax);
@@ -920,10 +1120,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
   custom_ar.def("meta_size", &meta_size);
   custom_ar.def("sm70_tp4_push_allreduce_buffer_size",
                 &sm70_tp4_push_allreduce_buffer_size);
+  custom_ar.def("sm70_tp8_hierarchical_push_allreduce_buffer_size",
+                &sm70_tp8_hierarchical_push_allreduce_buffer_size);
 
   custom_ar.def("register_buffer", &register_buffer);
   custom_ar.def("register_sm70_tp4_push_allreduce_buffer",
                 &register_sm70_tp4_push_allreduce_buffer);
+  custom_ar.def("register_sm70_tp8_hierarchical_push_allreduce_buffer",
+                &register_sm70_tp8_hierarchical_push_allreduce_buffer);
   custom_ar.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
   custom_ar.def("register_graph_buffers", &register_graph_buffers);
 

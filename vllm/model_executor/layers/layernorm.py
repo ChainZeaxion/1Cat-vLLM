@@ -9,6 +9,7 @@ import torch.nn.functional as F
 # Import kernels
 import vllm.kernels  # noqa: F401
 from vllm import envs, ir
+from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
@@ -18,6 +19,150 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+
+
+@torch.compiler.assume_constant_result
+def _sm70_gated_norm_device_supported(device_id: int | None) -> bool:
+    # Capability is static for the device guarded by the compiled tensor input.
+    # Do not trace the platform's cached NVML/PyTorch capability query.
+    return current_platform.is_device_capability(70, device_id=device_id)
+
+
+def _sm70_gated_norm_shape_supported(
+    x: torch.Tensor, z: torch.Tensor | None, weight: torch.Tensor
+) -> bool:
+    return bool(
+        z is not None
+        and x.ndim == 2
+        and 1 <= x.shape[0] <= 192
+        and x.shape[1] == 128
+        and z.shape == x.shape
+        and weight.shape == (128,)
+        and x.dtype == z.dtype == weight.dtype == torch.float16
+        and x.device == z.device == weight.device
+        and x.is_contiguous()
+        and z.is_contiguous()
+        and weight.is_contiguous()
+    )
+
+
+def _sm70_rmsnorm_gated_exact_impl(
+    x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float, silu: bool
+) -> torch.Tensor:
+    logger.info_once(
+        "SM70 exact native gated RMSNorm fusion enabled "
+        "(N128, sigmoid/SiLU, M1 and batch)."
+    )
+    out = torch.empty_like(x)
+    torch.ops._C.sm70_rmsnorm_gated_exact_out(out, x, z, weight, eps, silu)
+    return out
+
+
+def _sm70_rmsnorm_gated_exact_fake(
+    x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float, silu: bool
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="sm70_rmsnorm_gated_exact",
+    op_func=_sm70_rmsnorm_gated_exact_impl,
+    fake_impl=_sm70_rmsnorm_gated_exact_fake,
+)
+
+
+@triton.jit
+def _sm70_dflash2_fixed_gemma_rms_kernel(
+    x,
+    residual,
+    weight,
+    normalized_out,
+    residual_out,
+    HAS_RESIDUAL: tl.constexpr,
+    epsilon: tl.constexpr,
+):
+    # Pin both the reduction extent and warp count. Inductor's 2048/8192
+    # autotune changes FP32 reduction order, including between TP ranks.
+    row = tl.program_id(0)
+    cols = tl.arange(0, 8192)
+    mask = cols < 5120
+    values = tl.load(x + row * 5120 + cols, mask=mask, other=0.0).to(tl.float32)
+    if HAS_RESIDUAL:
+        values += tl.load(residual + row * 5120 + cols, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        tl.store(residual_out + row * 5120 + cols, values, mask=mask)
+    # Preserve the masked square and residual materialization of the pinned
+    # Inductor reduction. Removing this boundary changes FMA contraction for
+    # sums of two FP16 inputs even with an identical reduction tile.
+    variance = tl.sum(tl.where(mask, values * values, 0.0), axis=0) / 5120.0
+    inverse_rms = tl.rsqrt(variance + epsilon)
+    if HAS_RESIDUAL:
+        values = tl.load(residual_out + row * 5120 + cols, mask=mask, other=0.0)
+    gemma_weight = tl.load(weight + cols, mask=mask, other=0.0).to(tl.float32) + 1.0
+    tl.store(
+        normalized_out + row * 5120 + cols,
+        values * inverse_rms * gemma_weight,
+        mask=mask,
+    )
+
+
+def _sm70_dflash2_fixed_gemma_rms_norm(
+    x: torch.Tensor,
+    residual: torch.Tensor | None,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    normalized_out = torch.empty_like(x)
+    residual_out = (
+        torch.empty_like(x, dtype=torch.float32) if residual is not None else None
+    )
+    _sm70_dflash2_fixed_gemma_rms_kernel[(x.shape[0],)](
+        x,
+        residual,
+        weight,
+        normalized_out,
+        residual_out,
+        HAS_RESIDUAL=residual is not None,
+        epsilon=variance_epsilon,
+        num_warps=16,
+        num_stages=1,
+        enable_fp_fusion=True,
+    )
+    if residual_out is None:
+        return normalized_out
+    return normalized_out, residual_out
+
+
+def _use_sm70_dflash2_fixed_gemma_rms(
+    x: torch.Tensor,
+    residual: torch.Tensor | None,
+    weight: torch.Tensor,
+) -> bool:
+    return bool(
+        envs.VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS
+        and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+        and _sm70_gemma_long_prefill_available()
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and x.ndim == 2
+        and x.shape[0] > 0
+        and x.shape[1] == 5120
+        and x.is_contiguous()
+        and weight.device == x.device
+        and weight.dtype == torch.float16
+        and weight.shape == (5120,)
+        and weight.is_contiguous()
+        and (
+            residual is None
+            or (
+                residual.dtype == torch.float16
+                and residual.device == x.device
+                and residual.shape == x.shape
+                and residual.is_contiguous()
+            )
+        )
+    )
 
 
 @triton.jit
@@ -395,6 +540,7 @@ class GemmaRMSNorm(CustomOp):
         return (
             envs.VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE
             and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            and use_sm70_decode_graph_semantics()
             and torch.compiler.is_compiling()
             and x.is_cuda
         )
@@ -427,6 +573,10 @@ class GemmaRMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
+        if _use_sm70_dflash2_fixed_gemma_rms(x, residual, self.weight):
+            return _sm70_dflash2_fixed_gemma_rms_norm(
+                x, residual, self.weight, self.variance_epsilon
+            )
         if _use_sm70_dflash2_gemma_fused_add_rms(x, residual, self.weight):
             assert residual is not None
             return _sm70_dflash2_gemma_fused_add_rms_norm(
@@ -481,6 +631,10 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if _use_sm70_dflash2_fixed_gemma_rms(x, residual, self.weight):
+            return _sm70_dflash2_fixed_gemma_rms_norm(
+                x, residual, self.weight, self.variance_epsilon
+            )
         if _use_sm70_dflash2_gemma_fused_add_rms(x, residual, self.weight):
             assert residual is not None
             return _sm70_dflash2_gemma_fused_add_rms_norm(
@@ -627,6 +781,19 @@ class RMSNormGated(CustomOp):
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
+        if (
+            envs.VLLM_SM70_RMSNORM_GATED_EXACT
+            and not envs.VLLM_BATCH_INVARIANT
+            and x.is_cuda
+            and _sm70_gated_norm_device_supported(x.device.index)
+            and self.group_size is None
+            and self.norm_before_gate
+            and self.activation in ("sigmoid", "silu", "swish")
+            and _sm70_gated_norm_shape_supported(x, z, self.weight)
+        ):
+            return torch.ops.vllm.sm70_rmsnorm_gated_exact(
+                x, z, self.weight, self.eps, self.activation != "sigmoid"
+            )
         return self.forward_static(
             x,
             z,

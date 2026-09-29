@@ -905,6 +905,28 @@ def test_qsa_lexicographic_topk_is_exact_and_repeatable() -> None:
         torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("live_length", [2048, 2304, 2305])
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
+def test_qsa_lexicographic_topk_decode_boundary_is_exact(
+    live_length: int,
+) -> None:
+    """The decode fast path and its capacity fallback retain exact ties."""
+
+    torch.set_default_device("cuda:0")
+    top_k = 512
+    logits = torch.randn((1, 4096), dtype=torch.float32)
+    logits[0, :live_length:3] = 0.0
+    lengths = torch.tensor([live_length], dtype=torch.int32)
+    output = torch.empty((1, top_k), dtype=torch.int32)
+    expected = _qsa_lexicographic_topk_reference(logits, [live_length], top_k)
+
+    for _ in range(10):
+        torch.ops._C.qsa_lexicographic_topk(logits, lengths, output, top_k)
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
 @torch.inference_mode()
 def test_qsa_lexicographic_topk_supports_prefill_batches() -> None:
@@ -928,6 +950,44 @@ def test_qsa_lexicographic_topk_supports_prefill_batches() -> None:
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("rows", [5, 10])
+@pytest.mark.parametrize("columns", [8364, 16384])
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@torch.inference_mode()
+def test_qsa_mtp_topk_changed_graph_lengths_are_exact(rows, columns) -> None:
+    """Compaction, the per-row fallback and the long-buffer gate share ties."""
+    torch.manual_seed(20260927)
+    logits = torch.empty((rows, columns + 16), device="cuda")[:, :columns]
+    lengths = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    output = torch.empty((rows, 512), dtype=torch.int32, device="cuda")
+    reference = torch.empty_like(output)
+
+    def call():
+        torch.ops._C.qsa_lexicographic_topk(logits, lengths, output, 512, True)
+
+    call()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    boundaries = [0, 256, 512, 2048, 2176, 2304, 2305, columns]
+    for step in range(4):
+        logits.normal_()
+        logits[:, ::3] = 0.0
+        logits[:, 1::7] = -0.0
+        logits[:, 2::31] = float("inf")
+        logits[:, 3::37] = float("-inf")
+        live_lengths = [
+            boundaries[(row + step) % len(boundaries)] for row in range(rows)
+        ]
+        lengths.copy_(torch.tensor(live_lengths, dtype=torch.int32, device="cuda"))
+        graph.replay()
+        torch.ops._C.qsa_lexicographic_topk(logits, lengths, reference, 512)
+        expected = _qsa_lexicographic_topk_reference(logits, live_lengths, 512)
+        torch.testing.assert_close(output, reference, rtol=0, atol=0)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
 @torch.inference_mode()
 def test_qsa_lexicographic_topk_cuda_graph_replay_is_stable() -> None:
@@ -935,7 +995,7 @@ def test_qsa_lexicographic_topk_cuda_graph_replay_is_stable() -> None:
 
     torch.set_default_device("cuda:0")
     top_k = 512
-    live_length = 4096
+    live_length = 2176
     logits = torch.zeros((1, 8192), dtype=torch.float32)
     lengths = torch.tensor([live_length], dtype=torch.int32)
     output = torch.empty((1, top_k), dtype=torch.int32)

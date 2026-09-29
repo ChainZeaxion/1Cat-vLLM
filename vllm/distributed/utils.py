@@ -14,7 +14,7 @@ import sys
 import time
 import uuid
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import timedelta
 from typing import Any
 
@@ -138,6 +138,21 @@ def get_pp_indices(
     end_layer = start_layer + partitions[pp_rank]
 
     return (start_layer, end_layer)
+
+
+def get_layers_outside_first_pp_rank(
+    layer_indices: Iterable[int], num_hidden_layers: int, pp_size: int
+) -> tuple[list[int], int]:
+    """Return the given layer indices the pipeline partition places beyond the
+    first rank, together with the exclusive end of the first rank's range.
+
+    Honours ``VLLM_PP_LAYER_PARTITION`` through :func:`get_pp_indices`, so a
+    caller that needs certain layers on the first rank can check the actual
+    split instead of refusing ``pp_size > 1`` outright.
+    """
+    _, first_rank_end = get_pp_indices(num_hidden_layers, 0, pp_size)
+    misplaced = sorted(index for index in layer_indices if index >= first_rank_end)
+    return misplaced, first_rank_end
 
 
 def create_tcp_store(
@@ -498,6 +513,17 @@ def get_cpu_distributed_timeout_or_none() -> timedelta | None:
     if vllm_config is None:
         return None
     timeout_seconds = vllm_config.parallel_config.cpu_distributed_timeout_seconds
+    return timedelta(seconds=timeout_seconds) if timeout_seconds is not None else None
+
+
+def get_distributed_timeout_or_none() -> timedelta | None:
+    """Timeout for the device (NCCL) subgroups, from the current vLLM config."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        return None
+    timeout_seconds = vllm_config.parallel_config.distributed_timeout_seconds
     return timedelta(seconds=timeout_seconds) if timeout_seconds is not None else None
 
 

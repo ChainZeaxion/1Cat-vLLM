@@ -17,6 +17,7 @@ from shutil import which
 import torch
 from packaging.version import Version, parse
 from setuptools import Extension, find_packages, setup
+from setuptools.command.bdist_wheel import bdist_wheel
 from setuptools.command.build_ext import build_ext
 from setuptools_rust import Binding, RustExtension
 from setuptools_rust.build import build_rust
@@ -280,14 +281,17 @@ def bundle_flash_qla_sm70(build_lib: str, build_temp: str) -> None:
 def remove_rpath(path: Path) -> None:
     patchelf = which("patchelf")
     if patchelf is None:
-        logger.warning("patchelf not found; leaving RPATH unchanged for %s", path)
-        return
-    subprocess.run([patchelf, "--remove-rpath", str(path)], check=False)
+        raise RuntimeError(
+            "patchelf is required to build a portable 1Cat SM70 wheel; "
+            f"refusing to leave a build-host RPATH in {path}"
+        )
+    subprocess.run([patchelf, "--remove-rpath", str(path)], check=True)
 
 
 class CMakeExtension(Extension):
     def __init__(self, name: str, cmake_lists_dir: str = ".", **kwa) -> None:
-        super().__init__(name, sources=[], py_limited_api=not is_freethreaded(), **kwa)
+        kwa.setdefault("py_limited_api", not is_freethreaded())
+        super().__init__(name, sources=[], **kwa)
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
 
 
@@ -493,8 +497,12 @@ class cmake_build_ext(build_ext):
             bundle_tcmalloc(self.build_lib)
 
         if _is_cuda():
-            bundle_flash_attn_v100(self.build_lib)
-            bundle_flash_qla_sm70(self.build_lib, self.build_temp)
+            # In-place imports resolve the source packages, not build/lib.
+            # Bundle companion kernels beside them just like the native _C
+            # extensions; wheel builds still stage everything in build_lib.
+            bundle_dir = str(ROOT_DIR) if self.inplace else self.build_lib
+            bundle_flash_attn_v100(bundle_dir)
+            bundle_flash_qla_sm70(bundle_dir, self.build_temp)
 
         # copy vllm/vllm_flash_attn/**/*.py from self.build_lib to current
         # directory so that they can be included in the editable build
@@ -539,6 +547,33 @@ class cmake_build_ext(build_ext):
                     "vllm/third_party/deep_gemm",
                     dirs_exist_ok=True,
                 )
+
+
+class vllm_bdist_wheel(bdist_wheel):
+    """Use interpreter-specific tags when native libraries require the full ABI."""
+
+    def finalize_options(self) -> None:
+        super().finalize_options()
+        full_api_extensions = any(
+            not extension.py_limited_api
+            for extension in self.distribution.ext_modules or []
+        )
+        # Precompiled wheels supply native libraries through package_data, even
+        # when TORCH_CUDA_ARCH_LIST does not declare their CMake targets.
+        cpython_package_data = any(
+            re.search(r"\.cpython-\d+[^/]*\.so$", filename)
+            for filenames in (self.distribution.package_data or {}).values()
+            for filename in filenames
+        )
+        if full_api_extensions or cpython_package_data:
+            self.root_is_pure = False
+            if self.py_limited_api:
+                logger.warning(
+                    "Ignoring --py-limited-api=%s: wheel contains "
+                    "CPython-specific native extensions",
+                    self.py_limited_api,
+                )
+                self.py_limited_api = None
 
 
 class precompiled_build_ext(build_ext):
@@ -891,8 +926,12 @@ class precompiled_wheel_utils:
                 flash_qla_sm70_ext_regex = re.compile(
                     r"flash_qla/ops/gated_delta_rule/chunk/sm70/[^/]+\.so"
                 )
-                sm70_sampler_ext_regex = re.compile(
-                    r"vllm/_sm70_sampler_C(?:\.[^/]+)?\.so$"
+                sm70_ext_regex = re.compile(
+                    r"vllm/_sm70_(?:sampler|exact_reduce|sparse_attention)_C"
+                    r"(?:\.[^/]+)?\.so$"
+                )
+                h3_ext_regex = re.compile(
+                    r"vllm/_h3_(?:w8a16|flashinfer|flashattn)_C(?:\.[^/]+)?\.so$"
                 )
                 file_members = []
                 for member in wheel.filelist:
@@ -913,7 +952,8 @@ class precompiled_wheel_utils:
                         or deep_gemm_regex.match(member.filename)
                         or flash_attn_v100_ext_regex.match(member.filename)
                         or flash_qla_sm70_ext_regex.match(member.filename)
-                        or sm70_sampler_ext_regex.match(member.filename)
+                        or sm70_ext_regex.match(member.filename)
+                        or h3_ext_regex.match(member.filename)
                     ):
                         file_members.append(member)
 
@@ -1241,6 +1281,23 @@ if _is_hip():
 if _is_cuda():
     if _cuda_arch_contains(7, 0):
         ext_modules.append(CMakeExtension(name="vllm._sm70_sampler_C"))
+        # These extensions use pybind11/libtorch_python and therefore require
+        # the interpreter-specific CPython ABI suffix emitted by CMake.
+        ext_modules.append(
+            CMakeExtension(name="vllm._sm70_exact_reduce_C", py_limited_api=False)
+        )
+        ext_modules.append(
+            CMakeExtension(name="vllm._h3_w8a16_C", py_limited_api=False)
+        )
+        ext_modules.append(
+            CMakeExtension(name="vllm._h3_flashinfer_C", py_limited_api=False)
+        )
+        ext_modules.append(
+            CMakeExtension(name="vllm._h3_flashattn_C", py_limited_api=False)
+        )
+        ext_modules.append(
+            CMakeExtension(name="vllm._sm70_sparse_attention_C", py_limited_api=False)
+        )
     build_sm70_fa2 = _cuda_arch_contains(7, 0) and not _cuda_arch_at_least(8, 0)
     if _cuda_arch_at_least(8, 0) or build_sm70_fa2:
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
@@ -1360,6 +1417,7 @@ else:
     }
 if USE_PRECOMPILED_RUST_FRONTEND or PRECOMPILED_RUST_FRONTEND_PATH.exists():
     cmdclass["build_rust"] = precompiled_build_rust
+cmdclass["bdist_wheel"] = vllm_bdist_wheel
 
 # Rust frontend binary, built via setuptools-rust and installed into the
 # package directory alongside the Python modules.
@@ -1402,7 +1460,19 @@ setup(
             "soundfile",
             "mistral_common[audio]",
         ],  # Required for audio processing
-        "video": [],  # Kept for backwards compatibility
+        "image": ["diffusers==0.40.0", "accelerate>=1.12", "nvidia-ml-py"],
+        "video": [
+            "diffusers==0.40.0",
+            "av>=14",
+            "imageio>=2.37.2",
+            "imageio-ffmpeg>=0.6",
+            "soundfile>=0.13",
+            "scipy",
+            "einops",
+            "omegaconf",
+            "accelerate>=1.12",
+            "nvidia-ml-py",
+        ],
         "flashinfer": [],  # Kept for backwards compatibility
         # Optional deps for Helion kernel development
         # NOTE: When updating helion version, also update CI files:

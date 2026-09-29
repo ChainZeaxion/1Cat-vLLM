@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch.nn.parameter import Parameter
 
@@ -101,14 +102,15 @@ def test_nvfp4_qpn2_dflash2_default_contract(monkeypatch):
             "get_current_vllm_config",
             lambda: _runtime_config(tp=2),
         )
-        assert not nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
+        assert nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
 
         monkeypatch.setattr(
             nvfp4_scheme,
             "get_current_vllm_config",
-            lambda: _runtime_config(max_num_seqs=2),
+            lambda: _runtime_config(max_num_seqs=256),
         )
-        assert not nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
+        assert nvfp4_scheme._sm70_nvfp4_qpn2_enabled()
+        assert nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
     finally:
         envs.disable_envs_cache()
 
@@ -127,7 +129,7 @@ def test_nvfp4_qpn2_dflash2_explicit_rollback(monkeypatch):
         envs.disable_envs_cache()
 
 
-def test_nvfp4_qpn2_shape_gate_is_exact_tp4():
+def test_nvfp4_qpn2_shape_gate_ignores_tp_size():
     layer = SimpleNamespace(
         tp_size=4,
         prefix="model.language_model.layers.0.mlp.gate_up_proj",
@@ -138,17 +140,87 @@ def test_nvfp4_qpn2_shape_gate_is_exact_tp4():
     assert nvfp4_scheme._is_qpn2_layer(layer)
 
     layer.tp_size = 2
-    assert not nvfp4_scheme._is_qpn2_layer(layer)
-    layer.tp_size = 4
-    layer.prefix = "model.language_model.layers.0.self_attn.qkv_proj"
-    assert not nvfp4_scheme._is_qpn2_layer(layer)
-    layer.prefix = "model.language_model.layers.0.mlp.down_proj"
-    layer.input_size_per_partition = 4352
-    layer.output_size_per_partition = 5120
-    layer.weight = SimpleNamespace(shape=(5120, 2176))
     assert nvfp4_scheme._is_qpn2_layer(layer)
+    layer.tp_size = 4
+    compatible = (
+        ("linear_attn.in_proj_qkvz", 5120, 4120, (4120, 2560)),
+        ("linear_attn.out_proj", 1536, 5120, (5120, 768)),
+        ("self_attn.qkv_proj", 5120, 3584, (3584, 2560)),
+        ("self_attn.o_proj", 1536, 5120, (5120, 768)),
+        ("mlp.down_proj", 4352, 5120, (5120, 2176)),
+    )
+    for suffix, k, n, weight_shape in compatible:
+        layer.prefix = f"model.language_model.layers.0.{suffix}"
+        layer.input_size_per_partition = k
+        layer.output_size_per_partition = n
+        layer.weight = SimpleNamespace(shape=weight_shape)
+        assert nvfp4_scheme._is_qpn2_layer(layer)
+
     layer.input_size_per_partition = 4096
     assert not nvfp4_scheme._is_qpn2_layer(layer)
+
+
+def test_nvfp4_qpn2_output_padding_is_zero_filled():
+    weight = torch.full((56, 32), 7, dtype=torch.uint8)
+    scales = torch.full((56, 4), 2, dtype=torch.float8_e4m3fn)
+    padded_weight, padded_scales, physical_n = nvfp4_scheme._pad_qpn2_output_rows(
+        weight, scales
+    )
+    assert physical_n == 64
+    assert padded_weight.shape == (64, 32)
+    assert padded_scales.shape == (64, 4)
+    assert torch.equal(padded_weight[:56], weight)
+    assert torch.equal(padded_scales[:56], scales)
+    assert not torch.count_nonzero(padded_weight[56:])
+    assert not torch.count_nonzero(padded_scales[56:].float())
+
+
+def test_nvfp4_qpn2_dispatch_crops_padded_output_before_bias(monkeypatch):
+    layer = SimpleNamespace(
+        output_size_per_partition=56,
+        sm70_nvfp4_qpn2_output_size=64,
+        sm70_nvfp4_qpn2_split_k=8,
+        sm70_nvfp4_qpn2_nacc=2,
+        sm70_nvfp4_qpn2_global_scale=0.5,
+        sm70_nvfp4_qpn2_prefill_enabled=False,
+        sm70_nvfp4_qpn2_codes=torch.empty((64, 32), dtype=torch.uint8),
+        sm70_nvfp4_qpn2_scales=torch.empty((64, 4), dtype=torch.uint8),
+    )
+    setattr(
+        layer,
+        sm70_tm.STATE_ATTR,
+        sm70_tm.SM70TurboMindLinearState(
+            weight=torch.empty((1,), dtype=torch.int32),
+            scales=torch.empty((1,), dtype=torch.float16),
+            group_size=16,
+            k_ld=64,
+            q_ld=64,
+            output_size=56,
+            padded_output_size=64,
+            op_kind="nvfp4",
+        ),
+    )
+    seen_shapes = []
+
+    def fake_dispatch(*args):
+        seen_shapes.append(tuple(args[0].shape))
+        args[0].fill_(3)
+
+    monkeypatch.setattr(
+        nvfp4_scheme.sm70_ops, "nvfp4_qpn2_dispatch_sm70_out", fake_dispatch
+    )
+    bias = torch.arange(56, dtype=torch.float16)
+    output = CompressedTensorsW4A4Fp4._apply_qpn2(
+        layer, torch.ones((8, 64), dtype=torch.float16), bias, gated_silu=False
+    )
+    assert seen_shapes == [(8, 64)]
+    assert output.shape == (8, 56)
+    assert torch.equal(output[0], bias + 3)
+
+    empty = CompressedTensorsW4A4Fp4._apply_qpn2(
+        layer, torch.ones((0, 64), dtype=torch.float16), None, gated_silu=False
+    )
+    assert empty.shape == (0, 56)
 
 
 def _make_small_layer() -> torch.nn.Module:
@@ -172,13 +244,30 @@ def _make_small_layer() -> torch.nn.Module:
     return layer
 
 
-def test_nvfp4_qpn2_prepare_and_dispatch_contract(monkeypatch):
+@pytest.mark.parametrize(
+    "shared_requested,shared_available,compact",
+    [
+        (False, True, False),
+        (True, False, False),
+        (True, True, False),
+        (True, True, True),
+    ],
+)
+@pytest.mark.parametrize("batch_layouts", [False, True])
+def test_nvfp4_qpn2_prepare_and_dispatch_contract(
+    monkeypatch, shared_requested, shared_available, compact, batch_layouts
+):
     monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2", "1")
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT", str(int(shared_requested)))
     monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_PREFILL", "1")
     monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M", "9")
     envs.disable_envs_cache()
     layer = _make_small_layer()
     calls = []
+    monkeypatch.setattr(nvfp4_scheme, "_compact_qpn2_scales_enabled", lambda: compact)
+    monkeypatch.setattr(
+        nvfp4_scheme.sm70_tm, "use_batched_gemm_layouts", lambda: batch_layouts
+    )
 
     monkeypatch.setattr(nvfp4_scheme.sm70_tm, "use_turbomind", lambda enabled: True)
     scheme = CompressedTensorsW4A4Fp4()
@@ -190,19 +279,35 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(monkeypatch):
     monkeypatch.setattr(nvfp4_scheme, "_is_qpn2_layer", lambda layer: True)
     monkeypatch.setattr(nvfp4_scheme, "_missing_qpn2_ops", lambda: [])
     monkeypatch.setattr(nvfp4_scheme, "_missing_qpn2_prefill_ops", lambda: [])
+    monkeypatch.setattr(
+        nvfp4_scheme,
+        "_missing_qpn2_shared_ops",
+        lambda: [] if shared_available else ["nvfp4_qpn2_tm_dispatch_sm70_out"],
+    )
     monkeypatch.setitem(nvfp4_scheme._SM70_NVFP4_QPN2_CONFIGS, (64, 64, False), (8, 2))
     monkeypatch.setitem(nvfp4_scheme._SM70_NVFP4_QPN2_CONFIGS, (64, 64, True), (8, 2))
+    shared = shared_requested and shared_available
+
+    def fake_prepare_codes(weight, scales):
+        assert not shared, "Shared preparation must not allocate QPN2 codes"
+        return torch.empty_like(weight), torch.empty(scales.shape, dtype=torch.uint8)
+
+    def fake_prepare_scales(scales):
+        assert shared
+        return torch.empty(scales.shape, dtype=torch.uint8)
+
     monkeypatch.setattr(
-        nvfp4_scheme.sm70_ops,
-        "nvfp4_qpn2_prepare_sm70",
-        lambda weight, scales: (
-            torch.empty_like(weight),
-            torch.empty(scales.shape, dtype=torch.uint8),
-        ),
+        nvfp4_scheme.sm70_ops, "nvfp4_qpn2_prepare_sm70", fake_prepare_codes
+    )
+    monkeypatch.setattr(
+        nvfp4_scheme.sm70_ops, "nvfp4_qpn2_prepare_scales_sm70", fake_prepare_scales
     )
 
-    def fake_prepare(prepared_layer, *, interleave_gated_silu=False):
+    def fake_prepare(
+        prepared_layer, *, interleave_gated_silu=False, prescale_for_batch=False
+    ):
         assert not interleave_gated_silu
+        assert prescale_for_batch == (shared and batch_layouts and not compact)
         state = sm70_tm.SM70TurboMindLinearState(
             weight=torch.empty((1,), dtype=torch.int32),
             scales=torch.empty((1,), dtype=torch.float16),
@@ -211,6 +316,7 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(monkeypatch):
             q_ld=64,
             output_size=64,
             op_kind="nvfp4",
+            prescaled_scales=prescale_for_batch,
         )
         setattr(prepared_layer, sm70_tm.STATE_ATTR, state)
 
@@ -235,12 +341,32 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(monkeypatch):
         fake_combined_dispatch,
     )
 
+    def fake_shared_dispatch(*args):
+        assert shared
+        state = getattr(layer, sm70_tm.STATE_ATTR)
+        assert args[2] is state.weight
+        assert args[-1] == state.prescaled_scales
+        fake_combined_dispatch(*args[:-1])
+
+    monkeypatch.setattr(
+        nvfp4_scheme.sm70_ops,
+        "nvfp4_qpn2_tm_dispatch_sm70_out",
+        fake_shared_dispatch,
+    )
+
     try:
         scheme.process_weights_after_loading(layer)
         assert layer.sm70_nvfp4_qpn2
         assert layer.sm70_nvfp4_qpn2_gated_silu
         assert layer.sm70_nvfp4_qpn2_global_scale == 0.5
         assert layer.sm70_nvfp4_qpn2_prefill_enabled
+        assert layer.sm70_nvfp4_qpn2_shared_weight == shared
+        state = getattr(layer, sm70_tm.STATE_ATTR)
+        assert state.use_scale_code == compact
+        if compact:
+            assert state.scales is layer.sm70_nvfp4_qpn2_scales
+            assert state.global_scale == layer.sm70_nvfp4_qpn2_global_scale
+        assert hasattr(layer, "sm70_nvfp4_qpn2_codes") != shared
         assert layer.weight.numel() == 0
         assert layer.weight_scale.numel() == 0
 
@@ -263,5 +389,55 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(monkeypatch):
         assert torch.equal(large_fused, torch.full_like(large_fused, 5))
         assert combined_calls[2][-2:] == (False, 9)
         assert combined_calls[3][-2:] == (True, 9)
+        if shared:
+            layer.sm70_nvfp4_qpn2_prefill_enabled = False
+            scheme.apply_weights(layer, x)
+            assert combined_calls[-1][-1] == 0
     finally:
         envs.disable_envs_cache()
+
+
+@pytest.mark.parametrize(
+    "capture_sizes,expected", [([], True), ([1, 8, 32], True), ([8, 64, 256], True)]
+)
+def test_compact_scales_support_fallback_sized_graphs(
+    monkeypatch, capture_sizes, expected
+):
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", "1")
+    envs.disable_envs_cache()
+    monkeypatch.setattr(
+        torch.ops._C, "nvfp4_qpn2_compact_tm_gemm_sm70_out", lambda: None, raising=False
+    )
+    monkeypatch.setattr(
+        torch.ops._C, "nvfp4_qpn2_compact_scales_version_sm70", lambda: 1, raising=False
+    )
+    config = _runtime_config()
+    config.compilation_config = SimpleNamespace(cudagraph_capture_sizes=capture_sizes)
+    monkeypatch.setattr(nvfp4_scheme, "get_current_vllm_config", lambda: config)
+    assert nvfp4_scheme._compact_qpn2_scales_enabled() == expected
+
+
+def test_shared_layout_defaults_and_rollback(monkeypatch):
+    for name in (
+        "VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT",
+        "VLLM_SM70_NVFP4_QPN2_SHARED_SCALES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+        envs.disable_envs_cache()
+        assert getattr(envs, name)
+        monkeypatch.setenv(name, "0")
+        envs.disable_envs_cache()
+        assert not getattr(envs, name)
+
+
+@pytest.mark.parametrize("version", [None, lambda: 0])
+def test_compact_scales_reject_old_extension(monkeypatch, version):
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", "1")
+    envs.disable_envs_cache()
+    monkeypatch.setattr(
+        torch.ops._C, "nvfp4_qpn2_compact_tm_gemm_sm70_out", lambda: None, raising=False
+    )
+    monkeypatch.setattr(
+        torch.ops._C, "nvfp4_qpn2_compact_scales_version_sm70", version, raising=False
+    )
+    assert not nvfp4_scheme._compact_qpn2_scales_enabled()

@@ -29,7 +29,8 @@ except Exception:
 
 logger = init_logger(__name__)
 
-_SM70_TP8_HIERARCHICAL_ELEMENTS = 4096
+_SM70_TP8_HIERARCHICAL_ELEMENTS = frozenset((4096, 8 * 4096))
+_SM70_TP8_HIERARCHICAL_SCRATCH_BYTES = 4 * 8 * 4096 * torch.float16.itemsize
 _EXPANDABLE_SEGMENTS_TRUE_PATTERN = re.compile(
     r"((?:^|,)\s*expandable_segments\s*:\s*)True(?=\s*(?:,|$))"
 )
@@ -129,6 +130,7 @@ class CustomAllreduce:
         self.disabled = True
         self.long_prefill_output_ptrs: list[int] | None = None
         self.sm70_tp4_push_buffer_ptrs: list[int] | None = None
+        self.sm70_tp8_hierarchical_push_buffer_ptrs: list[int] | None = None
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -192,7 +194,10 @@ class CustomAllreduce:
                 )
         cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
         if cuda_visible_devices:
-            device_ids = list(map(int, cuda_visible_devices.split(",")))
+            device_ids = [
+                current_platform.device_id_to_physical_device_id(index)
+                for index in range(len(cuda_visible_devices.split(",")))
+            ]
         else:
             device_ids = list(range(current_platform.device_count()))
 
@@ -274,8 +279,12 @@ class CustomAllreduce:
         # Buffers memory are owned by this Python class and passed to C++.
         # Metadata composes of two parts: metadata for synchronization and a
         # temporary buffer for storing intermediate allreduce results.
+        meta_scratch_size = max(
+            max_size,
+            _SM70_TP8_HIERARCHICAL_SCRATCH_BYTES if tp8_hierarchical else 0,
+        )
         self.meta_ptrs = self.create_shared_buffer(
-            ops.meta_size() + max_size,
+            ops.meta_size() + meta_scratch_size,
             group=group,
             uncached=True,
             peer_ranks=set(hierarchical_peer_ranks)
@@ -337,10 +346,40 @@ class CustomAllreduce:
             ops.register_sm70_tp4_push_allreduce_buffer(
                 self._ptr, self.sm70_tp4_push_buffer_ptrs
             )
+            mtp5_status = (
+                "enabled" if envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5 else "disabled"
+            )
+            qwen38_batch_status = (
+                "enabled"
+                if envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH
+                else "disabled"
+            )
+            sum2_m1_status = (
+                "enabled" if envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1 else "disabled"
+            )
             logger.info(
                 "SM70 TP4 SGLang-style push all-reduce enabled for the "
                 "FP16 80-KiB verifier, 8-KiB decode, and 5-KiB Qwen4Exp "
-                "payloads."
+                "payloads; batch payloads are %s, 5-KiB sum2 is %s, "
+                "and opt-in 25-KiB MTP4 is %s.",
+                qwen38_batch_status,
+                sum2_m1_status,
+                mtp5_status,
+            )
+        if tp8_hierarchical and envs.VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR:
+            assert hierarchical_peer_ranks is not None
+            push_buffer_size = ops.sm70_tp8_hierarchical_push_allreduce_buffer_size()
+            self.sm70_tp8_hierarchical_push_buffer_ptrs = self.create_shared_buffer(
+                push_buffer_size,
+                group=group,
+                peer_ranks=set(hierarchical_peer_ranks),
+            )
+            ops.register_sm70_tp8_hierarchical_push_allreduce_buffer(
+                self._ptr, self.sm70_tp8_hierarchical_push_buffer_ptrs
+            )
+            logger.info(
+                "SM70 TP8 hierarchical push all-reduce enabled for exact "
+                "FP16 8-KiB and 64-KiB CUDA-Graph payloads."
             )
 
     @contextmanager
@@ -392,7 +431,7 @@ class CustomAllreduce:
         if self.tp8_hierarchical:
             return (
                 inp.dtype == torch.float16
-                and inp.numel() == _SM70_TP8_HIERARCHICAL_ELEMENTS
+                and inp.numel() in _SM70_TP8_HIERARCHICAL_ELEMENTS
             )
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
@@ -430,6 +469,98 @@ class CustomAllreduce:
             out = torch.empty_like(inp_a)
         ops.all_reduce_sum2(self._ptr, inp_a, inp_b, out)
         return out
+
+    def can_sm70_qwen38_hc_batch(self, branches: torch.Tensor) -> bool:
+        return bool(
+            not self.disabled
+            and self.world_size == 4
+            and self.fully_connected
+            and self.sm70_tp4_push_buffer_ptrs is not None
+            and branches.is_cuda
+            and branches.dtype == torch.float16
+            and branches.ndim == 2
+            and 2 <= branches.shape[0] <= 16
+            and branches.shape[1] == 10240
+            and branches.is_contiguous()
+            and ops.supports_sm70_qwen38_hc_batch()
+        )
+
+    def sm70_qwen38_hc_batch(
+        self,
+        branches,
+        packed_down,
+        packed_up,
+        partials,
+        lora,
+        local_output,
+        output,
+        injection,
+        round_down_partials: bool = False,
+        cooperative: bool = False,
+        full_unroll: bool = False,
+        fused_chain: bool = False,
+    ) -> None:
+        ops.sm70_qwen38_hc_batch(
+            self._ptr,
+            branches,
+            packed_down,
+            packed_up,
+            partials,
+            lora,
+            local_output,
+            output,
+            injection,
+            round_down_partials,
+            cooperative,
+            full_unroll,
+            fused_chain,
+        )
+
+    def can_sm70_qwen38_hc_shard(self, branches: torch.Tensor) -> bool:
+        return bool(
+            not self.disabled
+            and self.world_size == 4
+            and self.fully_connected
+            and self.sm70_tp4_push_buffer_ptrs is not None
+            and branches.is_cuda
+            and branches.dtype == torch.float16
+            and branches.shape == (1, 10240)
+            and branches.is_contiguous()
+            and ops.supports_sm70_qwen38_hc_shard()
+        )
+
+    def sm70_qwen38_hc_down_allgather(
+        self, local_down: torch.Tensor, gathered_down: torch.Tensor
+    ) -> None:
+        ops.sm70_qwen38_hc_down_allgather(self._ptr, local_down, gathered_down)
+
+    def sm70_qwen38_hc_gate_mix(
+        self,
+        local_gate: torch.Tensor,
+        branches: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        ops.sm70_qwen38_hc_gate_mix(self._ptr, local_gate, branches, output)
+
+    def supports_sm70_qwen38_hc_output_allgather(self) -> bool:
+        return ops.supports_sm70_qwen38_hc_output_allgather()
+
+    def sm70_qwen38_hc_output_allgather(
+        self, local_block: torch.Tensor, output: torch.Tensor
+    ) -> None:
+        ops.sm70_qwen38_hc_output_allgather(self._ptr, local_block, output)
+
+    def supports_sm70_qwen38_hc_up_mix_allgather(self) -> bool:
+        return ops.supports_sm70_qwen38_hc_up_mix_allgather()
+
+    def sm70_qwen38_hc_up_mix_allgather(
+        self,
+        lora: torch.Tensor,
+        weight: torch.Tensor,
+        branches: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        ops.sm70_qwen38_hc_up_mix_allgather(self._ptr, lora, weight, branches, output)
 
     def sm70_tp2_all_reduce_gemma_rms_norm(
         self,
@@ -879,6 +1010,12 @@ class CustomAllreduce:
             if self.sm70_tp4_push_buffer_ptrs is not None:
                 self.free_shared_buffer(self.sm70_tp4_push_buffer_ptrs, rank=self.rank)
                 self.sm70_tp4_push_buffer_ptrs = None
+            if self.sm70_tp8_hierarchical_push_buffer_ptrs is not None:
+                self.free_shared_buffer(
+                    self.sm70_tp8_hierarchical_push_buffer_ptrs,
+                    rank=self.rank,
+                )
+                self.sm70_tp8_hierarchical_push_buffer_ptrs = None
 
     def __del__(self):
         self.close()

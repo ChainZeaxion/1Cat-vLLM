@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 import vllm._sm70_ops as sm70_ops
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -167,6 +168,8 @@ def _sm70_mhc_post_kernel(
                 + output_stream * comb_stride_j
             )
             value += mix * residual
+        # float16 store: saturate, see FP16_MAX in tilelang_kernels.py.
+        value = tl.clamp(value, -65504.0, 65504.0)
         tl.store(
             out_ptr
             + token_idx * out_stride_t
@@ -356,8 +359,9 @@ def _sm70_mhc_pre_norm_kernel(
     norm_weight = tl.load(
         norm_weight_ptr + hidden_offsets, mask=hidden_mask, other=0.0
     ).to(tl.float32)
-    # Match the upstream fused kernel's FP16 staging before RMSNorm scaling.
-    layer_input = layer_input.to(tl.float16).to(tl.float32)
+    # No float16 staging of the unnormalized sum: an attention-sink row adds
+    # up past 65504 here although its normalized value is small. The fused
+    # tilelang kernel stashes it in float32 under float16 for the same reason.
     layer_input = layer_input * norm_scale * norm_weight
     tl.store(
         layer_input_ptr + token_idx * output_stride_t + hidden_offsets,
@@ -394,13 +398,17 @@ def sm70_mhc_pre_norm_from_staging(
     if norm_weight.dtype != torch.float16:
         raise TypeError("SM70 mHC staging kernel requires FP16 norm weights")
 
-    if num_tokens == 1:
+    use_native_verify = num_tokens == 8 and envs.VLLM_SM70_GLM53_MHC_NATIVE_VERIFY
+    if num_tokens == 1 or use_native_verify:
         if not hasattr(torch.ops._C, "sm70_glm_mhc_pre_norm_out"):
             raise RuntimeError(
                 "SM70 GLM mHC decode requires the native CUDA final-stage op. "
                 "Rebuild vLLM from source with CUDA arch 7.0."
             )
-        logger.info_once("SM70 GLM mHC native CUDA decode final stage enabled.")
+        if use_native_verify:
+            logger.info_once("SM70 GLM mHC native CUDA q8 final stage enabled.")
+        else:
+            logger.info_once("SM70 GLM mHC native CUDA decode final stage enabled.")
         sm70_ops.sm70_glm_mhc_pre_norm_out(
             gemm_out_mul,
             gemm_out_sqrsum,

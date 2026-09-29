@@ -19,6 +19,7 @@ except ImportError:
 DEFAULT_DECODE_PARTITION_SIZE = 256
 VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
 E4M3_XQA_VALID_DECODE_PARTITION_SIZES = (64, 128, 256, 512, 896, 1024, 1664)
+E4M3_XQA_BATCH_VALID_DECODE_PARTITION_SIZES = (64, 128, 256)
 _decode_plan_cache = {}
 _decode_workspace_cache = {}
 _xqa_staged_rescale_workspace_cache = {}
@@ -43,6 +44,8 @@ class _DecodeWorkspace:
     exp_sums: torch.Tensor
     active_num_partitions: torch.Tensor
     max_num_partitions: int
+    captured: bool = False
+    previous: "_DecodeWorkspace | None" = None
 
 
 @dataclass
@@ -124,11 +127,12 @@ def _allocate_decode_workspace(
     num_heads: int,
     head_dim: int,
     max_num_partitions: int,
+    partial_dtype: torch.dtype = torch.float16,
 ) -> _DecodeWorkspace:
     return _DecodeWorkspace(
         tmp_out=torch.empty(
             (batch_capacity, num_heads, max_num_partitions, head_dim),
-            dtype=torch.float16,
+            dtype=partial_dtype,
             device=q.device,
         ),
         max_logits=torch.empty(
@@ -189,14 +193,14 @@ def _get_decode_plan(
             effective_max_seq_len,
             effective_workspace_seq_capacity,
         )
-    partition_size = (
-        _validate_decode_partition_size(
+    if partition_size_hint is not None:
+        partition_size = _validate_decode_partition_size(
             int(partition_size_hint),
             "partition_size_hint",
             valid_partition_sizes,
         )
-        if partition_size_hint is not None
-        else _get_decode_partition_size(
+    else:
+        partition_size = _get_decode_partition_size(
             max_seq_capacity=max_seq_capacity,
             head_dim=head_dim,
             num_q_heads=num_heads,
@@ -204,7 +208,19 @@ def _get_decode_plan(
             max_seq_len_hint=effective_max_seq_len,
             batch_size_hint=batch_capacity,
         )
-    )
+        if partition_size not in valid_partition_sizes:
+            if os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE") is not None:
+                _validate_decode_partition_size(
+                    partition_size,
+                    "VLLM_FLASH_V100_DECODE_PARTITION_SIZE",
+                    valid_partition_sizes,
+                )
+            smaller_sizes = tuple(
+                size for size in valid_partition_sizes if size < partition_size
+            )
+            partition_size = (
+                max(smaller_sizes) if smaller_sizes else min(valid_partition_sizes)
+            )
     runtime_num_partitions = max(
         1,
         (effective_max_seq_len + partition_size - 1) // partition_size,
@@ -313,42 +329,66 @@ def _get_decode_workspace_for_plan(
     head_dim: int,
     plan: _DecodePlan,
     active_num_partitions: torch.Tensor | None = None,
+    partial_dtype: torch.dtype = torch.float16,
 ):
     device_index = q.device.index if q.device.index is not None else -1
     stream_id = _workspace_stream_id(q.device)
+    share_rows = os.getenv("VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE", "1") != "0"
+    partition_capacity = _round_decode_partition_capacity(plan.workspace_num_partitions)
     key = (
         device_index,
         stream_id,
-        batch_capacity,
+        None if share_rows else batch_capacity,
         num_heads,
         head_dim,
         plan.partition_size,
+        partial_dtype,
+        partition_capacity if share_rows else None,
     )
 
     workspace = _decode_workspace_cache.get(key) if _can_cache_workspace(q) else None
     if (
         workspace is None
+        or workspace.tmp_out.size(0) < batch_capacity
         or workspace.max_num_partitions < plan.workspace_num_partitions
     ):
+        # Capture sizes normally descend, so smaller shapes can use a prefix
+        # of the first allocation. Partition capacities remain separate: a
+        # long single-row request followed by a short batched request must not
+        # multiply the largest row count by the largest context capacity.
+        # A later growth must keep any old addresses
+        # already embedded in graphs alive, including warmup allocations that
+        # were subsequently reused during capture.
+        previous = workspace
         workspace = _allocate_decode_workspace(
             q,
-            batch_capacity=batch_capacity,
+            batch_capacity=max(
+                batch_capacity, previous.tmp_out.size(0) if previous else 0
+            ),
             num_heads=num_heads,
             head_dim=head_dim,
             max_num_partitions=_round_decode_partition_capacity(
-                plan.workspace_num_partitions
+                max(
+                    plan.workspace_num_partitions,
+                    previous.max_num_partitions if previous else 0,
+                )
             ),
+            partial_dtype=partial_dtype,
         )
+        if previous is not None:
+            workspace.previous = previous if previous.captured else previous.previous
         if _can_cache_workspace(q):
             _decode_workspace_cache[key] = workspace
 
+    if _cuda_graph_capture_active():
+        workspace.captured = True
     if active_num_partitions is None:
         workspace.active_num_partitions.fill_(plan.actual_num_partitions)
         active_num_partitions = workspace.active_num_partitions
     return (
-        workspace.tmp_out[:, :, : workspace.max_num_partitions, :],
-        workspace.max_logits[:, :, : workspace.max_num_partitions],
-        workspace.exp_sums[:, :, : workspace.max_num_partitions],
+        workspace.tmp_out[:batch_capacity],
+        workspace.max_logits[:batch_capacity],
+        workspace.exp_sums[:batch_capacity],
         active_num_partitions,
     )
 
@@ -503,26 +543,49 @@ def _get_prefill_splitkv3_workspace(
     return workspace
 
 
-def _get_grouped_verify_workspace(q: torch.Tensor) -> _GroupedVerifyWorkspace:
+def _get_grouped_verify_workspace(
+    q: torch.Tensor,
+    batch_size: int = 1,
+    *,
+    partial_dtype: torch.dtype = torch.float16,
+) -> _GroupedVerifyWorkspace:
+    query_len = q.shape[0] // batch_size
+    max_query_tokens = 16 if query_len > 8 else 8
+    grouped_splits = 640 // max_query_tokens
     device_index = q.device.index if q.device.index is not None else -1
     key = (
         q.device.type,
         device_index,
         _workspace_stream_id(q.device),
+        batch_size,
+        max_query_tokens,
         q.dtype,
+        partial_dtype,
     )
     workspace = (
         _grouped_verify_workspace_cache.get(key) if _can_cache_workspace(q) else None
     )
     if workspace is None:
+        partial_out_shape = (
+            (grouped_splits, max_query_tokens, 6, 256)
+            if batch_size == 1
+            else (batch_size, grouped_splits, max_query_tokens, 6, 256)
+        )
+        partial_lse_shape = (
+            (grouped_splits, max_query_tokens, 6)
+            if batch_size == 1
+            else (batch_size, grouped_splits, max_query_tokens, 6)
+        )
         workspace = _GroupedVerifyWorkspace(
             partial_out=torch.empty(
-                (80, 8, 6, 256),
-                dtype=torch.float16,
+                partial_out_shape,
+                dtype=partial_dtype,
                 device=q.device,
             ),
             partial_lse=torch.empty(
-                (80, 8, 6),
+                (*partial_lse_shape, 2)
+                if partial_dtype == torch.float32
+                else partial_lse_shape,
                 dtype=torch.float32,
                 device=q.device,
             ),
@@ -944,6 +1007,11 @@ def flash_attn_decode_paged(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
+    e4m3_fp32 = kv_cache_dtype in ("fp8", "fp8_e4m3")
+    if e4m3_fp32 and not flash_attn_grouped_e4m3_fp32_available():
+        raise RuntimeError(
+            "Rebuild Flash-V100 for E4M3 FP32 scalar decode (precision revision 4)"
+        )
     q = maybe_contiguous(q)
     block_table = maybe_contiguous(block_table)
     seq_lens = maybe_contiguous(seq_lens)
@@ -980,6 +1048,22 @@ def flash_attn_decode_paged(
         seq_lens,
         workspace_seq_capacity_hint=workspace_seq_capacity_hint,
     )
+    if (
+        os.getenv(
+            "VLLM_FLASH_V100_E4M3_SCALAR_FAST",
+            os.getenv("VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST", "1"),
+        )
+        == "1"
+        and e4m3_fp32
+        and q.dtype == torch.float16
+        and q.shape[2] == 256
+        and plan.partition_size == 1024
+        and window_size_left == window_size_right == -1
+        and anchor_lens is None
+    ):
+        version = getattr(flash_attn_v100_cuda, "tp2_e4m3_scalar_fast_version", None)
+        if not callable(version) or int(version()) < 3:
+            raise RuntimeError("Rebuild Flash-V100 for E4M3 scalar fast revision 3")
     tmp_out, max_logits, exp_sums, active_num_partitions = (
         _get_decode_workspace_for_plan(
             q,
@@ -988,6 +1072,7 @@ def flash_attn_decode_paged(
             head_dim=head_dim,
             plan=plan,
             active_num_partitions=active_num_partitions,
+            partial_dtype=torch.float32 if e4m3_fp32 else torch.float16,
         )
     )
 
@@ -1040,6 +1125,79 @@ def flash_attn_grouped_verify_max_query_tokens() -> int:
     return int(get_max_query_tokens())
 
 
+def flash_attn_grouped_verify_request_major_abi_version() -> int:
+    """Return zero for binaries that only support single-request grouping."""
+    get_abi_version = getattr(
+        flash_attn_v100_cuda,
+        "grouped_verify_request_major_abi_version",
+        None,
+    )
+    return 0 if get_abi_version is None else int(get_abi_version())
+
+
+def flash_attn_grouped_e4m3_fp32_available(min_version: int = 4) -> bool:
+    version = getattr(flash_attn_v100_cuda, "grouped_e4m3_fp32_precision_version", None)
+    return (
+        hasattr(flash_attn_v100_cuda, "grouped_e4m3_fp32_paged_fwd")
+        and callable(version)
+        and int(version()) >= min_version
+    )
+
+
+def flash_attn_grouped_e4m3_fp32_paged(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    row_lengths: torch.Tensor,
+    *,
+    out: torch.Tensor,
+    softmax_scale: float,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> torch.Tensor:
+    """E4M3 q2..8/B1 or request-major q8/B2..16 GQA6/D256 attention.
+
+    Row lengths are authoritative GPU metadata, not inferred from padded Q.
+    Zero lengths produce zero outputs. All positive lengths must fit the
+    block table, whose entries must address valid physical pages. This is
+    q8 batches use one block-table row per independent request. QK/PV and
+    partial storage are FP32;
+    Tensor Core operands and final output remain FP16. KV must encode E4M3.
+    Precision revision 3 retains FP32 numerators and separate max/sum until
+    the final normalization, as well as compensated QK/P and tile-local PV.
+    Revision 4 adds DFlash2 1728/3456 pages and FP32 scalar fallback workspace.
+    """
+    if not flash_attn_grouped_e4m3_fp32_available():
+        raise RuntimeError(
+            "Rebuild Flash-V100 for E4M3 grouped FP32 precision revision 4"
+        )
+    if (
+        q.shape[1] != 6
+        or k_cache.shape[1] not in (800, 848, 1616, 1648, 1728, 3296, 3456)
+    ) and int(flash_attn_v100_cuda.grouped_e4m3_fp32_precision_version()) < 5:
+        raise RuntimeError("Rebuild Flash-V100 for multi-head E4M3 revision 5")
+    batch_size = block_table.shape[0]
+    if batch_size > 1 and not flash_attn_grouped_e4m3_fp32_available(6):
+        raise RuntimeError("Rebuild Flash-V100 for request-major E4M3 revision 6")
+    workspace = _get_grouped_verify_workspace(
+        q, batch_size=batch_size, partial_dtype=torch.float32
+    )
+    return flash_attn_v100_cuda.grouped_e4m3_fp32_paged_fwd(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        block_table,
+        row_lengths,
+        workspace.partial_out,
+        workspace.partial_lse,
+        float(softmax_scale),
+        float(k_scale),
+        float(v_scale),
+    )
+
+
 def flash_attn_grouped_verify_paged(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1053,12 +1211,13 @@ def flash_attn_grouped_verify_paged(
     v_scale: float = 1.0,
     one_pass: bool = False,
 ) -> torch.Tensor:
-    """Exact grouped q8/q16 H6/D256 DFlash2 verifier for SM70.
+    """Exact request-major grouped q8/q16 H6/D256 DFlash2 verifier for SM70.
 
+    Each request has one block-table row and a uniform contiguous query span.
     The native entry keeps all causal verifier rows together and reuses each
-    paged-KV scan across a packed GQA group. q8 uses one six-head group and q16
-    uses two three-head groups, retaining 48 rows per CTA and the same workspace
-    byte count. Workspaces are stream-local and CUDA-graph safe.
+    paged-KV scan across a packed GQA group. Single-request q16 uses two
+    three-head groups; batched requests use request-major q8 groups. Workspaces
+    are stream- and batch-local and CUDA-graph safe.
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -1066,13 +1225,7 @@ def flash_attn_grouped_verify_paged(
     block_table = maybe_contiguous(block_table)
     seq_lens = maybe_contiguous(seq_lens)
     out = maybe_contiguous(out)
-    workspace = _get_grouped_verify_workspace(q)
-    if q.shape[0] > 8:
-        partial_out = workspace.partial_out.view(40, 16, 6, 256)
-        partial_lse = workspace.partial_lse.view(40, 16, 6)
-    else:
-        partial_out = workspace.partial_out
-        partial_lse = workspace.partial_lse
+    workspace = _get_grouped_verify_workspace(q, int(block_table.shape[0]))
     return flash_attn_v100_cuda.grouped_verify_paged_fwd(
         q,
         k_cache,
@@ -1080,14 +1233,20 @@ def flash_attn_grouped_verify_paged(
         out,
         block_table,
         seq_lens,
-        partial_out,
-        partial_lse,
+        workspace.partial_out,
+        workspace.partial_lse,
         float(softmax_scale),
         kv_cache_dtype,
         float(k_scale),
         float(v_scale),
         bool(one_pass),
     )
+
+
+# Older native extensions retain the E5M2 route until rebuilt.
+flash_attn_grouped_verify_paged.supports_e4m3 = bool(  # type: ignore[attr-defined]
+    getattr(flash_attn_v100_cuda, "grouped_verify_e4m3", False)
+)
 
 
 def flash_attn_decode_paged_xqa(
@@ -1137,20 +1296,31 @@ def flash_attn_decode_paged_xqa(
         active_num_partitions=active_num_partitions,
         partition_size_hint=partition_size_hint,
         valid_partition_sizes=(
-            E4M3_XQA_VALID_DECODE_PARTITION_SIZES
+            E4M3_XQA_BATCH_VALID_DECODE_PARTITION_SIZES
             if kv_cache_dtype in ("fp8", "fp8_e4m3")
             and q.ndim == 3
-            and q.shape[1:] == (6, 256)
-            and (
-                q.shape[0] == 1
-                or (
-                    os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1") == "1"
-                    and 1 < q.shape[0] <= 16
-                )
-            )
+            and k_cache.shape[2] > 0
+            and q.shape[1:] == (6 * k_cache.shape[2], 256)
+            and os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1") == "1"
+            and q.shape[0] > 1
             and k_cache.dtype == torch.uint8
             and v_cache.dtype == torch.uint8
-            else VALID_DECODE_PARTITION_SIZES
+            else (
+                E4M3_XQA_VALID_DECODE_PARTITION_SIZES
+                if kv_cache_dtype in ("fp8", "fp8_e4m3")
+                and q.ndim == 3
+                and k_cache.shape[2] > 0
+                and q.shape == (1, 6 * k_cache.shape[2], 256)
+                and k_cache.shape[1] >= 256
+                and k_cache.shape[1] % 16 == 0
+                and k_cache.dtype == torch.uint8
+                and v_cache.dtype == torch.uint8
+                else (
+                    E4M3_XQA_BATCH_VALID_DECODE_PARTITION_SIZES
+                    if kv_cache_dtype in ("fp8", "fp8_e4m3")
+                    else VALID_DECODE_PARTITION_SIZES
+                )
+            )
         ),
     )
     _assert_decode_launch_covers_seq_lens(
@@ -1166,6 +1336,11 @@ def flash_attn_decode_paged_xqa(
             head_dim=head_dim,
             plan=plan,
             active_num_partitions=active_num_partitions,
+            partial_dtype=(
+                torch.float32
+                if kv_cache_dtype in ("fp8", "fp8_e4m3")
+                else torch.float16
+            ),
         )
     )
 
@@ -1430,6 +1605,38 @@ def flash_attn_prefill_paged(
     return _copy_bhmd_to_bmhd_out(out_, out_original)
 
 
+def fp8_e4m3_paged_kv_to_fp16(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    key_out: torch.Tensor,
+    value_out: torch.Tensor,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand explicit E4M3 bytes; this does not enable a backend route.
+
+    Positive sequence lengths and physical block IDs must be within the
+    supplied cache/table capacity. Only the live prefix and its 16-token
+    padding are written; the remaining workspace is untouched.
+    """
+    op = getattr(flash_attn_v100_cuda, "fp8_e4m3_paged_kv_to_fp16", None)
+    if op is None:
+        raise RuntimeError("Rebuild Flash-V100 for the explicit E4M3 KV bridge")
+    op(
+        key_cache,
+        value_cache,
+        block_table.contiguous(),
+        seq_lens.contiguous(),
+        key_out,
+        value_out,
+        float(k_scale),
+        float(v_scale),
+    )
+    return key_out, value_out
+
+
 def fp8_e5m2_paged_kv_to_fp16(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -1688,6 +1895,8 @@ __all__ = [
     "flash_attn_decode_paged_xqa",
     "flash_attn_decode_paged_xqa_available",
     "flash_attn_grouped_verify_paged",
+    "flash_attn_grouped_e4m3_fp32_paged",
+    "flash_attn_grouped_e4m3_fp32_available",
     "flash_attn_decode_paged_wmma",
     "flash_attn_decode_qk_scores",
     "flash_attn_turboquant_decode_paged",

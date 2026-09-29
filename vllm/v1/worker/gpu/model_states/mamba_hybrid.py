@@ -16,7 +16,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     is_conv_state_dim_first,
 )
 from vllm.platforms import current_platform
-from vllm.triton_utils import triton
+from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backends.flash_attn_v100 import (
     DFlash2SmallQGroupDescriptor,
@@ -142,12 +142,33 @@ class MambaHybridModelState(DefaultModelState):
         )
         if self._use_dflash2_common_gdn_metadata:
             logger.info_once("DFlash2 shared GDN batch metadata fast path enabled.")
+        speculative_config = vllm_config.speculative_config
+        # The shared request metadata and the fused state rows depend on the
+        # draft depth only through num_spec_state_tokens, so every native MTP
+        # depth qualifies. The MTP4 prefix on these names is historical.
+        self._use_mtp4_common_gdn_metadata = bool(
+            envs.VLLM_SM70_MTP4_SHARED_GDN_METADATA
+            and speculative_config is not None
+            and speculative_config.method == "mtp"
+            and device.type == "cuda"
+            and current_platform.is_device_capability(70)
+        )
+        if self._use_mtp4_common_gdn_metadata:
+            logger.info_once("SM70 MTP shared GDN batch metadata fast path enabled.")
+        self._use_common_gdn_metadata = (
+            self._use_dflash2_common_gdn_metadata or self._use_mtp4_common_gdn_metadata
+        )
         self._use_dflash2_fused_gdn_metadata = bool(
             self._use_dflash2_common_gdn_metadata
             and envs.VLLM_SM70_DFLASH2_FUSED_GDN_METADATA
             and self.cache_config.mamba_cache_mode in ("none", "align")
             and device.type == "cuda"
             and current_platform.is_device_capability(70)
+        )
+        self._use_mtp4_fused_gdn_metadata = bool(
+            self._use_mtp4_common_gdn_metadata
+            and envs.VLLM_SM70_MTP4_FUSED_GDN_METADATA
+            and self.cache_config.mamba_cache_mode in ("none", "align")
         )
         self._dflash2_gdn_builders: (
             list[tuple[int, GDNAttentionMetadataBuilder]] | None
@@ -285,6 +306,7 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_src_col_gpu,
             self._mamba_token_bias_gpu,
             input_batch.idx_mapping,
+            input_batch.query_start_loc,
         )
 
     def _get_dflash2_gdn_builders(
@@ -365,7 +387,7 @@ class MambaHybridModelState(DefaultModelState):
                     -1,
                 )
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
-            if self._use_dflash2_common_gdn_metadata:
+            if self._use_common_gdn_metadata:
                 speculative_config = self.vllm_config.speculative_config
                 assert speculative_config is not None
                 common_gdn_metadata = compute_common_gdn_attn_metadata(
@@ -381,7 +403,10 @@ class MambaHybridModelState(DefaultModelState):
                 )
 
             if (
-                self._use_dflash2_fused_gdn_metadata
+                (
+                    self._use_dflash2_fused_gdn_metadata
+                    or self._use_mtp4_fused_gdn_metadata
+                )
                 and cudagraph_mode == CUDAGraphMode.FULL
                 and common_gdn_metadata is not None
             ):
@@ -393,11 +418,21 @@ class MambaHybridModelState(DefaultModelState):
                     num_actual_tokens=num_tokens,
                     descriptor=self._dflash2_gdn_group_descriptor,
                     state_start_indices=(
-                        self._mamba_state_idx_gpu if self._align_mode else None
+                        self._mamba_state_idx_gpu
+                        if self._use_dflash2_fused_gdn_metadata and self._align_mode
+                        else None
                     ),
                     req_index_mapping=(
-                        input_batch.idx_mapping if self._align_mode else None
+                        input_batch.idx_mapping
+                        if self._use_dflash2_fused_gdn_metadata and self._align_mode
+                        else None
                     ),
+                    seq_lens=(
+                        input_batch.seq_lens
+                        if self._use_mtp4_fused_gdn_metadata and self._align_mode
+                        else None
+                    ),
+                    enable_mtp4=self._use_mtp4_fused_gdn_metadata,
                 )
                 if prepared_result is not None:
                     (
@@ -406,8 +441,10 @@ class MambaHybridModelState(DefaultModelState):
                     ) = prepared_result
                     if not self._dflash2_fused_gdn_metadata_logged:
                         logger.info(
-                            "DFlash2 fused GDN metadata active for %d cache groups.",
+                            "Fused speculative GDN metadata active for %d cache "
+                            "groups (%s).",
                             len(prepared_dflash2_gdn_metadata),
+                            "MTP" if self._use_mtp4_fused_gdn_metadata else "DFlash2",
                         )
                         self._dflash2_fused_gdn_metadata_logged = True
 
@@ -486,26 +523,63 @@ class MambaHybridModelState(DefaultModelState):
 
     def postprocess_state(
         self,
-        input_batch: InputBatch,
-        num_sampled: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        num_sampled: torch.Tensor | int,
         num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
         # Chunked prefill does not sample a token, so num_sampled can be 0.
         # Mamba treats num_accepted_tokens=1 as the neutral non-spec value.
-        self.num_accepted_tokens_gpu[input_batch.idx_mapping] = torch.clamp(
-            num_sampled, min=1
-        )
+        if isinstance(num_sampled, int):
+            num_reqs = idx_mapping.shape[0]
+            if num_reqs:
+                _fill_num_accepted_kernel[(num_reqs,)](
+                    idx_mapping,
+                    self.num_accepted_tokens_gpu,
+                    VALUE=max(num_sampled, 1),
+                )
+        else:
+            num_reqs = idx_mapping.shape[0]
+            if num_reqs:
+                _scatter_num_accepted_kernel[(num_reqs,)](
+                    idx_mapping, num_sampled, self.num_accepted_tokens_gpu
+                )
         if (
             self._align_mode
             and num_computed_tokens is not None
             and self._mamba_ctx is not None
-            and input_batch.num_reqs > 0
+            and idx_mapping.shape[0] > 0
         ):
             run_mamba_align_postprocess(
                 self._mamba_ctx,
-                input_batch.num_reqs,
+                idx_mapping.shape[0],
                 self.num_accepted_tokens_gpu,
                 self._mamba_state_idx_gpu,
                 num_computed_tokens,
-                input_batch.idx_mapping,
+                idx_mapping,
             )
+
+
+@triton.jit
+def _fill_num_accepted_kernel(
+    idx_mapping_ptr,
+    num_accepted_ptr,
+    VALUE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    req_state_idx = tl.load(idx_mapping_ptr + row)
+    if req_state_idx >= 0:
+        tl.store(num_accepted_ptr + req_state_idx, VALUE)
+
+
+@triton.jit
+def _scatter_num_accepted_kernel(
+    idx_mapping_ptr,
+    num_sampled_ptr,
+    num_accepted_ptr,
+):
+    row = tl.program_id(0)
+    req_state_idx = tl.load(idx_mapping_ptr + row)
+    if req_state_idx < 0:
+        return
+    num_sampled = tl.load(num_sampled_ptr + row)
+    tl.store(num_accepted_ptr + req_state_idx, tl.maximum(num_sampled, 1))

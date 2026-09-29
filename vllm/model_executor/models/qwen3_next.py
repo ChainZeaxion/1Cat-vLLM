@@ -151,6 +151,9 @@ def _sm70_qwen_layer_dump_impl(
     layer_idx: int,
     layer_type: str,
 ) -> torch.Tensor:
+    # The custom-op schema has no output alias annotation. Returning the input
+    # can corrupt AOT buffer reuse and change the tensors being diagnosed.
+    tensor = tensor.clone()
     dump_dir = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR")
     graph_buffers = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_BUFFERS") == "1"
     target_labels = {
@@ -285,7 +288,7 @@ def _sm70_qwen_layer_dump_fake(
     layer_idx: int,
     layer_type: str,
 ) -> torch.Tensor:
-    return tensor
+    return torch.empty_like(tensor)
 
 
 direct_register_custom_op(
@@ -748,8 +751,9 @@ class Qwen3NextDecoderLayer(nn.Module):
         )
 
         use_direct_attention_output = (
-            envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM and torch.compiler.is_compiling()
-        )
+            envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM
+            or getattr(self, "sm70_dflash2_direct_attention_output", False)
+        ) and torch.compiler.is_compiling()
         self_attention_output = (
             None if use_direct_attention_output else torch.empty_like(hidden_states)
         )
@@ -769,7 +773,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         if use_direct_attention_output:
             if projected_attention_output is None:
                 raise RuntimeError(
-                    "SM70 TP4 fused prefill requires a direct attention output"
+                    "SM70 TP4 direct attention route requires a projection tensor"
                 )
             hidden_states = projected_attention_output
         else:

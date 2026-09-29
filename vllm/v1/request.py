@@ -141,6 +141,10 @@ class Request:
         self.num_output_placeholders = 0
         self.async_tokens_to_discard = 0
 
+        # V2 PP async decode must wait for the sampled-token broadcast slot
+        # from the prior pipeline pass before scheduling this request again.
+        self.next_decode_eligible_step = 0
+
         # Tokens of steps whose output is not yet processed (async scheduling
         # and PP run ahead of the GPU); `num_computed_tokens` counts them
         # optimistically.
@@ -163,6 +167,8 @@ class Request:
 
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False
+        # Detected cross-request junction to retain for subsequent sparse reuse.
+        self.shared_prefix_boundary = 0
 
         # The number of NaNs in logits. A value greater than 0
         # indicates that the output is corrupted

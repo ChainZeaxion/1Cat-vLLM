@@ -59,19 +59,20 @@ at::Tensor flash_attention_grouped_verify_paged(
 
 int64_t flash_attention_grouped_verify_max_query_tokens();
 
-// [e4m3 patch] Single-request E4M3 grouped verification retaining FP32
-// numerators. Ported from upstream 1.5.0.
+int64_t flash_attention_grouped_verify_request_major_abi_version();
+
 at::Tensor flash_attention_grouped_e4m3_fp32_paged(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     at::Tensor& out, const at::Tensor& block_table,
     const at::Tensor& row_lengths, at::Tensor& partial, at::Tensor& lse,
     float scale, float k_scale, float v_scale);
 
-// [e4m3 patch] Workspace/precision revision of the E4M3 grouped operator.
 int64_t flash_attention_grouped_e4m3_fp32_precision_version();
 
-// [request-major patch] 1 = batched (request-major) grouped verify supported.
-int64_t flash_attention_grouped_verify_request_major_abi_version();
+int64_t flash_attention_tp2_e4m3_scalar_fast_version();
+int64_t flash_attention_tp2_e4m3_scalar_fast_launch_count();
+
+int64_t flash_attention_grouped_sparse_page4_abi_version();
 
 at::Tensor flash_attention_grouped_sparse_page4(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
@@ -79,10 +80,6 @@ at::Tensor flash_attention_grouped_sparse_page4(
     const at::Tensor& token_masks, const at::Tensor& seq_lens, at::Tensor& lse,
     const float softmax_scale, const std::string& kv_cache_dtype,
     const float k_scale, const float v_scale);
-
-// [sparse-page4 dtype patch] 1 = the original 9-argument fp16-only entry point;
-// 2 = kv_cache_dtype / k_scale / v_scale accepted (fp16 or fp8_e4m3 KV).
-int64_t flash_attention_grouped_sparse_page4_abi_version();
 
 at::Tensor flash_attention_grouped_sparse_page4_plan(
     const at::Tensor& logical_indices, const at::Tensor& block_table,
@@ -155,6 +152,12 @@ at::Tensor flash_attention_prefill_paged_splitkv(
     const int max_seq_len_hint);
 
 void flash_attention_fp8_e5m2_paged_kv_to_fp16(
+    const at::Tensor& key_cache, const at::Tensor& value_cache,
+    const at::Tensor& block_table, const at::Tensor& seq_lens,
+    at::Tensor& key_out, at::Tensor& value_out, const float key_scale,
+    const float value_scale);
+
+void flash_attention_fp8_e4m3_paged_kv_to_fp16(
     const at::Tensor& key_cache, const at::Tensor& value_cache,
     const at::Tensor& block_table, const at::Tensor& seq_lens,
     at::Tensor& key_out, at::Tensor& value_out, const float key_scale,

@@ -54,6 +54,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     swap_w13_to_w31,
@@ -98,6 +99,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Backported from vllm-project/vllm#55513: canonical name and legacy alias.
+_BLOCK_FP8_MOE_ALGOS = ("FP8_PB_WO", "FP8_BLOCK_SCALES")
+
 QUANT_ALGOS = [
     # FP8 (per-tensor weight + optional static activation scale).
     "FP8",
@@ -115,6 +119,21 @@ QUANT_ALGOS = [
     "MIXED_PRECISION",
 ]
 KV_CACHE_QUANT_ALGOS = ["FP8", "NVFP4"]
+
+
+def _sm70_moe_backend_requested_explicitly(layer) -> bool:
+    """True when the run pins an SM70 MoE backend with ``--moe-backend``.
+
+    The SM70 ModelOpt NVFP4 MoE otherwise binds to the TurboMind experts,
+    whose tuned prefill paths are gated on the TP4 shapes (num_experts 512,
+    hidden 2560, w13 n=320). At other topologies every fast path falls
+    through to the per-expert dense stage, which re-reads an expert's weights
+    per call. Honouring the user's explicit pick lets that run take the
+    selected backend instead. Without the flag nothing changes.
+    """
+    moe_config = getattr(layer, "moe_config", None)
+    backend = getattr(moe_config, "moe_backend", "auto")
+    return isinstance(backend, str) and backend.lower() not in ("", "auto")
 
 
 class ModelOptKVCacheMethod(BaseKVCacheMethod):
@@ -1168,6 +1187,7 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
             isinstance(layer, RoutedExperts)
             and not self.is_layer_excluded(prefix)
             and sm70_tm.is_exact_sm70_cuda_platform()
+            and not _sm70_moe_backend_requested_explicitly(layer)
         ):
             if not sm70_tm.should_use_nvfp4_moe_turbomind():
                 raise NotImplementedError(
@@ -2366,6 +2386,29 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         self.nvfp4_config = nvfp4_config
         self.w4a16_nvfp4_config = w4a16_nvfp4_config
 
+        block_sizes = {
+            int(layer_info.get("group_size", 128))
+            for layer_info in quantized_layers.values()
+            if layer_info.get("quant_algo", "").upper() in _BLOCK_FP8_MOE_ALGOS
+        }
+        if len(block_sizes) > 1:
+            raise ValueError(
+                "MIXED_PRECISION currently requires all block-FP8 MoE layers "
+                f"to use one group_size, got {sorted(block_sizes)}."
+            )
+        block_size = next(iter(block_sizes), 128)
+        self.fp8_block_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[block_size, block_size],
+        )
+
+    def has_blocked_weights(self) -> bool:
+        return any(
+            info.get("quant_algo", "").upper() in _BLOCK_FP8_MOE_ALGOS
+            for info in self.quantized_layers.values()
+        )
+
     def get_name(self) -> QuantizationMethods:
         return "modelopt_mixed"
 
@@ -2564,13 +2607,17 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             return UnquantizedLinearMethod()
 
         if isinstance(layer, RoutedExperts):
+            if quant_algo in _BLOCK_FP8_MOE_ALGOS:
+                return Fp8MoEMethod(self.fp8_block_config, layer)
             if quant_algo == "FP8":
                 return ModelOptFp8MoEMethod(
                     quant_config=self.fp8_config,
                     moe_config=layer.moe_config,
                 )
             if quant_algo == "NVFP4":
-                if sm70_tm.is_exact_sm70_cuda_platform():
+                if sm70_tm.is_exact_sm70_cuda_platform() and not (
+                    _sm70_moe_backend_requested_explicitly(layer)
+                ):
                     if not sm70_tm.should_use_nvfp4_moe_turbomind():
                         raise NotImplementedError(
                             "ModelOpt NVFP4 MoE on SM70 requires the TurboMind backend."
@@ -2588,7 +2635,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                     moe_config=layer.moe_config,
                 )
             if quant_algo == "W4A16_NVFP4":
-                if sm70_tm.is_exact_sm70_cuda_platform():
+                if sm70_tm.is_exact_sm70_cuda_platform() and not (
+                    _sm70_moe_backend_requested_explicitly(layer)
+                ):
                     if not sm70_tm.should_use_nvfp4_moe_turbomind():
                         raise NotImplementedError(
                             "ModelOpt W4A16 NVFP4 MoE on SM70 requires the "

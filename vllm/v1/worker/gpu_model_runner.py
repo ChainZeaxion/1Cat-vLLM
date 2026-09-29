@@ -52,6 +52,7 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
     graph_capture,
     is_global_first_rank,
+    is_last_pp_first_tp_rank,
     prepare_communication_buffer_for_model,
 )
 from vllm.forward_context import (
@@ -1262,7 +1263,9 @@ class GPUModelRunner(
 
         if calls != 1 and calls % _sm70_mtp_profile_interval() != 0:
             return
-        if not is_global_first_rank():
+        # The events come from the sampling path, which only the last PP
+        # stage runs; the global first rank never sees them when PP > 1.
+        if not is_last_pp_first_tp_rank():
             return
 
         preferred = [
@@ -1405,8 +1408,14 @@ class GPUModelRunner(
             self.ngram_eos_token_id = 0
         if self.uses_ngram_embedding and self.ngram_context_len <= 0:
             raise ValueError("N-gram embedding requires context length >= 1")
-        if self.uses_ngram_embedding and parallel_config.pipeline_parallel_size > 1:
-            raise RuntimeError("N-gram PLE embedding requires pipeline_parallel_size=1")
+        if self.uses_ngram_embedding:
+            from vllm.models.qwen4_exp.common.ple import (
+                check_ple_layers_on_first_pp_rank,
+            )
+
+            check_ple_layers_on_first_pp_rank(
+                model_config.hf_text_config, parallel_config.pipeline_parallel_size
+            )
         self._ple_offload_connector: Any | None = None
 
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
@@ -1534,6 +1543,7 @@ class GPUModelRunner(
                 | Gemma4Proposer
                 | Step3p5MTPProposer
                 | Qwen4ExpMTPProposer
+                | None
             )
             if self.speculative_config.method == "custom_class":
                 self.drafter = create_custom_proposer(  # type: ignore[assignment]
@@ -1607,6 +1617,15 @@ class GPUModelRunner(
                 self.sampler, self.speculative_config, self.device
             )
 
+        elif self.speculative_config:
+            # Non-last PP ranks never build a drafter (the entire draft
+            # model lives on the last rank, see the note above), but code
+            # that runs on every rank probes the attribute -- the
+            # attention-metadata builder does so during memory profiling,
+            # long before any request arrives. Bind it so those
+            # isinstance() checks fall through instead of raising
+            # AttributeError.
+            self.drafter = None
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None
         if self.speculative_config:
             draft_config = self.speculative_config.draft_model_config
@@ -1934,6 +1953,10 @@ class GPUModelRunner(
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
+        # Non-last PP rank under speculative decoding: this step's
+        # scheduler_output, kept until the sampled matrix arrives from the
+        # last rank in sample_tokens() (hybrid-state update).
+        self._pp_nonlast_scheduler_output: SchedulerOutput | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
@@ -2541,10 +2564,13 @@ class GPUModelRunner(
                         req_state.output_token_ids.extend(
                             new_token_ids[-num_new_tokens:]
                         )
-            elif num_output_tokens < len(req_state.output_token_ids):
+            if num_output_tokens < len(req_state.output_token_ids):
                 # Some output tokens were discarded due to a sync-KV-load
                 # failure, or output_token_ids was inflated by the optimistic
                 # extend above (async spec decode). Align the cached state.
+                # This runs on every pipeline rank: the optimistic extend is
+                # not gated on the rank either, and the deferred correction
+                # only fixes the token counts, never the placeholders.
                 del req_state.output_token_ids[num_output_tokens:]
                 if req_index is not None:
                     end_idx = (
@@ -7692,10 +7718,11 @@ class GPUModelRunner(
             draft_confidence_logits=draft_confidence_logits,
         )
         target_candidate_ids = self.rejection_sampler.take_last_target_candidate_ids()
-        if target_candidate_ids is not None and hasattr(
-            self.drafter, "update_dynamic_draft_vocab"
-        ):
-            self.drafter.update_dynamic_draft_vocab(
+        update_dynamic_draft_vocab = getattr(
+            getattr(self, "drafter", None), "update_dynamic_draft_vocab", None
+        )
+        if target_candidate_ids is not None and update_dynamic_draft_vocab is not None:
+            update_dynamic_draft_vocab(
                 target_candidate_ids,
                 sampler_output.sampled_token_ids,
             )
@@ -8171,6 +8198,44 @@ class GPUModelRunner(
             else force_uniform_decode
         )
 
+    def _compute_force_uniform_decode(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> bool | None:
+        """Reject uniform-decode dispatch for hybrid-model prefills.
+
+        A prefill can have the same shape as a uniform decode batch, notably
+        when its scheduled token count equals ``1 + num_speculative_tokens``.
+        Hybrid backends keep recurrent state and must run that row through the
+        prefill path. Derive the phase from this iteration's scheduler output
+        rather than ``input_batch`` so the early PP+SP caller observes the
+        current step as well.
+
+        ``None`` preserves the normal shape heuristic. ``False`` is only
+        returned when a hybrid batch contains an unfinished prompt.
+        """
+        if not self.model_config.is_hybrid:
+            return None
+
+        for new_req in scheduler_output.scheduled_new_reqs:
+            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+                new_req.prompt_token_ids,
+                new_req.prompt_embeds,
+            )
+            if new_req.num_computed_tokens < num_prompt_tokens:
+                return False
+
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        for req_id, num_computed_tokens in zip(
+            cached_reqs.req_ids,
+            cached_reqs.num_computed_tokens,
+            strict=True,
+        ):
+            if num_computed_tokens < self.requests[req_id].num_prompt_tokens:
+                return False
+
+        return None
+
     def _determine_batch_execution_and_padding(
         self,
         num_tokens: int,
@@ -8613,6 +8678,9 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
+                force_uniform_decode=self._compute_force_uniform_decode(
+                    scheduler_output
+                ),
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
             if trace_log:
@@ -8866,6 +8934,7 @@ class GPUModelRunner(
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
                     self.kv_connector_output = kv_connector_output
+                    self._pp_nonlast_scheduler_output = scheduler_output
                     return hidden_states
 
                 if self.is_pooling_model:
@@ -9374,14 +9443,13 @@ class GPUModelRunner(
                 # make token id 0 look like a real speculative token to the
                 # scheduler and verifier.
                 logger.warning_once(
-                    "Skipping speculative drafts because the drafter context "
-                    "limit is reached: max_seq_len=%s, num_spec_tokens=%s, "
-                    "effective_drafter_max_model_len=%s.",
-                    spec_decode_common_attn_metadata.max_seq_len
-                    if spec_decode_common_attn_metadata is not None
-                    else None,
+                    "Skipping speculative drafts after reaching the drafter "
+                    "context limit: num_spec_tokens=%s, "
+                    "effective_drafter_max_model_len=%s. Future over-limit "
+                    "batches are suppressed.",
                     self.num_spec_tokens,
                     self.effective_drafter_max_model_len,
+                    scope="global",
                 )
                 self._draft_token_ids = [[] for _ in self.input_batch.req_ids]
                 self._draft_probs = None
@@ -9435,6 +9503,15 @@ class GPUModelRunner(
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
+
+        if (
+            spec_config is not None
+            and self.use_async_scheduling
+            and not self.broadcast_pp_output
+            and get_pp_group().world_size > 1
+            and get_pp_group().is_last_rank
+        ):
+            self._pp_broadcast_draft_token_ids()
 
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
@@ -9589,28 +9666,123 @@ class GPUModelRunner(
         """Broadcast sampled token ids (GPU) from last PP stage"""
         pp = get_pp_group()
         assert pp.is_last_rank
+        # Skip for chunked prefill: sampled tokens are dummy
+        # and will be discarded, no need to broadcast.
+        if self._is_all_reqs_chunked_prefill():
+            return
+        # The receiver sizes its buffer from its own input_batch.num_reqs.
+        # Both come from the same scheduler output; a divergence has to raise
+        # here instead of hanging every rank in an unmatched collective.
+        assert sampled_token_ids.shape[0] == self.input_batch.num_reqs
+        if self.num_spec_tokens:
+            # Speculative decoding: the non-last ranks derive the next token
+            # ids, the accepted counts and the hybrid-state update from the
+            # full sampled matrix. The sampler emits fewer columns in rounds
+            # with fewer or no scheduled drafts, so pad to the static wire
+            # shape [num_reqs, num_spec_tokens + 1] with the rejection
+            # sampler's -1 placeholder.
+            payload = torch.full(
+                (sampled_token_ids.shape[0], self.num_spec_tokens + 1),
+                -1,
+                dtype=torch.int32,
+                device=sampled_token_ids.device,
+            )
+            payload[:, : sampled_token_ids.shape[1]] = sampled_token_ids
+            # The speculative round state goes over the gloo cpu_group. An
+            # NCCL broadcast on the device_group shares the communicator with
+            # the pipeline's send/recv; with five stages the two interleave
+            # and the first request hangs (ranks 0-2 in the broadcast, ranks
+            # 3-4 in irecv). A CPU rendezvous has no stream ordering to
+            # violate, and the payload is [num_reqs, num_spec_tokens + 1]
+            # int32.
+            torch.distributed.broadcast(payload.cpu(), src=pp.rank, group=pp.cpu_group)
+            return
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
         assert sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] == 1, (
             "PP+async expects sampled_token_ids to have shape [num_reqs, 1]"
         )
-        # Skip for chunked prefill: sampled tokens are dummy
-        # and will be discarded, no need to broadcast.
-        if not self._is_all_reqs_chunked_prefill():
-            torch.distributed.broadcast(
-                sampled_token_ids, src=pp.rank, group=pp.device_group
+        torch.distributed.broadcast(
+            sampled_token_ids, src=pp.rank, group=pp.device_group
+        )
+
+    def _pp_broadcast_draft_token_ids(self) -> None:
+        """Broadcast this step's draft token ids from the last PP stage.
+
+        Under async scheduling the scheduler only carries placeholder draft
+        slots; the non-last ranks need the real draft ids for their
+        input_ids scatter in the next step.
+        """
+        pp = get_pp_group()
+        assert pp.is_last_rank
+        if self._is_all_reqs_chunked_prefill():
+            return
+        num_reqs = self.input_batch.num_reqs
+        drafts = self._draft_token_ids
+        if isinstance(drafts, torch.Tensor) and drafts.shape[0] >= num_reqs:
+            payload = drafts[:num_reqs].to(dtype=torch.int32).contiguous()
+        else:
+            # Drafter skipped, or list-form drafts (ngram): the scheduler
+            # schedules no GPU-resident spec slots from these, so the zeros
+            # are never read on the receiving rank.
+            payload = torch.zeros(
+                (num_reqs, self.num_spec_tokens),
+                dtype=torch.int32,
+                device=self.device,
             )
+        torch.distributed.broadcast(payload.cpu(), src=pp.rank, group=pp.cpu_group)
+
+    def _pp_receive_spec_decode_state(self, num_reqs: int) -> None:
+        """Receive the speculative round state from the last PP stage.
+
+        Wire format, two broadcasts of statically known shape:
+          1. the sampled token matrix [num_reqs, num_spec_tokens + 1], -1 padded
+          2. the draft token ids [num_reqs, num_spec_tokens]
+        The next token ids, the accepted counts and the hybrid (GDN/mamba)
+        state update are derived locally from the matrix, as the last rank
+        does in its full sample_tokens() path.
+        """
+        pp = get_pp_group()
+        sampled_cpu = torch.empty(
+            (num_reqs, self.num_spec_tokens + 1), dtype=torch.int32
+        )
+        torch.distributed.broadcast(sampled_cpu, src=pp.last_rank, group=pp.cpu_group)
+        sampled = sampled_cpu.to(self.device, non_blocking=True)
+        valid_counts = _count_contiguous_spec_tokens(sampled)
+        next_token_ids = sampled.gather(
+            1, (valid_counts.to(torch.int64) - 1).clamp_(min=0).unsqueeze(1)
+        ).squeeze(1)
+        assert self.valid_sampled_token_count_event is not None
+        self._copy_valid_sampled_token_count(next_token_ids, valid_counts)
+
+        drafts_cpu = torch.empty((num_reqs, self.num_spec_tokens), dtype=torch.int32)
+        torch.distributed.broadcast(drafts_cpu, src=pp.last_rank, group=pp.cpu_group)
+        self._draft_token_ids = drafts_cpu.to(self.device, non_blocking=True)
+
+        scheduler_output = self._pp_nonlast_scheduler_output
+        self._pp_nonlast_scheduler_output = None
+        if scheduler_output is None:
+            raise RuntimeError(
+                "PP speculative decoding: this non-last rank has no stashed "
+                "scheduler_output for the hybrid-state update."
+            )
+        self._update_states_after_model_execute(sampled, scheduler_output)
 
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
         """Receive sampled token ids broadcast from last PP stage"""
         pp = get_pp_group()
         assert not pp.is_last_rank
         num_reqs = self.input_batch.num_reqs
-        # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
-        recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
-        # skip for chunked prefill.
-        if not self._is_all_reqs_chunked_prefill():
-            torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
-        self.input_batch.prev_sampled_token_ids = recv
+        if self.num_spec_tokens and not self._is_all_reqs_chunked_prefill():
+            self._pp_receive_spec_decode_state(num_reqs)
+        else:
+            # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
+            recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
+            # skip for chunked prefill.
+            if not self._is_all_reqs_chunked_prefill():
+                torch.distributed.broadcast(
+                    recv, src=pp.last_rank, group=pp.device_group
+                )
+            self.input_batch.prev_sampled_token_ids = recv
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
         # can map req_id -> previous batch row
@@ -10211,13 +10383,13 @@ class GPUModelRunner(
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
-                if hasattr(self, "drafter"):
+                if (drafter := getattr(self, "drafter", None)) is not None:
                     logger.info_once("Loading drafter model...")
-                    if hasattr(self.drafter, "load_model"):
-                        self.drafter.load_model(self.model)
+                    if hasattr(drafter, "load_model"):
+                        drafter.load_model(self.model)
                     if (
-                        hasattr(self.drafter, "model")
-                        and is_mixture_of_experts(self.drafter.model)
+                        hasattr(drafter, "model")
+                        and is_mixture_of_experts(drafter.model)
                         and self.parallel_config.enable_eplb
                     ):
                         assert not self.parallel_config.enable_elastic_ep, (
@@ -10235,7 +10407,7 @@ class GPUModelRunner(
                                 self.parallel_config, self.device
                             )
                         self.eplb_state.add_model(
-                            self.drafter.model,
+                            drafter.model,
                             spec_config.draft_model_config,
                         )
                         eplb_models += 1
@@ -11076,12 +11248,16 @@ class GPUModelRunner(
             elif self.uses_xdrope_dim > 0:
                 positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
             else:
+                # A dummy batch can hold more tokens than one sequence may
+                # (max_num_batched_tokens > max_model_len); wrap so every
+                # position stays inside the model's position table.
                 self.positions[:num_tokens_padded].copy_(
                     torch.arange(
                         num_tokens_padded,
                         dtype=torch.int64,
                         device=self.device,
                     )
+                    % self.max_model_len
                 )
                 positions = self.positions[:num_tokens_padded]
 
@@ -11157,10 +11333,14 @@ class GPUModelRunner(
                     hidden_states
                 )
 
-            if self.speculative_config and (
-                self.speculative_config.use_eagle()
-                or self.speculative_config.uses_draft_model()
-                or self.speculative_config.uses_extract_hidden_states()
+            if (
+                self.speculative_config
+                and get_pp_group().is_last_rank
+                and (
+                    self.speculative_config.use_eagle()
+                    or self.speculative_config.uses_draft_model()
+                    or self.speculative_config.uses_extract_hidden_states()
+                )
             ):
                 assert isinstance(
                     self.drafter,
@@ -12155,9 +12335,13 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_draft_model()
+        if (
+            self.speculative_config
+            and get_pp_group().is_last_rank
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_draft_model()
+            )
         ):
             assert isinstance(
                 self.drafter,
@@ -12208,9 +12392,13 @@ class GPUModelRunner(
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_extract_hidden_states()
+        if (
+            self.speculative_config
+            and get_pp_group().is_last_rank
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_extract_hidden_states()
+            )
         ):
             assert isinstance(
                 self.drafter,
@@ -12679,6 +12867,7 @@ class GPUModelRunner(
         if (
             self.speculative_config
             and self.speculative_config.uses_extract_hidden_states()
+            and get_pp_group().is_last_rank
         ):
             assert isinstance(self.drafter, ExtractHiddenStatesProposer)
             # validate all draft model layers belong to the same kv cache

@@ -14,6 +14,9 @@ GPTQ_GROUP_SIZES = (128,)
 COMPRESSED_UINT4_GROUP_SIZES = (32, 128)
 MXFP4_GROUP_SIZE = 32
 NVFP4_GROUP_SIZE = 16
+# SM70 packed NVFP4 GEMM needs complete 32-column tiles. N=8240 (Qwen
+# GDN on TP2) is 16-aligned but corrupts the result without this padding.
+NVFP4_OUTPUT_ALIGNMENT = 32
 NVFP4_QPN4_DENSE_WORKSPACE_ELEMENTS = 5120 * 8704
 STATE_ATTR = "_sm70_turbomind_linear"
 SM70QuantBackend = Literal["auto", "marlin", "turbomind"]
@@ -32,10 +35,17 @@ class SM70TurboMindLinearState:
     dense_weight_ptr: int = 0
     global_scale: float = 0.0
     use_scale_code: bool = False
+    padded_output_size: int = 0
+    prescaled_scales: bool = False
 
 
 # States retain only data_ptr(), so this cache owns the bounded allocation.
-_nvfp4_qpn4_dense_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
+_nvfp4_qpn4_dense_workspaces: dict[tuple, torch.Tensor] = {}
+
+
+def clear_sm70_turbomind_workspaces() -> None:
+    """Release process-global NVFP4 QPN4 dense workspaces."""
+    _nvfp4_qpn4_dense_workspaces.clear()
 
 
 def quant_backend() -> SM70QuantBackend:
@@ -44,6 +54,17 @@ def quant_backend() -> SM70QuantBackend:
 
 def use_turbomind(default_enabled: bool) -> bool:
     return envs.use_sm70_turbomind(default_enabled)
+
+
+def use_batched_gemm_layouts() -> bool:
+    """Prepare compatible batch GEMM layouts once on SM70.
+
+    Format-specific callers validate their own local weights and operators.
+    Model name, quantization label, speculative method/width and max_num_seqs
+    do not restrict this shared policy. Small-M kernels retain their existing
+    packed layouts; larger batches consume prepared TurboMind weights/scales.
+    """
+    return envs.VLLM_SM70_BATCH_GEMM_LAYOUTS and is_exact_sm70_cuda_platform()
 
 
 def forces_marlin() -> bool:
@@ -62,8 +83,17 @@ def is_exact_sm70_cuda_platform() -> bool:
     Quant-method selection runs before a layer owns a CUDA tensor, so it
     cannot use :func:`is_exact_sm70_cuda`. Keep this platform check separate
     from the tensor-based helpers used by linear weight preparation.
+
+    The capability is read from the device this worker builds its layers on.
+    Probing device 0 of the visibility list answers for a different card on a
+    heterogeneous node: with a Turing card first the Volta workers lose their
+    SM70 routes, and with a Volta first the Turing workers take them.
     """
-    return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+    if not current_platform.is_cuda():
+        return False
+    return current_platform.is_device_capability(
+        (7, 0), device_id=torch.accelerator.current_device_index()
+    )
 
 
 def should_use_mxfp4_moe_turbomind() -> bool:
@@ -158,6 +188,8 @@ def _store_state(
     dense_weight_ptr: int = 0,
     global_scale: float = 0.0,
     use_scale_code: bool = False,
+    padded_output_size: int = 0,
+    prescaled_scales: bool = False,
 ) -> None:
     state = SM70TurboMindLinearState(
         weight=weight,
@@ -171,6 +203,8 @@ def _store_state(
         dense_weight_ptr=dense_weight_ptr,
         global_scale=global_scale,
         use_scale_code=use_scale_code,
+        padded_output_size=padded_output_size,
+        prescaled_scales=prescaled_scales,
     )
     setattr(layer, STATE_ATTR, state)
 
@@ -277,9 +311,18 @@ def prepare_mxfp4_linear(
     )
 
 
+def _prescale_nvfp4_batch_scales(scales: torch.Tensor) -> bool:
+    """Fold the exact FP4 conversion factor into the existing scale allocation."""
+    if not float(scales.abs().amax()) <= 65504.0 / 16384.0:
+        return False
+    scales.mul_(16384.0)
+    return True
+
+
 def prepare_nvfp4_linear(
     layer: torch.nn.Module,
     interleave_gated_silu: bool = False,
+    prescale_for_batch: bool = False,
 ) -> None:
     if not hasattr(torch.ops._C, "nvfp4_sm70_prepare"):
         raise RuntimeError(
@@ -297,8 +340,38 @@ def prepare_nvfp4_linear(
         .to(torch.float16)
         .contiguous()
     )
+    output_size = qweight.size(1)
+    padded_output_size = (
+        (output_size + NVFP4_OUTPUT_ALIGNMENT - 1) // NVFP4_OUTPUT_ALIGNMENT
+    ) * NVFP4_OUTPUT_ALIGNMENT
+    if padded_output_size != output_size:
+        if interleave_gated_silu:
+            raise RuntimeError(
+                "SM70 TurboMind NVFP4 gated-SiLU does not support output padding."
+            )
+        padded_qweight = torch.zeros(
+            (qweight.size(0), padded_output_size),
+            dtype=qweight.dtype,
+            device=qweight.device,
+        )
+        padded_scales = torch.zeros(
+            (scales.size(0), padded_output_size),
+            dtype=scales.dtype,
+            device=scales.device,
+        )
+        padded_qweight[:, :output_size].copy_(qweight)
+        padded_scales[:, :output_size].copy_(scales)
+        qweight = padded_qweight
+        scales = padded_scales
     tm_weight, tm_scales, meta = sm70_ops.nvfp4_sm70_prepare(
         qweight, scales, NVFP4_GROUP_SIZE, interleave_gated_silu
+    )
+    # QPN2 retains its independent compressed scales for M<=32. Larger decode
+    # and prefill use the same scaled TM buffer, without a second allocation.
+    prescaled_scales = bool(
+        prescale_for_batch
+        and hasattr(torch.ops._C, "nvfp4_gemm_sm70_prescaled_out")
+        and _prescale_nvfp4_batch_scales(tm_scales)
     )
     _store_state(
         layer,
@@ -306,9 +379,11 @@ def prepare_nvfp4_linear(
         tm_scales,
         meta,
         NVFP4_GROUP_SIZE,
-        qweight.size(1),
+        output_size,
         "nvfp4",
         interleave_gated_silu,
+        padded_output_size=padded_output_size,
+        prescaled_scales=prescaled_scales,
     )
 
 
@@ -316,13 +391,14 @@ def get_nvfp4_qpn4_dense_workspace(weight: torch.Tensor) -> torch.Tensor | None:
     device_index = weight.device.index
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
-    cache_key = (device_index, torch.float16)
+    elements = max(NVFP4_QPN4_DENSE_WORKSPACE_ELEMENTS, weight.numel() * 2)
+    cache_key = (device_index, torch.float16, elements)
     workspace = _nvfp4_qpn4_dense_workspaces.get(cache_key)
     if workspace is not None:
         return workspace
     try:
         workspace = torch.empty(
-            (NVFP4_QPN4_DENSE_WORKSPACE_ELEMENTS,),
+            (elements,),
             dtype=torch.float16,
             device=weight.device,
         )
@@ -384,8 +460,9 @@ def apply_prepared_linear(
     state = getattr(layer, STATE_ATTR)
     reshaped_x = x.reshape(-1, x.shape[-1])
     out_shape = x.shape[:-1] + (state.output_size,)
+    kernel_output_size = state.padded_output_size or state.output_size
     out = torch.empty(
-        (reshaped_x.shape[0], state.output_size),
+        (reshaped_x.shape[0], kernel_output_size),
         dtype=x.dtype,
         device=x.device,
     )
@@ -411,8 +488,23 @@ def apply_prepared_linear(
             state.k_ld,
             state.q_ld,
         )
+    elif state.op_kind == "nvfp4" and state.use_scale_code:
+        sm70_ops.nvfp4_qpn2_compact_tm_gemm_sm70_out(
+            out,
+            reshaped_x,
+            state.weight,
+            state.scales,
+            state.global_scale,
+            state.k_ld,
+            state.q_ld,
+        )
     elif state.op_kind == "nvfp4":
-        sm70_ops.nvfp4_gemm_sm70_out(
+        op = (
+            sm70_ops.nvfp4_gemm_sm70_prescaled_out
+            if state.prescaled_scales
+            else sm70_ops.nvfp4_gemm_sm70_out
+        )
+        op(
             out,
             reshaped_x,
             state.weight,
@@ -440,6 +532,8 @@ def apply_prepared_linear(
         )
     else:
         raise AssertionError(f"unknown SM70 TurboMind op kind: {state.op_kind}")
+    if kernel_output_size != state.output_size:
+        out = out[:, : state.output_size]
     if state.gated_silu and state.op_kind == "nvfp4":
         out_features = state.output_size // 2
         out = (
@@ -495,7 +589,12 @@ def apply_prepared_fused_silu_and_mul(
             True,
         )
     else:
-        sm70_ops.nvfp4_gemm_sm70_out(
+        op = (
+            sm70_ops.nvfp4_gemm_sm70_prescaled_out
+            if state.prescaled_scales
+            else sm70_ops.nvfp4_gemm_sm70_out
+        )
+        op(
             out,
             reshaped_x,
             state.weight,

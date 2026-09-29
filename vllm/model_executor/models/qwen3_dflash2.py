@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from functools import cache
 
@@ -54,10 +55,17 @@ def _use_sm70_bf16_emulation(config) -> bool:
         "bf16",
         "torch.bfloat16",
     }
-    return (
-        is_bf16
-        and current_platform.is_cuda()
-        and current_platform.is_device_capability(70)
+    enabled = os.getenv("VLLM_SM70_DFLASH2_BF16_EMULATION", "1").strip().lower()
+    enabled = enabled in ("1", "true", "yes", "on")
+    if not (enabled and is_bf16 and current_platform.is_cuda()):
+        return False
+    # Native BF16 arithmetic arrives with SM80. Volta and Turing both run the
+    # draft in FP16, so both need the range-preserving path: the criterion is
+    # the missing capability, not one architecture number. Ask the device this
+    # worker builds on; device 0 of the visibility list may be another card on
+    # a node that mixes architectures.
+    return not current_platform.has_device_capability(
+        80, device_id=torch.accelerator.current_device_index()
     )
 
 
@@ -70,7 +78,12 @@ def _flashinfer_topk() -> Callable[..., tuple[torch.Tensor, torch.Tensor]] | Non
     """
     if not current_platform.is_cuda():
         return None
-    if not current_platform.has_device_capability(80):
+    # Same rule as _use_sm70_bf16_emulation: ask the worker's own device, not
+    # device 0 of the visibility list; the cache is per process, i.e. per
+    # worker.
+    if not current_platform.has_device_capability(
+        80, device_id=torch.accelerator.current_device_index()
+    ):
         logger.info_once(
             "DFlash2 disables FlashInfer top-k below SM80; using torch.topk."
         )
@@ -263,7 +276,8 @@ def _score_edges(
     anchor_token_ids: torch.Tensor,
     top_k: int,
 ) -> torch.Tensor:
-    successors = successor_table[candidate_ids]
+    vocab_size = successor_table.shape[0]
+    successors = successor_table[candidate_ids.clamp(0, vocab_size - 1)]
     predecessor_ids = torch.cat(
         (
             anchor_token_ids[:, None, None].expand(-1, 1, top_k),
@@ -271,7 +285,7 @@ def _score_edges(
         ),
         dim=1,
     )
-    predecessors = predecessor_table[predecessor_ids]
+    predecessors = predecessor_table[predecessor_ids.clamp(0, vocab_size - 1)]
     return unary_logits[:, :, None] + torch.einsum(
         "blpr,blcr->blpc", predecessors * hidden[:, :, None], successors
     )
@@ -342,8 +356,11 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
             and current_platform.is_cuda()
             and current_platform.is_device_capability(70)
             and vllm_config.parallel_config.tensor_parallel_size == 4
-            and input_size == 25600
-            and output_size == 5120
+            and (input_size, output_size)
+            in {
+                (25600, 5120),
+                (20480, 4096),
+            }
         )
         if not use_sharded_fc:
             return super()._make_context_projection(
@@ -370,7 +387,9 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
         projection._sm70_f16_max_m = 64
         logger.info_once(
             "Using TP4 output-sharded DFlash2 target-hidden projection on SM70 "
-            "(25600->5120 plus compact all-gather)."
+            "(%d->%d plus compact all-gather).",
+            input_size,
+            output_size,
         )
         return projection
 
@@ -440,21 +459,37 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
         softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
         self.final_logit_softcapping = softcap if softcap > 0 else None
 
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+
     def compute_candidates(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not isinstance(
+        unquantized_head = isinstance(
             self.lm_head.quant_method,
             (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
-        ):
-            raise ValueError(
-                "DFlash2 requires an unquantized target LM head for candidate TopK; "
-                f"got {type(self.lm_head.quant_method).__name__}."
+        )
+        if not unquantized_head:
+            if not envs.VLLM_SM70_DFLASH2_QUANT_LM_HEAD:
+                raise ValueError(
+                    "DFlash2 requires an unquantized target LM head for "
+                    "candidate TopK; got "
+                    f"{type(self.lm_head.quant_method).__name__}. Set "
+                    "VLLM_SM70_DFLASH2_QUANT_LM_HEAD=1 to use the "
+                    "dense-logit fallback over the quantized head."
+                )
+            logger.info_once(
+                "VLLM_SM70_DFLASH2_QUANT_LM_HEAD=1: DFlash2 candidate TopK "
+                "uses the dense-logit fallback over the quantized target "
+                "LM head (%s).",
+                type(self.lm_head.quant_method).__name__,
             )
 
         selector = self.model.candidate_selector
-        local_candidates = self.lm_head.maybe_get_sm70_dflash2_top20(
-            hidden_states, selector.top_k
+        local_candidates = (
+            self.lm_head.maybe_get_sm70_dflash2_top20(hidden_states, selector.top_k)
+            if unquantized_head
+            else None
         )
         if local_candidates is None:
             logits = self.lm_head.quant_method.apply(

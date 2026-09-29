@@ -140,6 +140,12 @@ def test_compressed_tensors_channel_fp8_prepares_and_dispatches_turbomind(
         "compressed_tensors_w8a16_fp8.sm70_ops.fp8_sm70_prepare",
         fake_prepare,
     )
+    # Isolate dispatch from the real packing geometry in this tiny mocked case.
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.compressed_tensors.schemes."
+        "compressed_tensors_w8a16_fp8._sm70_channel_fp8_shape_is_validated",
+        lambda _: True,
+    )
     scheme.process_weights_after_loading(layer)
 
     assert prepare_calls == [((6, 4), (6, 1), 128, False)]
@@ -204,7 +210,7 @@ def test_compressed_tensors_channel_fp8_qpn8_shape_gate_is_exact():
     layer.tp_size = 2
     layer.prefix = "model.language_model.layers.3.self_attn.o_proj"
     layer.weight = SimpleNamespace(shape=(5120, 1536))
-    assert _sm70_channel_fp8_qpn8_config(layer) is None
+    assert _sm70_channel_fp8_qpn8_config(layer) == (12, 2, False)
 
 
 def test_compressed_tensors_channel_fp8_qpn8_prepares_and_dispatches(monkeypatch):
@@ -390,7 +396,7 @@ def test_fp8_qpn8_is_opt_in_except_for_mixed_nvfp4(monkeypatch):
         envs.disable_envs_cache()
 
 
-def test_fp8_prefill_exact_dense_shape_gate_is_narrow():
+def test_fp8_prefill_exact_dense_shape_gate_checks_layout():
     layer = SimpleNamespace(
         tp_size=4,
         weight_block_size=[128, 128],
@@ -401,7 +407,7 @@ def test_fp8_prefill_exact_dense_shape_gate_is_narrow():
     assert _is_sm70_fp8_prefill_exact_dense_layer(layer)
 
     layer.tp_size = 2
-    assert not _is_sm70_fp8_prefill_exact_dense_layer(layer)
+    assert _is_sm70_fp8_prefill_exact_dense_layer(layer)
     layer.tp_size = 4
     layer.prefix = "model.language_model.layers.1.self_attn.qkv_proj"
     layer.weight = SimpleNamespace(shape=(5120, 3584))
@@ -410,7 +416,7 @@ def test_fp8_prefill_exact_dense_shape_gate_is_narrow():
     layer.weight = SimpleNamespace(shape=(5120, 4096))
     assert _is_sm70_fp8_prefill_exact_dense_layer(layer)
     layer.prefix = "model.language_model.layers.1.mlp.gate_up_proj"
-    layer.weight = SimpleNamespace(shape=(5120, 8192))
+    layer.weight = SimpleNamespace(shape=(5120, 8193))
     assert not _is_sm70_fp8_prefill_exact_dense_layer(layer)
     layer.weight_block_size = [64, 128]
     layer.weight = SimpleNamespace(shape=(5120, 8704))
@@ -431,12 +437,12 @@ def test_fp8_exact_8k_prefill_gate_uses_operator_contract_only():
     assert _is_sm70_fp8_exact_8k_prefill_layer(layer)
 
     layer.tp_size = 2
-    assert not _is_sm70_fp8_exact_8k_prefill_layer(layer)
+    assert _is_sm70_fp8_exact_8k_prefill_layer(layer)
     layer.tp_size = 4
     layer.weight_block_size = [64, 128]
     assert not _is_sm70_fp8_exact_8k_prefill_layer(layer)
     layer.weight_block_size = [128, 128]
-    layer.weight = SimpleNamespace(shape=(5120, 4096))
+    layer.weight = SimpleNamespace(shape=(5120, 4097))
     assert not _is_sm70_fp8_exact_8k_prefill_layer(layer)
 
 
@@ -453,7 +459,7 @@ def test_fp8_qpn8_shape_gate_uses_checkpoint_native_layout():
     assert _is_sm70_fp8_qpn8_layer(layer)
 
     layer.tp_size = 2
-    assert not _is_sm70_fp8_qpn8_layer(layer)
+    assert _is_sm70_fp8_qpn8_layer(layer)
     layer.tp_size = 4
     layer.prefix = "model.language_model.layers.1.linear_attn.in_proj_qkvz"
     layer.output_size_per_partition = 4096
@@ -470,23 +476,7 @@ def test_fp8_qpn8_shape_gate_uses_checkpoint_native_layout():
     assert not _is_sm70_fp8_qpn8_layer(layer)
 
 
-def test_fp8_qpn8_runtime_gate_uses_engine_contract_only(monkeypatch):
-    vllm_config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
-        speculative_config=None,
-    )
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.fp8.get_current_vllm_config",
-        lambda: vllm_config,
-    )
-
-    assert _is_sm70_fp8_qpn8_runtime_contract()
-    vllm_config.scheduler_config.max_num_seqs = 16
-    assert not _is_sm70_fp8_qpn8_runtime_contract()
-    vllm_config.scheduler_config.max_num_seqs = 8
-    vllm_config.speculative_config = object()
-    assert not _is_sm70_fp8_qpn8_runtime_contract()
-    monkeypatch.setenv("VLLM_SM70_FP8_QPN8", "1")
+def test_fp8_qpn8_runtime_gate_is_capacity_and_speculation_independent():
     assert _is_sm70_fp8_qpn8_runtime_contract()
 
 
@@ -504,7 +494,7 @@ def test_fp8_prefill_exact_dense_workspace_is_reused(monkeypatch):
 
     _sm70_fp8_prefill_dense_workspaces.clear()
     monkeypatch.setattr(torch, "empty", fake_empty)
-    weight = SimpleNamespace(device=torch.device("cuda:0"))
+    weight = SimpleNamespace(device=torch.device("cuda:0"), numel=lambda: 5120 * 8704)
 
     try:
         first = _get_sm70_fp8_prefill_exact_dense_workspace(weight)

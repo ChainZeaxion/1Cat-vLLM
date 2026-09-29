@@ -6,6 +6,7 @@ import math
 import pytest
 import torch
 
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     dflash2_sparse_topk_rejection_sample,
     rejection_sample,
@@ -133,15 +134,18 @@ def _assert_distribution_match(
 @pytest.mark.parametrize("num_speculative_steps", [3, 7])
 @pytest.mark.parametrize("top_p", [1.0, 0.95])
 @pytest.mark.parametrize("temperature", [0.6, 1.0])
+@pytest.mark.parametrize("padded_candidates", [False, True])
+@pytest.mark.parametrize("num_reqs", [2, 4, 8])
 def test_dflash2_sparse_topk_matches_dense_rejection(
+    num_reqs: int,
     num_speculative_steps: int,
     top_p: float,
     temperature: float,
+    padded_candidates: bool,
 ):
     """Compact p/q support must preserve the dense DFlash2 decision path."""
     torch.manual_seed(20260823)
     device = torch.device("cuda")
-    num_reqs = 4
     target_top_k = 20
     draft_top_k = 16
     rows_per_req = num_speculative_steps + 1
@@ -244,6 +248,15 @@ def test_dflash2_sparse_topk_matches_dense_rejection(
         seeds,
         num_speculative_steps,
     )
+    if padded_candidates:
+        padded_ids = target_topk_ids.new_zeros((num_logits, target_top_k + 1))
+        padded_logits = target_topk_logits.new_full(
+            (num_logits, target_top_k + 1), 1000.0
+        )
+        padded_ids[:, :target_top_k].copy_(target_topk_ids)
+        padded_logits[:, :target_top_k].copy_(target_topk_logits)
+        target_topk_ids = padded_ids[:, :target_top_k]
+        target_topk_logits = padded_logits[:, :target_top_k]
     sparse_sampled, sparse_num_sampled = dflash2_sparse_topk_rejection_sample(
         target_topk_ids,
         target_topk_logits,
@@ -301,6 +314,112 @@ def test_stochastic_rejection_sample(num_speculative_steps: int, temperature: fl
         num_speculative_steps,
         temperature=temperature,
         num_trials=num_trials,
+    )
+
+    sampled, num_sampled = rejection_sample(
+        **inputs, num_speculative_steps=num_speculative_steps
+    )
+
+    target_probs = torch.softmax(target_logits_1d, dim=0)
+    for pos in range(num_speculative_steps + 1):
+        accepted_mask = num_sampled >= pos + 1
+        _assert_distribution_match(
+            sampled[accepted_mask, pos], target_probs, device, label=f"position {pos}"
+        )
+
+
+NARROW_VOCAB_SIZE = 16
+NARROW_NUM_TRIALS = 200_000
+
+
+def _gumbel_drafted_tokens(
+    inputs: dict,
+    draft_logits_1d: torch.Tensor,
+    num_trials: int,
+    num_speculative_steps: int,
+) -> torch.Tensor:
+    k = num_speculative_steps
+    vocab_size = draft_logits_1d.shape[0]
+    draft_tokens = gumbel_sample(
+        draft_logits_1d.unsqueeze(0).expand(num_trials * k, vocab_size).float(),
+        inputs["expanded_idx_mapping"]
+        .view(num_trials, k + 1)[:, :k]
+        .reshape(-1)
+        .contiguous(),
+        inputs["temperature"],
+        inputs["seed"],
+        inputs["pos"].view(num_trials, k + 1)[:, :k].reshape(-1).contiguous(),
+        apply_temperature=True,
+        is_drafting=True,
+    )
+    draft_sampled = torch.zeros(
+        num_trials * (k + 1), dtype=torch.int64, device=draft_logits_1d.device
+    )
+    draft_sampled.view(num_trials, k + 1)[:, 1:] = draft_tokens.view(num_trials, k)
+    return draft_sampled
+
+
+@pytest.mark.parametrize("num_speculative_steps", [1, 3])
+def test_gumbel_drafted_rejection_sample_is_unbiased(num_speculative_steps: int):
+    """Draft proposals and residual resampling must use independent noise."""
+    torch.manual_seed(42)
+    device = "cuda"
+    target_logits_1d = torch.randn(
+        NARROW_VOCAB_SIZE, device=device, dtype=torch.float32
+    )
+    draft_logits_1d = -target_logits_1d
+    inputs = _build_rejection_sample_inputs(
+        target_logits_1d,
+        draft_logits_1d,
+        num_speculative_steps,
+        temperature=1.0,
+        num_trials=NARROW_NUM_TRIALS,
+    )
+    inputs["draft_sampled"] = _gumbel_drafted_tokens(
+        inputs, draft_logits_1d, NARROW_NUM_TRIALS, num_speculative_steps
+    )
+
+    sampled, num_sampled = rejection_sample(
+        **inputs, num_speculative_steps=num_speculative_steps
+    )
+
+    target_probs = torch.softmax(target_logits_1d, dim=0)
+    for pos in range(num_speculative_steps + 1):
+        accepted_mask = num_sampled >= pos + 1
+        _assert_distribution_match(
+            sampled[accepted_mask, pos], target_probs, device, label=f"position {pos}"
+        )
+
+
+def test_calibrated_nucleus_draft_rejection_sample_is_unbiased():
+    """A sharpened, truncated proposal must still sample the target."""
+    torch.manual_seed(42)
+    device = "cuda"
+    num_speculative_steps = 3
+    target_logits_1d = torch.randn(
+        NARROW_VOCAB_SIZE, device=device, dtype=torch.float32
+    )
+    draft_logits_1d = (
+        torch.randn(NARROW_VOCAB_SIZE, device=device, dtype=torch.float32) / 0.8
+    )
+    sorted_logits, sorted_indices = draft_logits_1d.sort(descending=True)
+    sorted_probs = sorted_logits.softmax(dim=0)
+    remove_sorted = sorted_probs.cumsum(dim=0) - sorted_probs >= 0.8
+    remove = torch.zeros_like(remove_sorted).scatter(0, sorted_indices, remove_sorted)
+    draft_logits_1d.masked_fill_(remove, -float("inf"))
+
+    inputs = _build_rejection_sample_inputs(
+        target_logits_1d,
+        draft_logits_1d,
+        num_speculative_steps,
+        temperature=1.0,
+        num_trials=NARROW_NUM_TRIALS,
+    )
+    inputs["draft_sampled"] = _gumbel_drafted_tokens(
+        inputs,
+        draft_logits_1d,
+        NARROW_NUM_TRIALS,
+        num_speculative_steps,
     )
 
     sampled, num_sampled = rejection_sample(
