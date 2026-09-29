@@ -646,7 +646,6 @@ tokenizers==0.22.2
     # via
     #   -c requirements/common.txt
     #   transformers
-torch==2.11.0+xpu
     # via
     #   -c requirements/xpu.txt
     #   accelerate
@@ -654,7 +653,6 @@ torch==2.11.0+xpu
     #   sentence-transformers
     #   timm
     #   torchvision
-torchvision==0.26.0+xpu
     # via timm
 tqdm==4.67.3
     # via

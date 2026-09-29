@@ -993,7 +993,6 @@ tomli==2.2.1
     # via schemathesis
 tomli-w==1.2.0
     # via schemathesis
-torch==2.10.0+cu130
     # via
     #   -c requirements/cuda.txt
     #   -r requirements/test/cuda.in
@@ -1013,13 +1012,11 @@ torch==2.10.0+cu130
     #   torchvision
     #   vector-quantize-pytorch
     #   vocos
-torchaudio==2.10.0+cu130
     # via
     #   -c requirements/cuda.txt
     #   -r requirements/test/cuda.in
     #   encodec
     #   vocos
-torchvision==0.25.0+cu130
     # via
     #   -c requirements/cuda.txt
     #   -r requirements/test/cuda.in

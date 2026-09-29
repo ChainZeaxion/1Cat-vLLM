@@ -98,7 +98,7 @@ if TYPE_CHECKING:
     VERBOSE: bool = False
     VLLM_ALLOW_LONG_MAX_MODEL_LEN: bool = False
     VLLM_RPC_TIMEOUT: int = 10000  # ms
-    VLLM_HTTP_TIMEOUT_KEEP_ALIVE: int = 5  # seconds
+    VLLM_HTTP_TIMEOUT_KEEP_ALIVE: int = 600  # seconds
     VLLM_MAX_N_SEQUENCES: int = 16384
     VLLM_PLUGINS: list[str] | None = None
     VLLM_LORA_RESOLVER_CACHE_DIR: str | None = None
@@ -335,6 +335,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FUSED_PROPOSAL: bool = False
     VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU: bool = False
     VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK: int = 0
+    VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT: bool = False
     VLLM_SM70_MTP_DENSE_F16_FASTPATH: bool = True
     VLLM_SM70_MTP_DENSE_F16_ALLOWLIST: str | None = None
     VLLM_SM70_MTP_SYNC_ACCEPT_COUNTS: bool = False
@@ -704,6 +705,8 @@ if TYPE_CHECKING:
     VLLM_SYSTEM_START_DATE: str | None = None
     VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY: bool = False
     VLLM_ENFORCE_STRICT_TOOL_CALLING: bool = False
+    VLLM_QWEN3CODER_STREAMING_FIX: int = 1
+    VLLM_QWEN3X_TOOL_FIX: int = 1
     VLLM_CUSTOM_SCOPES_FOR_PROFILING: bool = False
     VLLM_NVTX_SCOPES_FOR_PROFILING: bool = False
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
@@ -1157,7 +1160,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # ================== Runtime Env Vars ==================
     # Root directory for vLLM cache files
-    # Defaults to `~/.cache/vllm` unless `XDG_CACHE_HOME` is set
+    # Defaults to `~/.cache/vllm` (persistent, XDG cache home).
     "VLLM_CACHE_ROOT": lambda: os.path.expanduser(
         os.getenv(
             "VLLM_CACHE_ROOT",
@@ -1540,7 +1543,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_RPC_TIMEOUT": lambda: int(os.getenv("VLLM_RPC_TIMEOUT", "10000")),
     # Timeout in seconds for keeping HTTP connections alive in API server
     "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": lambda: int(
-        os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "5")
+        os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "600")
     ),
     # Maximum allowed value for the `n` sampling parameter (number of output
     # sequences per request). Limits resource consumption to prevent
@@ -2507,6 +2510,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU": lambda: bool(
         int(os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU", "0"))
+    ),
+    "VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT", "0"))
     ),
     "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK": lambda: int(
         os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK", "0")
@@ -4143,6 +4149,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default 0 (off).
     "VLLM_ENFORCE_STRICT_TOOL_CALLING": lambda: bool(
         int(os.getenv("VLLM_ENFORCE_STRICT_TOOL_CALLING", "0"))
+    ),
+    # opt23: streaming tool call fix for Qwen3Coder tool parser.
+    # 0=原始路径, 1=双格式客户端自选(默认), 2=仅XML真流式,
+    # 3=仅JSON真流式, 4=XML/JSON互转(待设计), 5=仅XML假流式
+    "VLLM_QWEN3CODER_STREAMING_FIX": lambda: int(
+        os.getenv("VLLM_QWEN3CODER_STREAMING_FIX", "1")
+    ),
+    # opt23 §11.22: qwen3-coder / qwen3-xml 共用 fix 环境变量（0/1/2/3/4）。
+    # 新变量优先；旧 VLLM_QWEN3CODER_STREAMING_FIX 作为兼容兜底。
+    "VLLM_QWEN3X_TOOL_FIX": lambda: int(
+        os.getenv(
+            "VLLM_QWEN3X_TOOL_FIX",
+            os.getenv("VLLM_QWEN3CODER_STREAMING_FIX", "1"),
+        )
     ),
     # Add optional custom scopes for profiling, disable to avoid overheads
     "VLLM_CUSTOM_SCOPES_FOR_PROFILING": lambda: bool(

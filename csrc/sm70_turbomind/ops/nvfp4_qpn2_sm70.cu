@@ -130,6 +130,7 @@ __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const int tile = blockIdx.x;
+  const int m_base = blockIdx.y * 8;
   const int quadpair = (lane >> 2) & 3;
   const int row = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int groups_k16 = k >> 4;
@@ -163,8 +164,8 @@ __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
 
     uint4 input01 = make_uint4(0, 0, 0, 0);
     uint4 input23 = make_uint4(0, 0, 0, 0);
-    if (row < m) {
-      const half* input_row = input + static_cast<size_t>(row) * k;
+    if (row + m_base < m) {
+      const half* input_row = input + static_cast<size_t>(row + m_base) * k;
       input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
       input23 = *reinterpret_cast<const uint4*>(input_row + group * 16 + 8);
     }
@@ -203,9 +204,9 @@ __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
     }
     const int output_row = element >> 5;
     const int output_col = element & 31;
-    if (output_row < m) {
-      output[static_cast<size_t>(output_row) * n + tile * 32 + output_col] =
-          __float2half(value);
+    if (output_row + m_base < m) {
+      output[static_cast<size_t>(output_row + m_base) * n +
+             tile * 32 + output_col] = __float2half(value);
     }
   }
 }
@@ -223,6 +224,7 @@ __global__ void nvfp4_qpn2_gated_sm70_kernel(
   const int warp = warp_in_block - projection * SplitK;
   const int hidden_tiles = hidden >> 5;
   const int tile = blockIdx.x + projection * hidden_tiles;
+  const int m_base = blockIdx.y * 8;
   const int quadpair = (lane >> 2) & 3;
   const int row = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int groups_k16 = k >> 4;
@@ -256,8 +258,8 @@ __global__ void nvfp4_qpn2_gated_sm70_kernel(
 
     uint4 input01 = make_uint4(0, 0, 0, 0);
     uint4 input23 = make_uint4(0, 0, 0, 0);
-    if (row < m) {
-      const half* input_row = input + static_cast<size_t>(row) * k;
+    if (row + m_base < m) {
+      const half* input_row = input + static_cast<size_t>(row + m_base) * k;
       input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
       input23 = *reinterpret_cast<const uint4*>(input_row + group * 16 + 8);
     }
@@ -298,7 +300,7 @@ __global__ void nvfp4_qpn2_gated_sm70_kernel(
     }
     const int output_row = element >> 5;
     const int output_col = element & 31;
-    if (output_row < m) {
+    if (output_row + m_base < m) {
       // Match the existing SM70 silu_and_mul contract: round both GEMM
       // outputs to FP16 before the activation, round SiLU to FP16, then use
       // FP16 multiplication.  This makes fusion numerically equivalent to
@@ -307,8 +309,8 @@ __global__ void nvfp4_qpn2_gated_sm70_kernel(
       const half up_half = __float2half(up);
       const float gate_float = __half2float(gate_half);
       const half silu = __float2half(gate_float / (1.0f + expf(-gate_float)));
-      output[static_cast<size_t>(output_row) * hidden + blockIdx.x * 32 +
-             output_col] = __hmul(silu, up_half);
+      output[static_cast<size_t>(output_row + m_base) * hidden +
+             blockIdx.x * 32 + output_col] = __hmul(silu, up_half);
     }
   }
 }
@@ -317,7 +319,8 @@ template <int SplitK, int NAcc>
 void launch_qpn2(const uint8_t* codes, const uint8_t* scales, const half* input,
                  half* output, int n, int k, int m, float global_scale,
                  cudaStream_t stream) {
-  nvfp4_qpn2_sm70_kernel<SplitK, NAcc><<<(n / 32), (32 * SplitK), 0, stream>>>(
+  dim3 grid(n / 32, (m + 7) / 8, 1);
+  nvfp4_qpn2_sm70_kernel<SplitK, NAcc><<<grid, (32 * SplitK), 0, stream>>>(
       codes, scales, input, output, n, k, m, global_scale);
 }
 
@@ -325,9 +328,10 @@ template <int SplitK, int NAcc>
 void launch_qpn2_gated(const uint8_t* codes, const uint8_t* scales,
                        const half* input, half* output, int hidden, int k,
                        int m, float global_scale, cudaStream_t stream) {
-  nvfp4_qpn2_gated_sm70_kernel<SplitK, NAcc>
-      <<<(hidden / 32), (64 * SplitK), 0, stream>>>(
-          codes, scales, input, output, hidden, k, m, global_scale);
+  dim3 grid(hidden / 32, (m + 7) / 8, 1);
+  nvfp4_qpn2_gated_sm70_kernel<SplitK, NAcc><<<grid, (64 * SplitK), 0,
+                                             stream>>>(
+      codes, scales, input, output, hidden, k, m, global_scale);
 }
 
 void check_qpn2_tensors(const torch::Tensor& out, const torch::Tensor& input,
@@ -353,8 +357,8 @@ void check_qpn2_tensors(const torch::Tensor& out, const torch::Tensor& input,
   const int64_t m = input.size(0);
   const int64_t k = input.size(1);
   const int64_t n = gated_silu ? out.size(1) * 2 : out.size(1);
-  TORCH_CHECK(m >= 1 && m <= 8 && out.size(0) == m,
-              "NVFP4 QPN2 requires M in [1, 8]");
+  TORCH_CHECK(m >= 1 && m <= 64 && out.size(0) == m,
+              "NVFP4 QPN2 requires M in [1, 64]");
   TORCH_CHECK(k > 0 && k % 64 == 0 && n > 0 && n % 32 == 0,
               "NVFP4 QPN2 shape alignment mismatch");
   TORCH_CHECK(codes.numel() == n * k / 2 && scales.numel() == n * k / 16,
@@ -498,7 +502,7 @@ void nvfp4_qpn2_dispatch_sm70_out(torch::Tensor out, torch::Tensor input,
                                   torch::Tensor tm_scales,
                                   int64_t tm_group_size, int64_t tm_k_ld,
                                   int64_t tm_q_ld, bool gated_silu) {
-  if (input.size(0) <= 8) {
+  if (input.size(0) <= 64) {
     if (gated_silu) {
       nvfp4_qpn2_gated_sm70_out(out, input, codes, scales, global_scale,
                                 split_k, accumulator_chains);

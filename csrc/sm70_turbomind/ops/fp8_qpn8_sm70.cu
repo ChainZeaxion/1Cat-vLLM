@@ -216,6 +216,7 @@ __global__ void fp8_qpn8_sm70_kernel(
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const int tile = blockIdx.x;
+  const int m_base = blockIdx.y * 8;
   if constexpr (FusedBA) {
     const int qpn_tiles = n >> 5;
     if (tile >= qpn_tiles) {
@@ -329,8 +330,8 @@ __global__ void fp8_qpn8_sm70_kernel(
 
     uint4 input01 = make_uint4(0, 0, 0, 0);
     uint4 input23 = make_uint4(0, 0, 0, 0);
-    if (row < m) {
-      const half* input_row = input + static_cast<size_t>(row) * k;
+    if (row + m_base < m) {
+      const half* input_row = input + static_cast<size_t>(row + m_base) * k;
       input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
       input23 = *reinterpret_cast<const uint4*>(input_row + group * 16 + 8);
     }
@@ -401,9 +402,9 @@ __global__ void fp8_qpn8_sm70_kernel(
     } else {
       const int output_row = element >> 5;
       const int output_col = element & 31;
-      if (output_row < m) {
-        output[static_cast<size_t>(output_row) * n + tile * 32 + output_col] =
-            __float2half(value);
+      if (output_row + m_base < m) {
+        output[static_cast<size_t>(output_row + m_base) * n + tile * 32 +
+               output_col] = __float2half(value);
       }
     }
   }
@@ -415,7 +416,7 @@ void launch_fp8_qpn8_sm70(const uint8_t* codes, const half* group_scales,
                           const half* input, half* output, int n, int k, int m,
                           bool channel_scales, cudaStream_t stream) {
   fp8_qpn8_sm70_kernel<SplitK, NAcc, FastDecoder, PrefetchCodes, M1Only>
-      <<<(n / 32), (32 * SplitK), 0, stream>>>(
+      <<<dim3(n / 32, (m + 7) / 8), (32 * SplitK), 0, stream>>>(
           codes, group_scales, input, output, nullptr, nullptr, nullptr,
           nullptr, nullptr, 0, n, n, k, m, channel_scales);
 }
@@ -448,6 +449,7 @@ __global__ void fp8_qpn8_gated_pair_sm70_kernel(
   const int hidden_tiles = hidden >> 5;
   const int tiles_n32 = hidden_tiles * 2;
   const int tile = blockIdx.x + projection * hidden_tiles;
+  const int m_base = blockIdx.y * 8;
   const int quadpair = (lane >> 2) & 3;
   const int row = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int groups_k16 = k >> 4;
@@ -510,8 +512,8 @@ __global__ void fp8_qpn8_gated_pair_sm70_kernel(
 
     uint4 input01 = make_uint4(0, 0, 0, 0);
     uint4 input23 = make_uint4(0, 0, 0, 0);
-    if (row < m) {
-      const half* input_row = input + static_cast<size_t>(row) * k;
+    if (row + m_base < m) {
+      const half* input_row = input + static_cast<size_t>(row + m_base) * k;
       input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
       input23 = *reinterpret_cast<const uint4*>(input_row + group * 16 + 8);
     }
@@ -575,10 +577,10 @@ __global__ void fp8_qpn8_gated_pair_sm70_kernel(
     } else {
       const int output_row = element >> 5;
       const int output_col = element & 31;
-      if (output_row < m) {
+      if (output_row + m_base < m) {
         const float silu = gate / (1.0f + __expf(-gate));
-        output[static_cast<size_t>(output_row) * hidden + blockIdx.x * 32 +
-               output_col] = __float2half(silu * up);
+        output[static_cast<size_t>(output_row + m_base) * hidden +
+               blockIdx.x * 32 + output_col] = __float2half(silu * up);
       }
     }
   }
@@ -593,7 +595,7 @@ void launch_fp8_qpn8_gated_pair_sm70(const uint8_t* codes,
                                      bool channel_scales, cudaStream_t stream) {
   fp8_qpn8_gated_pair_sm70_kernel<SplitK, NAcc, FastDecoder, PrefetchCodes,
                                   M1Only>
-      <<<(hidden / 32), (64 * SplitK), 0, stream>>>(
+      <<<dim3(hidden / 32, (m + 7) / 8), (64 * SplitK), 0, stream>>>(
           codes, group_scales, input, output, hidden, k, m, channel_scales);
 }
 
@@ -1190,7 +1192,7 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   const int64_t m = input.size(0);
   const int64_t k = input.size(1);
   const int64_t n = out.size(1);
-  TORCH_CHECK(m >= 1 && m <= 8, "fp8_qpn8_gemm_sm70_out: M must be in [1, 8]");
+  TORCH_CHECK(m >= 1 && m <= 64, "fp8_qpn8_gemm_sm70_out: M must be in [1, 64]");
   TORCH_CHECK(out.size(0) == m, "fp8_qpn8_gemm_sm70_out: output M mismatch");
   TORCH_CHECK(n > 0 && n % 32 == 0,
               "fp8_qpn8_gemm_sm70_out: N must be a positive multiple of 32");
@@ -1509,8 +1511,8 @@ void fp8_qpn8_gated_pair_sm70_out(torch::Tensor out, torch::Tensor input,
   const int64_t k = input.size(1);
   const int64_t hidden = out.size(1);
   const int64_t n = hidden * 2;
-  TORCH_CHECK(m >= 1 && m <= 8 && out.size(0) == m,
-              "fp8_qpn8_gated_pair_sm70_out: M must be in [1, 8]");
+  TORCH_CHECK(m >= 1 && m <= 64 && out.size(0) == m,
+              "fp8_qpn8_gated_pair_sm70_out: M must be in [1, 64]");
   const bool channel_scales =
       group_scales.size(0) == 1 && group_scales.size(1) == n;
   const bool block_scales =
@@ -1612,7 +1614,7 @@ void fp8_qpn8_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
   // Keep the M decision inside the opaque operator. AOTInductor compiles one
   // dynamic M=1..8192 range for this model, so a Python shape branch traced at
   // M=1/2 would otherwise be incorrectly reused by large-M prefill.
-  if (input.size(0) <= 8) {
+  if (input.size(0) <= 64) {
     if (gated_silu) {
       fp8_qpn8_gated_pair_sm70_out(out, input, codes, group_scales, split_k,
                                    accumulator_chains, true, prefetch_codes);

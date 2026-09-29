@@ -53,7 +53,19 @@ def _is_sm70_nvfp4_qpn4_runtime_contract() -> bool:
 
 
 def _is_sm70_dflash2_nvfp4_qpn2_runtime_contract() -> bool:
-    """Admit the quality-audited single-request DFlash2 TP4 route."""
+    """Admit the quality-audited bounded-concurrency DFlash2 TP4 route.
+
+    opt-3a: the audited route was gated to a single in-flight request
+    (``max_num_seqs == 1``) and ``num_speculative_tokens == 7`` (the audited
+    checkpoint's trained width). Widen it to
+    ``1 <= max_num_seqs <= 10`` and ``num_speculative_tokens >= 3``: with
+    speculative decoding the verifier batch width is ``1 + NST``, so
+    ``3 <= NST <= 7`` keeps M in [4, 8], the QPN2 fast-kernel regime
+    (``nvfp4_qpn2_dispatch_sm70_out`` falls back to the bitwise-equal
+    TurboMind gemm for M > 8 anyway); smaller NSTs never reach this route's
+    target model. The explicit env rollback (``VLLM_SM70_NVFP4_QPN2`` /
+    ``VLLM_SM70_NVFP4_QPN2_PREFILL``) still overrides this contract.
+    """
     vllm_config = get_current_vllm_config()
     parallel_config = vllm_config.parallel_config
     scheduler_config = vllm_config.scheduler_config
@@ -68,11 +80,11 @@ def _is_sm70_dflash2_nvfp4_qpn2_runtime_contract() -> bool:
     )
     return bool(
         getattr(speculative_config, "method", None) == "dflash"
-        and int(getattr(speculative_config, "num_speculative_tokens", 0) or 0) == 7
+        and int(getattr(speculative_config, "num_speculative_tokens", 0) or 0) >= 3
         and selector_top_k == 16
         and parallel_config.pipeline_parallel_size == 1
         and parallel_config.tensor_parallel_size == 4
-        and scheduler_config.max_num_seqs == 1
+        and 1 <= scheduler_config.max_num_seqs <= 10
         and not getattr(parallel_config, "enable_dbo", False)
         and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
     )

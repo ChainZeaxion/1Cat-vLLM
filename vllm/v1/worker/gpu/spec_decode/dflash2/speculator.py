@@ -448,8 +448,13 @@ class DFlash2Speculator(DFlashSpeculator):
                 self.num_speculative_steps,
             )
 
+        # opt-2b: activate lookup-augmented drafting as soon as the verifier
+        # is wider than 2 tokens, rather than only when it strictly exceeds
+        # the trained draft block. When the two widths coincide the fusion
+        # region is empty and the lookup path is a no-op, so this only opens
+        # the previously-skipped same-width case.
         self._lookup_enabled = bool(
-            ngram_assist and self.draft_block < self.num_speculative_steps
+            ngram_assist and self.num_speculative_steps > 2
         )
         self._req_states = None
         self._lookup_current_req_key: tuple[int, ...] = ()
