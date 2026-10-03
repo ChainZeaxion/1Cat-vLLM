@@ -477,7 +477,12 @@ class InductorAdaptor(CompilerInterface):
         os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache
         triton_cache = os.path.join(self.base_cache_dir, "triton_cache")
         os.makedirs(triton_cache, exist_ok=True)
-        os.environ["TRITON_CACHE_DIR"] = triton_cache
+        # [本地 JIT 修复 2026-10-03] 尊重预置的 TRITON_CACHE_DIR，不覆盖。
+        # 原为直接赋值 ⇒ 独立 Triton 内核（拒绝采样 / topk / GDN 等）的缓存被挂在
+        # 配置哈希目录下：任何源码/配置变化都会换哈希 ⇒ 缓存清空 ⇒ 这些内核在
+        # 推理期现场 JIT（延迟尖峰，表现为"上下文衰减"）。设为预置值后可跨配置
+        # 哈希持久化，编译一次永久复用。未预置时行为与上游逐字相同。
+        os.environ.setdefault("TRITON_CACHE_DIR", triton_cache)
 
     def compile(
         self,

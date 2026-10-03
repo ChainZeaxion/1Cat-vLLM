@@ -6,7 +6,7 @@ import io
 import json
 import os
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Iterable
 from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Final
@@ -41,6 +41,7 @@ from vllm.entrypoints.openai.chat_completion.stream_harmony import (
     extract_harmony_streaming_delta,
 )
 from vllm.entrypoints.openai.engine.protocol import (
+    CompletionTokenUsageInfo,
     DeltaFunctionCall,
     DeltaMessage,
     DeltaToolCall,
@@ -74,6 +75,7 @@ from vllm.reasoning import ReasoningParser
 from vllm.renderers import ChatParams
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
+from vllm.tool_parsers.utils import escape_tool_like_tags
 from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
 
@@ -93,6 +95,29 @@ def _sx_skip_tool_parser_without_tools() -> bool:
     path are never affected.
     """
     return os.environ.get("SX_OPT_SKIP_TOOL_PARSER_WITHOUT_TOOLS", "1") != "0"
+
+
+def _count_reasoning_tokens(
+    reasoning_parser: ReasoningParser | None,
+    token_ids_per_choice: Iterable[GenericSequence[int]] | None,
+) -> int | None:
+    """Reasoning tokens among the generated ids, summed over choices.
+
+    Returns None when there is nothing to measure — no reasoning parser, or no
+    ids were retained for any choice. The caller then omits the field instead of
+    reporting zero, because a zero and "we did not look" mean different things to
+    whoever is reading the number.
+    """
+    if reasoning_parser is None or token_ids_per_choice is None:
+        return None
+    total = 0
+    measured = False
+    for token_ids in token_ids_per_choice:
+        if not token_ids:
+            continue
+        total += reasoning_parser.count_reasoning_tokens(token_ids)
+        measured = True
+    return total if measured else None
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -870,6 +895,11 @@ class OpenAIServingChat(OpenAIServing):
                         # only happens if we are NOT using structured outputs
                         index = 0
                         auto_tools_called = False
+                        # opt22d 第七轮：推迟补发是“一次性完整下发”，须跳过下方
+                        # “补发未流出参数”逻辑——那套逻辑按流式解析留下的
+                        # prev_tool_call_arr / streamed_args_for_tool 取索引，而被
+                        # 推迟的调用从未走过流式路径、这两者皆为空 → IndexError。
+                        _deferred_emitted = False
                         if tool_parser:
                             auto_tools_called = len(tool_parser.prev_tool_call_arr) > 0
                             index = (
@@ -877,6 +907,86 @@ class OpenAIServingChat(OpenAIServing):
                                 if auto_tools_called
                                 else 0
                             )
+
+                        # opt22d 第十二轮（缺陷B）：参数体内含文档示例时，收尾标签
+                        # （`</parameter>`/`</function>`/`</tool_call>`）被判为**内容**
+                        # 全部转义，expat 永远收不到闭合 ⇒ 流式阶段调用不入账。
+                        # 消息已完整，此处强制收尾并用完整文本重解析。
+                        if tool_parser and getattr(
+                            tool_parser, "_needs_finish_flush", False
+                        ):
+                            _flush_info = tool_parser.flush_streaming_finish()
+                            if _flush_info is not None and _flush_info.tool_calls:
+                                if delta_message is None:
+                                    delta_message = DeltaMessage()
+                                _base = len(delta_message.tool_calls or [])
+                                delta_message.tool_calls = list(
+                                    delta_message.tool_calls or []
+                                ) + [
+                                    DeltaToolCall(
+                                        # ⚠️ **沿用原 index**：收尾片段属于**同一个**
+                                        # 已流式下发的调用（前面发过函数名与部分参数），
+                                        # 重编 index 会被客户端当成新调用 ⇒ arguments 无法
+                                        # 拼接、JSON 不闭合（实测线上）。
+                                        index=(
+                                            _tc.index
+                                            if getattr(_tc, "index", None) is not None
+                                            else _base + _di
+                                        ),
+                                        id=_tc.id,
+                                        type="function",
+                                        function=DeltaFunctionCall(
+                                            name=_tc.function.name,
+                                            arguments=_tc.function.arguments,
+                                        ),
+                                    )
+                                    for _di, _tc in enumerate(_flush_info.tool_calls)
+                                ]
+                                auto_tools_called = True
+                                _deferred_emitted = True
+                                tools_streamed[i] = True
+                            tool_parser._needs_finish_flush = False
+
+                        # opt22d 第七轮：开启思考时，非 Write/Edit 的工具调用被推迟
+                        # 到此刻用**完整文本**解析（流式阶段刻意未产出，避免 thinking
+                        # 里写出的形似标签被当成真实调用）。previous_texts[i] 是本轮
+                        # 累积的完整原文；先经 reasoning parser 剥出正文段，再交工具
+                        # 解析器——后者复用非流式路径的全套 opt22d 防护。
+                        # 注意：_reset_streaming_state() 会清空这两个标志，故先读。
+                        if (
+                            tool_parser
+                            and previous_texts is not None
+                            and reasoning_parser is not None
+                            and getattr(tool_parser, "_thinking_enabled", False)
+                            and getattr(tool_parser, "_deferred_used", False)
+                        ):
+                            _, _deferred_content = reasoning_parser.extract_reasoning(
+                                previous_texts[i], request=request
+                            )
+                            _deferred_info = tool_parser.extract_tool_calls_deferred(
+                                _deferred_content or "", request
+                            )
+                            if _deferred_info.tools_called:
+                                if delta_message is None:
+                                    delta_message = DeltaMessage()
+                                _base = len(delta_message.tool_calls or [])
+                                delta_message.tool_calls = list(
+                                    delta_message.tool_calls or []
+                                ) + [
+                                    DeltaToolCall(
+                                        index=_base + _di,
+                                        id=_tc.id,
+                                        type="function",
+                                        function=DeltaFunctionCall(
+                                            name=_tc.function.name,
+                                            arguments=_tc.function.arguments,
+                                        ),
+                                    )
+                                    for _di, _tc in enumerate(_deferred_info.tool_calls)
+                                ]
+                                auto_tools_called = True
+                                _deferred_emitted = True
+                                tools_streamed[i] = True
                         should_check = (
                             self._should_check_for_unstreamed_tool_arg_tokens(
                                 delta_message, output
@@ -884,7 +994,12 @@ class OpenAIServingChat(OpenAIServing):
                         )
                         # only check if there are any tool calls
                         # detected by partial parsing
-                        if should_check and tool_parser and auto_tools_called:
+                        if (
+                            should_check
+                            and tool_parser
+                            and auto_tools_called
+                            and not _deferred_emitted
+                        ):
                             latest_delta_len = 0
                             if (
                                 isinstance(
@@ -1004,6 +1119,15 @@ class OpenAIServingChat(OpenAIServing):
                     final_usage.prompt_tokens_details = PromptTokenUsageInfo(
                         cached_tokens=num_cached_tokens
                     )
+                streamed_reasoning_tokens = _count_reasoning_tokens(
+                    reasoning_parser, all_previous_token_ids
+                )
+                if streamed_reasoning_tokens is not None:
+                    final_usage.completion_tokens_details = (
+                        CompletionTokenUsageInfo(
+                            reasoning_tokens=streamed_reasoning_tokens
+                        )
+                    )
 
                 final_usage_chunk = ChatCompletionStreamResponse(
                     id=request_id,
@@ -1026,6 +1150,13 @@ class OpenAIServingChat(OpenAIServing):
                 completion_tokens=num_completion_tokens,
                 total_tokens=num_prompt_tokens + num_completion_tokens,
             )
+            aggregate_reasoning_tokens = _count_reasoning_tokens(
+                reasoning_parser, all_previous_token_ids
+            )
+            if aggregate_reasoning_tokens is not None:
+                request_metadata.final_usage_info.completion_tokens_details = (
+                    CompletionTokenUsageInfo(reasoning_tokens=aggregate_reasoning_tokens)
+                )
 
             # Log complete streaming response if output logging is enabled
             if self.enable_log_outputs and self.request_logger:
@@ -1180,6 +1311,14 @@ class OpenAIServingChat(OpenAIServing):
                 )
                 if not request.include_reasoning:
                     reasoning = None
+                # opt22d 第七轮：reasoning 此前无任何转义收口（R1 只覆盖 content），
+                # 模型在思考里写出的形似工具调用标签会以裸形式下发，可能被下游
+                # harness 误当真实调用执行。此处按与 content 相同的规则转义
+                # （escape_tool_like_tags 幂等，重复施加无害）。
+                # 本处一并覆盖 Anthropic 协议——anthropic/serving.py:505 复用本
+                # generator，其 thinking block 取的正是这里产出的 message.reasoning。
+                if reasoning:
+                    reasoning = escape_tool_like_tags(reasoning)
             else:
                 reasoning = None
                 content = output.text
@@ -1367,6 +1506,15 @@ class OpenAIServingChat(OpenAIServing):
                     "completion."
                 )
                 message = ChatMessage(role=role, reasoning=reasoning, content=content)
+
+            # opt22d(R1): 上面这条 if/elif 链里，凡"跳过工具解析器"的分支
+            # （tool_choice=="none" / 无 tools / 解析异常兜底）其 content 未经 parser，
+            # 里面的"形似工具调用"裸标签不会被转义，会直接下发并可能被下游 harness
+            # 误当真实调用执行。此处统一补一次转义。
+            # 该转义是幂等的（已转义的 &lt;... 不再匹配），故对"已由 parser 处理过"
+            # 的分支重复施加无害，可安全地在此单点收口。
+            if message.content:
+                message.content = escape_tool_like_tags(message.content)
             # In OpenAI's API, when a tool is called, the finish_reason is:
             # "tool_calls" for "auto" or "required" tool calls,
             # and "stop" for named tool calls.
@@ -1435,6 +1583,13 @@ class OpenAIServingChat(OpenAIServing):
         if self.enable_prompt_tokens_details and final_res.num_cached_tokens:
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=final_res.num_cached_tokens
+            )
+        full_reasoning_tokens = _count_reasoning_tokens(
+            reasoning_parser, [output.token_ids for output in final_res.outputs]
+        )
+        if full_reasoning_tokens is not None:
+            usage.completion_tokens_details = CompletionTokenUsageInfo(
+                reasoning_tokens=full_reasoning_tokens
             )
 
         request_metadata.final_usage_info = usage

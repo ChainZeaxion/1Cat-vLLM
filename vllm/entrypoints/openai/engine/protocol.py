@@ -104,11 +104,20 @@ class PromptTokenUsageInfo(OpenAIBaseModel):
     cached_tokens: int | None = None
 
 
+class CompletionTokenUsageInfo(OpenAIBaseModel):
+    # How many of `completion_tokens` were reasoning. A client that shows one
+    # output number cannot otherwise tell a long deliberation from a long
+    # answer: on a reasoning model the two differ by several times, and only
+    # this split says which one a caller is paying for.
+    reasoning_tokens: int | None = None
+
+
 class UsageInfo(OpenAIBaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: int | None = 0
     prompt_tokens_details: PromptTokenUsageInfo | None = None
+    completion_tokens_details: CompletionTokenUsageInfo | None = None
 
 
 class RequestResponseMetadata(BaseModel):

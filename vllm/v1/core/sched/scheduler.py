@@ -290,17 +290,47 @@ class Scheduler(SchedulerInterface):
         # the Mamba group's own block grid. The global cache block size can be
         # much smaller in heterogeneous layouts (Qwen3.8 uses 16-token hashes
         # with an 816-token recurrent-state block), so it is not a valid grid.
-        mamba_state_block_sizes = {
-            group.kv_cache_spec.block_size
+        mamba_specs = [
+            group.kv_cache_spec
             for group in kv_cache_config.kv_cache_groups
             if isinstance(group.kv_cache_spec, MambaSpec)
-        }
+        ]
+        mamba_state_block_sizes = {spec.block_size for spec in mamba_specs}
         assert len(mamba_state_block_sizes) <= 1, (
             "mamba align scheduling requires a single state block size, "
             f"got {sorted(mamba_state_block_sizes)}"
         )
         self.mamba_state_block_size = (
             next(iter(mamba_state_block_sizes)) if mamba_state_block_sizes else None
+        )
+        # Sparse admission only retains replay/shared-prefix and periodic
+        # boundaries. Materializing discarded states must not split the whole
+        # model's prefill into one-state-block forwards. Mixed alignments still
+        # use dense admission in MambaManager, so keep their dense scheduling.
+        coordinator = self.kv_cache_manager.coordinator
+        self.mamba_state_retention_interval = (
+            self.cache_config.prefix_cache_retention_interval
+            if self.need_mamba_block_aligned_split
+            and all(spec.mamba_cache_mode == "align" for spec in mamba_specs)
+            and getattr(coordinator, "lcm_block_size", self.mamba_state_block_size)
+            == self.mamba_state_block_size
+            else None
+        )
+        # Full-chunk recurrent states need dense boundaries under contention
+        # to preserve concurrent decode throughput. A lone request still uses
+        # sparse replay boundaries: forcing dense admission there changes its
+        # prefix reuse and regresses speculative acceptance on warm repeats.
+        #
+        # [本地 2026-10-03] 上游条件 `mamba_state_block_size >= max_num_scheduled_tokens`
+        # 在本部署恒 False（state block 864 << token 预算 8192）⇒ 并发时仍走稀疏调度
+        # ⇒ 大 chunk(≤4096) 的 prefill 把并行 decode 掐到 1/10：实测 4 并发同一时刻，
+        # 早完成 prefill 的请求 decode span 2.9s vs 14.1s（32K）/ 3.9s vs 43s（100K），
+        # 榜单口径 Σout/max_span 因此从 317 掉到 104。放宽为「retention 生效即允许争用
+        # 回退」——争用时退回稠密边界（= 融合前行为，保住并发 decode），单请求仍走稀疏
+        # （保住 prefill 提速）。
+        self.mamba_dense_boundaries_on_contention = (
+            self.mamba_state_retention_interval is not None
+            and self.mamba_state_block_size is not None
         )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -328,9 +358,33 @@ class Scheduler(SchedulerInterface):
         self._pause_state: PauseState = PauseState.UNPAUSED
 
         # opt23: auto-adjust long_prefill_token_threshold for concurrent loads
+        #
+        # [opt23-v3] Ratio 0.25 -> 0.5 so the auto value can actually reach the
+        # SM70 long-prefill FAST PATH.  That path (sm70_79t architecture route,
+        # flash_attn_v100.py `_should_use_prefill_d256_gqa_architecture`) admits
+        # ONLY a per-chunk query length in [8000, 8192]
+        # (`_SM70_79T_CORE_QUERY_LEN` .. `_SM70_79T_MAX_QUERY_LEN`); with it
+        # selected the kernel is FP32-accumulated and materially faster per
+        # prefill token.  Anything outside that window -- in particular the wide
+        # 17..7999 hole, where the smallq path only covers q<=16 and the 79T path
+        # starts at 8000 -- falls to the generic chunked-prefill route.
+        #
+        # At the old 0.25 the threshold was 2048 (with max-num-batched-tokens
+        # 8192) and at 16384 it is 4096: BOTH sit below 8000, so every long
+        # prompt was chunked into pieces the fast path can never see, and the
+        # measured prefill peak collapsed (~6000 -> ~4000 tok/s).  This is a
+        # scheduling-side cause, independent of prefix caching: caching only
+        # changes how many tokens remain (and therefore how far the chunk falls
+        # into the hole), it does not change the per-token path.
+        #
+        # 0.5 puts the chunk budget at the TOP of the window: 0.5 * 16384 = 8192,
+        # i.e. exactly `_SM70_79T_MAX_QUERY_LEN`.  Pair with
+        # `--max-num-batched-tokens 16384` for the fast path to be reachable.
+        # (Residual gap: q in [17, 7999] still has no dedicated route; closing
+        # it is a kernel-side change, not a scheduling one.)
         max_seqs = self.scheduler_config.max_num_seqs
         max_batched_tokens = self.scheduler_config.max_num_batched_tokens
-        safe_threshold = int(max_batched_tokens * 0.25)
+        safe_threshold = int(max_batched_tokens * 0.5)
         current_threshold = self.scheduler_config.long_prefill_token_threshold
         if max_seqs >= 4:
             if current_threshold == 0:
@@ -474,15 +528,41 @@ class Scheduler(SchedulerInterface):
             if aligned_end > start:
                 end = aligned_end
 
-        # The align allocator materializes one recurrent-state column per
-        # scheduler step. A step spanning multiple state blocks leaves the
-        # interior slots null, so every crossed boundary must end a chunk.
-        next_block_boundary = (start // block_size + 1) * block_size
+        # The align allocator only materializes the state at the chunk end.
+        # Stop at every *retained* boundary so none is admitted with a null
+        # state, while batching across the discarded interior states.
+        retention_interval = getattr(self, "mamba_state_retention_interval", None)
+        # [本地 2026-10-04] 统一边界模式，消除「1 路稀疏大块 + N 路稠密」的不对称
+        # （首块竞态 ⇒ straggler ⇒ decode_agg 腰斩）。**缺省即全稠密**（已认可基线
+        # 4b25853）：不设置该变量也走 dense。仅显式 "sparse"（全稀疏大块）/"auto"
+        # （争用才回退稠密）用于 A/B。
+        _sparse_mode = os.environ.get("VLLM_SM70_MAMBA_SPARSE_MODE", "dense")
+        if _sparse_mode == "sparse":
+            pass
+        elif _sparse_mode == "auto":
+            if getattr(self, "mamba_dense_boundaries_on_contention", False) and (
+                len(self.running) + len(self.waiting) > 1
+            ):
+                retention_interval = None
+        else:  # "dense"（缺省）或未知值 ⇒ 全稠密
+            retention_interval = None
+        if retention_interval is None:
+            retained_boundaries = [(start // block_size + 1) * block_size]
+        else:
+            retained_boundaries = list(
+                self.kv_cache_manager.coordinator.get_replay_boundaries(
+                    request, block_size
+                )
+            )
+            if retention_interval:
+                retained_boundaries.append(
+                    (start // retention_interval + 1) * retention_interval
+                )
         end = min(
             (
                 stop
                 for stop in (
-                    next_block_boundary,
+                    *retained_boundaries,
                     last_cache_position,
                     getattr(request, "shared_prefix_boundary", 0)
                     // block_size
@@ -532,11 +612,17 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.new_step_starts()
 
         # First, schedule the RUNNING requests.
-        # opt23: 65/35 prefill/decode budget split for concurrent loads
+        # opt23: 55/45 prefill/decode budget split for concurrent loads.
+        # [opt23-v3] 0.65 -> 0.55: dedicate up to 45 % of the step budget to
+        # decode so concurrent decode streams are not starved while a long
+        # prefill is being chunked.  The cap is a ceiling only -- it engages
+        # when it is smaller than the per-chunk prefill limit, so the split
+        # never blocks prefill from reaching the 8000..8192 fast-path window
+        # (0.55 * 16384 = 9011 >= 8192).
         running_count = len(self.running)
         if running_count > 0:
             decode_per_request = self.scheduler_config.max_num_batched_tokens // running_count
-            prefill_cap = int(self.scheduler_config.max_num_batched_tokens * 0.65)
+            prefill_cap = int(self.scheduler_config.max_num_batched_tokens * 0.55)
         else:
             decode_per_request = self.scheduler_config.max_num_batched_tokens
             prefill_cap = self.scheduler_config.max_num_batched_tokens

@@ -29,6 +29,11 @@ class AnthropicUsage(BaseModel):
     output_tokens: int
     cache_creation_input_tokens: int | None = None
     cache_read_input_tokens: int | None = None
+    # Extension: how many of `output_tokens` were reasoning. The Anthropic
+    # schema has no such field, but a reasoning model's answer and its
+    # deliberation differ by several times, so a client cannot size one from the
+    # other. Omitted when the engine did not measure it.
+    reasoning_tokens: int | None = None
 
 
 class AnthropicContentBlock(BaseModel):
@@ -143,6 +148,30 @@ class AnthropicMessagesRequest(BaseModel):
             "Will be accessible by the template."
         ),
     )
+    # opt21: per-chunk output token ids are opt-in, mirroring the OpenAI
+    # protocol's `return_token_ids` (default off). A live TPS meter wants them;
+    # callers that do not should not pay for them. The same switch can be given
+    # as a request header (`x-return-token-ids`) for proxies that forward the
+    # body verbatim — see `AnthropicServingMessages._wants_token_ids`.
+    return_token_ids: bool = Field(
+        default=False,
+        description=(
+            "If true, each response carries the token ids its output decodes "
+            "from (`token_ids` per `content_block_delta`, or on the message for "
+            "a non-streaming reply). The Anthropic schema defines no such field; "
+            "this mirrors the OpenAI protocol's `return_token_ids`."
+        ),
+    )
+    # The prompt is typically tens of thousands of ids, so echoing it back is a
+    # separate, even more explicit opt-in than the output ids above.
+    return_prompt_token_ids: bool = Field(
+        default=False,
+        description=(
+            "If true, the response also carries the prompt's token ids in "
+            "`prompt_token_ids`. The Anthropic schema defines no such field; "
+            "this mirrors the OpenAI protocol's `prompt_token_ids`."
+        ),
+    )
 
     @field_validator("model")
     @classmethod
@@ -197,6 +226,10 @@ class AnthropicStreamEvent(BaseModel):
     index: int | None = None
     error: AnthropicError | None = None
     usage: AnthropicUsage | None = None
+    # opt21: not part of the Anthropic spec, but useful for tracing the tokens
+    # in agent scenarios — the token ids a `content_block_delta` decodes from,
+    # mirroring the OpenAI protocol's per-chunk `choices[].token_ids`.
+    token_ids: list[int] | None = None
 
 
 class AnthropicMessagesResponse(BaseModel):
@@ -217,6 +250,11 @@ class AnthropicMessagesResponse(BaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
+    # opt21: the output tokens this message produced (mirroring the OpenAI
+    # protocol's `choices[].token_ids`), plus the prompt's ids when the request
+    # opted in with `return_prompt_token_ids`. Neither is in the Anthropic spec.
+    token_ids: list[int] | None = None
+    prompt_token_ids: list[int] | None = None
 
     def model_post_init(self, __context):
         from vllm.utils import random_uuid

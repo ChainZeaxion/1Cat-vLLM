@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import TYPE_CHECKING
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
@@ -22,6 +23,126 @@ class VerifyAndUpdateConfig:
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
         return
+
+
+def sm70_flash_next_batch_qualified(vllm_config: "VllmConfig") -> bool:
+    """Batch quality covers ordinary decode and MTP; other proposers await gates."""
+    speculative = vllm_config.speculative_config
+    return speculative is None or getattr(speculative, "method", None) == "mtp"
+
+
+def sm70_fp8_serialized_pipeline_qualified(vllm_config: "VllmConfig") -> bool:
+    """Retain the measured PP2/TP4 no-spec single-request validation boundary.
+
+    QPN8 and reversible-scale M1 use the same qualification. They do not
+    require this scheduling layout to execute; wider layouts need paired
+    output and concurrent workspace tests before lifting the boundary.
+    """
+    parallel_config = vllm_config.parallel_config
+    scheduler_config = vllm_config.scheduler_config
+    return bool(
+        parallel_config.pipeline_parallel_size == 2
+        and parallel_config.tensor_parallel_size == 4
+        and scheduler_config.max_num_seqs == 1
+        and not getattr(parallel_config, "enable_dbo", False)
+        and int(getattr(parallel_config, "ubatch_size", 0)) <= 1
+        and getattr(vllm_config, "speculative_config", None) is None
+    )
+
+
+def sm70_awq_prefill_projection_qualified(prefix: str) -> bool:
+    """Retain the measured AWQ exact-dense projection roles.
+
+    This is a quality boundary, not a shape or TP requirement. Renamed and
+    additional roles need a paired kernel/quality check before admission.
+    """
+    return prefix.rsplit(".", 1)[-1] in {
+        "gate_up_proj",
+        "down_proj",
+        "in_proj_qkvz",
+        "out_proj",
+        "o_proj",
+    }
+
+
+def sm70_dflash2_nvfp4_qualified(vllm_config: "VllmConfig") -> bool:
+    """Retained QPN2 whole-workload qualification, not operator capability.
+
+    TP, KV dtype and service concurrency are already outside this boundary.
+    Keep the draft selector/state contract until a broader quality gate passes.
+
+    [本地融合 2026-10-03] 恢复本地 QPN2 门控：上游要求
+    ``num_speculative_tokens == 7``（其审计 checkpoint 的训练宽度），会把
+    本地 G27（DFlash2 NST=5）判 unqualified ⇒ QPN2 关闭。本地旧实现
+    （``_is_sm70_dflash2_nvfp4_qpn2_runtime_contract``）放宽为 ``>= 3``，
+    使中宽度草稿落入同一 QPN2 布局：开推测解码时验证批宽 = ``1 + NST``，
+    而 QPN2 分发窗口与核门限同为 64（``kQpn2MaxRows``），故 NST>=3 仍在窗口内。
+    其余合同（dflash / selector_top_k==16 / pp==1 / 非 dbo / ubatch<=1）与上游一致。
+    显式回滚仍走 kernel_config.sm70_nvfp4.qpn2 或 envs（VLLM_SM70_NVFP4_QPN2）。
+    """
+    parallel = vllm_config.parallel_config
+    spec = vllm_config.speculative_config
+    draft = getattr(spec, "draft_model_config", None)
+    hf = getattr(draft, "hf_config", None)
+    dflash = getattr(hf, "dflash_config", None) or {}
+    selector = (
+        int(dflash.get("selector_top_k", 0) or 0) if isinstance(dflash, Mapping) else 0
+    )
+    return bool(
+        getattr(spec, "method", None) == "dflash"
+        and int(getattr(spec, "num_speculative_tokens", 0) or 0) >= 3
+        and selector == 16
+        and parallel.pipeline_parallel_size == 1
+        and not parallel.enable_dbo
+        and int(parallel.ubatch_size or 0) <= 1
+    )
+
+
+def sm70_nvfp4_projection_qualified(prefix: str) -> bool:
+    """Roles covered by the existing real-weight QPN2 quality audit.
+
+    This whitelist is a temporary qualification boundary. Local K/N checks
+    belong to Qpn2NvFp4LinearKernel.can_implement, independent of these names.
+    """
+    return prefix.rsplit(".", 1)[-1] in {
+        "in_proj_qkvz",
+        "qkv_proj",
+        "out_proj",
+        "o_proj",
+        "gate_up_proj",
+        "down_proj",
+    }
+
+
+def sm70_nvfp4_gate_up_qualified(layer) -> bool:
+    """Retained dense gated layout audited with the 5120-wide model."""
+    return bool(
+        getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "gate_up_proj"
+        and getattr(layer, "input_size_per_partition", 0) == 5120
+        and getattr(layer, "output_size_per_partition", 0) > 0
+        and layer.output_size_per_partition % 64 == 0
+        and getattr(layer, "logical_widths", None)
+        == [layer.output_size_per_partition // 2] * 2
+    )
+
+
+def sm70_nvfp4_down_qualified(layer) -> bool:
+    """Retained QPN4 down projection audited with the 5120-wide model."""
+    return bool(
+        getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "down_proj"
+        and getattr(layer, "input_size_per_partition", 0) > 0
+        and layer.input_size_per_partition % 128 == 0
+        and getattr(layer, "output_size_per_partition", 0) == 5120
+    )
+
+
+def sm70_nvfp4_qpn4_qualified(vllm_config: "VllmConfig") -> bool:
+    """QPN4's quality audit covers a single sequence without speculation."""
+    scheduler = getattr(vllm_config, "scheduler_config", None)
+    return (
+        int(getattr(scheduler, "max_num_seqs", 1)) == 1
+        and vllm_config.speculative_config is None
+    )
 
 
 class DeepseekV32ForCausalLM(VerifyAndUpdateConfig):
@@ -291,7 +412,7 @@ class LlamaBidirectionalConfig(VerifyAndUpdateConfig):
             "last": "LAST",
         }
 
-        pooling_type = pooling_type_map.get(hf_config.pooling, None)
+        pooling_type = pooling_type_map.get(hf_config.pooling)
         if pooling_type is None:
             raise ValueError(f"pool_type {hf_config.pooling!r} not supported")
 
@@ -706,3 +827,59 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "VoyageQwen3BidirectionalEmbedModel": VoyageQwen3BidirectionalEmbedModelConfig,
     "XLMRobertaModel": JinaRobertaModelConfig,
 }
+
+
+def sm70_dflash2_verifier_qualified(
+    model_config: Any,
+    speculative_config: Any,
+    parallel_config: Any,
+) -> bool:
+    """Admit the quality-audited Qwen3.8 DFlash2 verifier contract.
+
+    Target quantization, KV dtype, TP degree, and service capacity are
+    intentionally not part of this admission. Each fast operator capability-
+    checks its local weight, cache dtype, and live batch shape, then falls back
+    independently when it cannot handle that contract.
+    """
+    import torch
+
+    if any(
+        config is None
+        for config in (
+            model_config,
+            speculative_config,
+            parallel_config,
+        )
+    ):
+        return False
+
+    draft_model_config = getattr(speculative_config, "draft_model_config", None)
+    draft_hf_config = getattr(draft_model_config, "hf_config", None)
+    dflash_config = getattr(draft_hf_config, "dflash_config", None) or {}
+    selector_top_k = (
+        int(dflash_config.get("selector_top_k", 0) or 0)
+        if isinstance(dflash_config, Mapping)
+        else 0
+    )
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    architectures = set(getattr(model_config, "architectures", ()) or ())
+    return bool(
+        "Qwen3_5ForConditionalGeneration" in architectures
+        and getattr(model_config, "dtype", None) == torch.float16
+        and getattr(hf_text_config, "hidden_size", None) == 5120
+        and getattr(hf_text_config, "num_attention_heads", None) == 24
+        and getattr(hf_text_config, "num_key_value_heads", None) == 4
+        and getattr(hf_text_config, "head_dim", None) == 256
+        and getattr(speculative_config, "method", None) == "dflash"
+        # [本地 2026-10-04] 放宽到 k in {3,5,7}: the audited DFlash2 width is 7,
+        # but k=3/5 are shape-safe on the default per-request verify path
+        # (flash_attn_v100 allows draft tokens in (1..7,15); q=1+k). k<7 runs the
+        # draft backbone narrower than its training width (upstream marks this
+        # Experimental), so this is a quality-level, not a crash, decision.
+        and int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
+        in (3, 5, 7)
+        and selector_top_k == 16
+        and getattr(parallel_config, "pipeline_parallel_size", 0) == 1
+        and not getattr(parallel_config, "enable_dbo", False)
+        and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
+    )

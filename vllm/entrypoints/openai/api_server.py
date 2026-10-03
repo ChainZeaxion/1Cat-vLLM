@@ -186,6 +186,49 @@ def build_app(
         from fastapi.responses import Response
         return Response(status_code=200)
 
+    # [opt28] Chat template hot reload. Gated by VLLM_CHAT_TEMPLATE_HOT_RELOAD=1.
+    #
+    # vLLM reads --chat-template exactly once at startup and every serving object
+    # keeps its own copy, so editing the file used to require a full restart.
+    # Here the file is followed instead: the load below records its path, and the
+    # middleware re-reads it (mtime-gated, so normally a single stat) before each
+    # request, then pushes the result onto every object that renders with it.
+    # Template edits therefore take effect on the next request, with no restart.
+    # Prefix caching is unaffected in kind: the prompt prefix changes, so cache
+    # entries miss until the new prefix is warmed -- same as any prompt change.
+    from vllm.entrypoints.chat_utils import (
+        current_hot_chat_template,
+        load_chat_template,
+        refresh_hot_chat_template,
+    )
+
+    load_chat_template(args.chat_template)  # registers the source path
+    _hot_template_holders = (
+        "openai_serving_chat",
+        "openai_serving_chat_batch",
+        "openai_serving_completion",
+        "openai_serving_responses",
+        "openai_serving_render",
+        "openai_serving_tokenization",
+    )
+
+    @app.middleware("http")
+    async def apply_hot_chat_template(request, call_next):
+        if refresh_hot_chat_template():
+            template = current_hot_chat_template()
+            if template is not None:
+                applied = []
+                for name in _hot_template_holders:
+                    holder = getattr(request.app.state, name, None)
+                    if holder is not None and hasattr(holder, "chat_template"):
+                        holder.chat_template = template
+                        applied.append(name)
+                logger.info(
+                    "Hot chat template pushed to: %s",
+                    ", ".join(applied) if applied else "no serving object",
+                )
+        return await call_next(request)
+
     from vllm.entrypoints.serve import register_vllm_serve_api_routers
 
     register_vllm_serve_api_routers(app)
@@ -363,6 +406,9 @@ async def init_app_state(
     state.engine_client = engine_client
     state.log_stats = not args.disable_log_stats
     state.vllm_config = vllm_config
+    from vllm.sm70_profiles.acceleration import collect_worker_reports
+
+    await collect_worker_reports(engine_client, vllm_config)
     state.args = args
     resolved_chat_template = load_chat_template(args.chat_template)
 
@@ -726,4 +772,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
     validate_parsed_serve_args(args)
 
-    uvloop.run(run_server(args))
+    # [SM70 patch] 让 `-m vllm.entrypoints.openai.api_server --api-server-count N` 真正生效。
+    #
+    # 上游问题：api_server_count 的调度逻辑只存在于 vllm/entrypoints/cli/serve.py:144
+    #   `elif args.api_server_count > 1: run_multi_api_server(args)`
+    # 而本模块的 __main__ 直接 `uvloop.run(run_server(args))`，
+    # ⇒ 参数能被 argparse 接受、也会出现在日志 non-default args 里，
+    #   **但被静默忽略**，只起 1 个前端进程（实测 2026-09-20：传 2 实际 1）。
+    # 这里复刻 serve.py 的判定，使该参数在 api_server 入口下同样生效。
+    if args.api_server_count is not None and args.api_server_count > 1:
+        from vllm.entrypoints.cli.serve import run_multi_api_server
+
+        run_multi_api_server(args)
+    else:
+        uvloop.run(run_server(args))

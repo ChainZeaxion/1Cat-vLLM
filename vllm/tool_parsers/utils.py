@@ -3,6 +3,7 @@
 
 import ast
 import json
+import re
 from json import JSONDecodeError, JSONDecoder
 from typing import Any, TypeAlias
 
@@ -167,6 +168,67 @@ def find_tool_properties(
         if name == tool_name:
             return (params or {}).get("properties", {})
     return {}
+
+
+# opt22e：请求侧「明确禁止调用」信号。用于把「只做分析/展示格式、不要执行」
+# 的意图**在服务端识别出来**并整轮降级。
+#
+# ⚠️ 模式必须**窄**：system prompt 里常见的「不要调用未注册的工具」「只能调用
+# 下列工具」属于**格式约束**而非禁止意图，误匹配会把真实调用整轮吞掉。
+# 故只认**明确的禁止性表述**（「不要真的调用/执行」「禁止调用/执行」）。
+_NO_CALL_INTENT_RE = re.compile(
+    r"不要真的(?:调用|执行)|不得真的(?:调用|执行)|禁止(?:调用|执行)"
+    r"|不要执行任何|不得执行任何"
+)
+
+
+def request_forbids_tool_calls(request) -> bool:
+    """opt22e：请求的 system/developer 消息是否**明确禁止**工具调用。
+
+    仅用于补足 `tool_choice="none"`：有些客户端把该意图写在 system prompt 里
+    （如「这只是格式分析，不要真的调用工具」），而未传 `tool_choice`。
+    此时模型可能在 **content**（而非 thinking）里裸写完整调用，其字节形态与
+    真实调用**无法区分** ⇒ 只能靠请求侧信号判定。
+
+    ⚠️ 模式刻意取窄（见 `_NO_CALL_INTENT_RE`），避免误伤格式约束类提示词。
+    """
+    msgs = getattr(request, "messages", None)
+    if not msgs:
+        return False
+    for m in msgs:
+        role = getattr(m, "role", None)
+        if role not in ("system", "developer"):
+            continue
+        content = getattr(m, "content", None)
+        if isinstance(content, str):
+            if _NO_CALL_INTENT_RE.search(content):
+                return True
+        elif isinstance(content, (list, tuple)):
+            for part in content:
+                text = getattr(part, "text", None) if not isinstance(part, dict) else part.get("text")
+                if isinstance(text, str) and _NO_CALL_INTENT_RE.search(text):
+                    return True
+    return False
+
+
+def find_tool_required(
+    tools: list[Tool] | None,
+    tool_name: str,
+) -> list[str]:
+    """opt22e：返回该工具 schema 中 ``required`` 声明的参数名列表（无则 []）。
+
+    用于「必填参数兜底」：模型写文档时正文里的**完整示例**会被文本层误判为
+    真实调用，其参数往往缺失或与 schema 不符。真实调用必然带齐必填参数，
+    故「缺必填 ⇒ 不是真实调用」是一条**不依赖枚举形态**的通用判据。
+    """
+    if not tools:
+        return []
+    for tool in tools:
+        name, params = _extract_tool_info(tool)
+        if name == tool_name:
+            req = (params or {}).get("required")
+            return list(req) if isinstance(req, (list, tuple)) else []
+    return []
 
 
 def _get_tool_schema_from_tool(tool: Tool) -> dict:
@@ -637,3 +699,90 @@ def compute_tool_delta(
         if arg_diff
         else None
     )
+
+
+import re as _re
+
+# opt22d(R1): 形似工具调用的标签匹配。
+# 后缀分支 \"<[^<>]*$\" 覆盖“无右尖括号的截断残片”。
+TOOL_LIKE_TAG_RE = _re.compile(
+    r"</?(?:tool_call|toolcall|tool|function|parameter|param)\b[^<>]*?/?>"
+    r"|</?(?:tool_call|toolcall|tool|function|parameter|param)\b[^<>]*$"
+)
+
+
+def escape_tool_like_tags(text: str) -> str:
+    """opt22d(R1): 把“形似工具调用”的裸标签换成显示安全的形式，使下游无法把它们当真实调用执行。
+
+    转义形如 `<function=Write>` -> `⟨'function=Write'⟩`（数学尖括号 + 成对单引号）。
+    不用 `&lt;`/`&gt;` 实体的原因：① 纯文本渲染下很难看；② 若下游做 HTML 解码
+    会被还原成 `<` 而失效。不用全角 `＜＞` 的原因：NFKC 会映射回 ASCII `<`/`>`。
+
+    仅命中工具调用词族的标签名——`a<b`、`20<3`、`<p>` 等普通文本不受影响。
+    **幂等**：已转义的 `⟨'...'⟩` 不再匹配（正则要求标签名紧跟 `<`），
+    故对“已由工具解析器转义过”的内容重复施加也无害。
+    """
+    if not text:
+        return text
+    return TOOL_LIKE_TAG_RE.sub(
+        lambda m: m.group(0).replace("<", "⟨'").replace(">", "'⟩"), text
+    )
+
+
+# opt22d（L-E）：工具类标签名（含别名），用于判断“残缺前缀”是否还可能是工具标签
+_TOOL_TAG_NAMES = ("tool_call", "toolcall", "tool", "function", "parameter", "param")
+
+
+def split_incomplete_tool_tag_tail(text: str) -> tuple[str, str]:
+    """opt22d（L-E）：把末尾“尚未闭合、仍可能长成工具类标签”的片段摘出来。
+
+    流式下标签会被切分（如 ``<p`` + ``arameter=file_path>``、``</function`` + ``>``）。
+    若在**片段粒度**上做转义，两种失败模式：
+      ① 标签名不完整（``<p``）→ 转义正则两个分支都不匹配 → **裸 ``<`` 泄漏**；
+      ② 名完整而缺 ``>``（``</function``）→ 只替换 ``<`` → 后到的 ``>`` 不匹配
+         → 产出 ``⟨'/function>`` 这类**畸形**（开一半、闭一半）。
+    故调用方应把这种尾部**暂存**到下一轮，等 ``>`` 到齐后整体转义。
+
+    Args:
+        text: 待处理的文本（通常是累积缓冲/整段文本）
+
+    Returns:
+        ``(可安全转义的部分, 需暂存的尾部)``；无此类尾部时返回 ``(text, "")``。
+    """
+    i = text.rfind("<")
+    if i == -1:
+        return text, ""
+    tail = text[i:]
+    if ">" in tail:
+        return text, ""
+    # 仅 "<" / "</"（其后还没有任何字符）才可能长成任意工具标签：暂存一个字符宽度，
+    # 下一字符到达即重新判定（自限，不会长期扣留）。
+    if tail in ("<", "</"):
+        return text[:i], tail
+    inner = tail[1:]
+    if inner.startswith("/"):
+        inner = inner[1:]
+    tok = ""
+    for ch in inner:
+        if ch.isalnum() or ch == "_":
+            tok += ch
+        else:
+            break
+    # opt22d 修正（2026-09-17）：tok 必须**非空**才算候选。空 tok 意味着 "<" 后紧跟
+    # 空格/标点（正文里的 `a < b`、`tokenCount < limit`），永远长不成标签；旧写法
+    # `name.startswith("")` 恒真 ⇒ 这类孤立 "<" 被当成候选暂存，其后全部文本被扣在
+    # 缓冲里，流式结束不补发 ⇒ **消息在孤立 "<" 处被截断**（xml/coder 双路径实测复现）。
+    if tok and any(name.startswith(tok) for name in _TOOL_TAG_NAMES):
+        return text[:i], tail
+    return text, ""
+
+
+def mask_tool_like_tags_holding_tail(text: str) -> str:
+    """opt22d（L-E）：转义的同时**丢弃**末尾未闭合的工具类标签片段。
+
+    供 coder 使用——它靠“当前文本 − 上一轮文本”相减推导增量，
+    必须保证遮罩结果的前缀关系稳定，故暂存片段不能出现在遮罩输出里，
+    留待下一轮片段闭合后以整体转义的形式出现。
+    """
+    head, _held = split_incomplete_tool_tag_tail(text)
+    return escape_tool_like_tags(head)

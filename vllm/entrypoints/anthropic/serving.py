@@ -352,6 +352,31 @@ class AnthropicServingMessages(OpenAIServingChat):
                 }
             )
 
+    @staticmethod
+    def _wants_token_ids(
+        request: AnthropicMessagesRequest,
+        raw_request: Request | None,
+    ) -> bool:
+        """Whether this request asked the response to carry per-chunk token ids.
+
+        opt21: the Anthropic response can echo the ids each delta decodes from
+        (mirroring the OpenAI protocol's `choices[].token_ids`), but that is an
+        extension no client needs by default, so it is opt-in. Two equivalent
+        ways to ask, so a caller can pick whichever fits its path:
+
+        * the body field ``return_token_ids`` (vLLM's OpenAI-protocol name), for
+          callers that already build the request body; or
+        * the request header ``x-return-token-ids``, for a proxy that forwards
+          the body byte-for-byte and cannot add a field to it.
+        """
+        if getattr(request, "return_token_ids", False):
+            return True
+        if raw_request is not None:
+            flag = raw_request.headers.get("x-return-token-ids")
+            if flag is not None and flag.strip().lower() in ("1", "true", "yes", "on"):
+                return True
+        return False
+
     @classmethod
     def _build_base_request(
         cls,
@@ -377,6 +402,13 @@ class AnthropicServingMessages(OpenAIServingChat):
                 top_k=anthropic_request.top_k,
                 kv_transfer_params=anthropic_request.kv_transfer_params,
                 chat_template_kwargs=anthropic_request.chat_template_kwargs,
+                # opt21: off by default, matching vLLM's OpenAI protocol
+                # (`return_token_ids` defaults to None/off). `create_messages`
+                # turns it on only when the caller asked — the `x-return-token-ids`
+                # header a local front end sets, or the body field of the same
+                # name — so a caller that does not want per-chunk ids is not made
+                # to pay for them.
+                return_token_ids=False,
             )
 
         # opt22: fix=2 强制 JSON / fix=3 强制 XML——模板格式与 parser 路由对齐
@@ -500,6 +532,10 @@ class AnthropicServingMessages(OpenAIServingChat):
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("Received messages request %s", request.model_dump_json())
         chat_req = self._convert_anthropic_to_openai_request(request)
+        # opt21: carry per-chunk output token ids only when asked for (see
+        # `_wants_token_ids`). Off unless requested keeps the response lean for
+        # every caller that does not run a live TPS meter.
+        chat_req.return_token_ids = self._wants_token_ids(request, raw_request)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("Convert to OpenAI request %s", chat_req.model_dump_json())
         generator = await self.create_chat_completion(chat_req, raw_request)
@@ -508,9 +544,9 @@ class AnthropicServingMessages(OpenAIServingChat):
             return generator
 
         elif isinstance(generator, ChatCompletionResponse):
-            return self.messages_full_converter(generator)
+            return self.messages_full_converter(generator, request)
 
-        return self.message_stream_converter(generator)
+        return self.message_stream_converter(generator, request)
 
     @staticmethod
     def _anthropic_input_tokens(
@@ -522,10 +558,27 @@ class AnthropicServingMessages(OpenAIServingChat):
         prompt = usage.prompt_tokens if usage is not None else 0
         return max(0, (prompt or 0) - (cached_tokens or 0))
 
+    @staticmethod
+    def _anthropic_reasoning_tokens(usage: Any) -> int | None:
+        # Pass through the reasoning split the chat layer measured. None when it
+        # did not measure one, so the field is omitted rather than reported as
+        # zero — a caller cannot tell "no reasoning" from "not measured".
+        details = getattr(usage, "completion_tokens_details", None)
+        if details is None:
+            return None
+        return getattr(details, "reasoning_tokens", None)
+
     def messages_full_converter(
         self,
         generator: ChatCompletionResponse,
+        request: AnthropicMessagesRequest,
     ) -> AnthropicMessagesResponse:
+        # opt21: the Anthropic schema has no token-id fields; carry the OpenAI
+        # layer's ids through, mirroring choices[].token_ids / prompt_token_ids.
+        output_token_ids: list[int] = []
+        for output_choice in generator.choices:
+            if output_choice.token_ids:
+                output_token_ids.extend(output_choice.token_ids)
         result = AnthropicMessagesResponse(
             id=generator.id,
             type="message",
@@ -548,8 +601,15 @@ class AnthropicServingMessages(OpenAIServingChat):
                     and generator.usage.prompt_tokens_details.cached_tokens
                     else None
                 ),
+                reasoning_tokens=self._anthropic_reasoning_tokens(generator.usage),
             ),
             kv_transfer_params=generator.kv_transfer_params,
+            token_ids=output_token_ids or None,
+            prompt_token_ids=(
+                generator.prompt_token_ids
+                if request.return_prompt_token_ids
+                else None
+            ),
         )
         choice = generator.choices[0]
         if choice.finish_reason == "stop":
@@ -592,6 +652,7 @@ class AnthropicServingMessages(OpenAIServingChat):
     async def message_stream_converter(
         self,
         generator: AsyncGenerator[str, None],
+        request: AnthropicMessagesRequest,
     ) -> AsyncGenerator[str, None]:
         try:
 
@@ -632,6 +693,35 @@ class AnthropicServingMessages(OpenAIServingChat):
             state = _ActiveBlockState()
             # Map from tool call index to tool_use_id
             tool_index_to_id: dict[int, str] = {}
+            # opt21: a chunk's output token ids (`choices[0].token_ids`) belong
+            # to exactly one content_block_delta, so they ride the first delta
+            # emitted for that chunk and are cleared afterwards (a chunk that
+            # carries both thinking and text must not count them twice).
+            pending_token_ids: list[int] | None = None
+
+            def take_token_ids() -> list[int] | None:
+                nonlocal pending_token_ids
+                ids, pending_token_ids = pending_token_ids, None
+                return ids
+
+            def content_delta_event(
+                index: int, delta: AnthropicDelta
+            ) -> AnthropicStreamEvent:
+                """A `content_block_delta` carrying this chunk's output ids.
+
+                opt21: `token_ids` is attached only when the caller asked for ids
+                (see `_wants_token_ids`). Assigning it conditionally — never as a
+                bare `token_ids=None` — keeps it out of `model_fields_set`, so a
+                reply that did not request ids has no `token_ids` key at all
+                rather than a null one.
+                """
+                event = AnthropicStreamEvent(
+                    index=index, type="content_block_delta", delta=delta
+                )
+                ids = take_token_ids()
+                if ids is not None:
+                    event.token_ids = ids
+                return event
 
             def stop_active_block():
                 events: list[str] = []
@@ -721,6 +811,17 @@ class AnthropicServingMessages(OpenAIServingChat):
                                             else None
                                         ),
                                     ),
+                                    # opt21: the prompt ids are echoed only when the
+                                    # request opted in (the prompt can be tens of
+                                    # thousands of ids). Spread in rather than passed
+                                    # as None so an un-opted-in reply has no
+                                    # `prompt_token_ids` key at all, mirroring how the
+                                    # output ids are handled (see content_delta_event).
+                                    **(
+                                        {"prompt_token_ids": origin_chunk.prompt_token_ids}
+                                        if request.return_prompt_token_ids
+                                        else {}
+                                    ),
                                 ),
                             )
                             first_item = False
@@ -759,6 +860,9 @@ class AnthropicServingMessages(OpenAIServingChat):
                                         and origin_chunk.usage.prompt_tokens_details.cached_tokens
                                         else None
                                     ),
+                                    reasoning_tokens=self._anthropic_reasoning_tokens(
+                                        origin_chunk.usage
+                                    ),
                                 ),
                             )
                             data = chunk.model_dump_json(exclude_unset=True)
@@ -768,6 +872,10 @@ class AnthropicServingMessages(OpenAIServingChat):
                         if origin_chunk.choices[0].finish_reason is not None:
                             finish_reason = origin_chunk.choices[0].finish_reason
                             # continue
+
+                        # opt21: the ids this chunk decoded, handed to whichever
+                        # content_block_delta the chunk turns out to produce.
+                        pending_token_ids = origin_chunk.choices[0].token_ids
 
                         # thinking / text content
                         reasoning_delta = origin_chunk.choices[0].delta.reasoning
@@ -784,14 +892,13 @@ class AnthropicServingMessages(OpenAIServingChat):
                                         )
                                     )
                                     yield start_event
-                                chunk = AnthropicStreamEvent(
-                                    index=(
+                                chunk = content_delta_event(
+                                    (
                                         state.block_index
                                         if state.block_index is not None
                                         else state.content_block_index
                                     ),
-                                    type="content_block_delta",
-                                    delta=AnthropicDelta(
+                                    AnthropicDelta(
                                         type="thinking_delta",
                                         thinking=reasoning_delta,
                                     ),
@@ -810,14 +917,13 @@ class AnthropicServingMessages(OpenAIServingChat):
                                         AnthropicContentBlock(type="text", text="")
                                     )
                                     yield start_event
-                                chunk = AnthropicStreamEvent(
-                                    index=(
+                                chunk = content_delta_event(
+                                    (
                                         state.block_index
                                         if state.block_index is not None
                                         else state.content_block_index
                                     ),
-                                    type="content_block_delta",
-                                    delta=AnthropicDelta(
+                                    AnthropicDelta(
                                         type="text_delta",
                                         text=origin_chunk.choices[0].delta.content,
                                     ),
@@ -859,14 +965,13 @@ class AnthropicServingMessages(OpenAIServingChat):
                                         and tool_call.function.arguments
                                         and state.tool_use_id == tool_call.id
                                     ):
-                                        chunk = AnthropicStreamEvent(
-                                            index=(
+                                        chunk = content_delta_event(
+                                            (
                                                 state.block_index
                                                 if state.block_index is not None
                                                 else state.content_block_index
                                             ),
-                                            type="content_block_delta",
-                                            delta=AnthropicDelta(
+                                            AnthropicDelta(
                                                 type="input_json_delta",
                                                 partial_json=tool_call.function.arguments,
                                             ),
@@ -884,14 +989,13 @@ class AnthropicServingMessages(OpenAIServingChat):
                                         and tool_call.function.arguments
                                         and state.tool_use_id == tool_use_id
                                     ):
-                                        chunk = AnthropicStreamEvent(
-                                            index=(
+                                        chunk = content_delta_event(
+                                            (
                                                 state.block_index
                                                 if state.block_index is not None
                                                 else state.content_block_index
                                             ),
-                                            type="content_block_delta",
-                                            delta=AnthropicDelta(
+                                            AnthropicDelta(
                                                 type="input_json_delta",
                                                 partial_json=tool_call.function.arguments,
                                             ),

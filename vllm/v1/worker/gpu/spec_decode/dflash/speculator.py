@@ -22,6 +22,7 @@ from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import cp_local_slot, prepare_dcp_local_seq_lens
+from vllm.v1.worker.gpu.decode_step_profile import get_profiler
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
@@ -257,6 +258,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         # The draft's attention differs from the target's in causality.
         return replace(
             self.vllm_config,
+            is_speculative_draft=True,
             model_config=self.draft_model_config,
             parallel_config=self.speculative_config.draft_parallel_config,
             attention_config=replace(
@@ -557,6 +559,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_sampled_tokens_cpu: np.ndarray | None = None,
         all_token_ids_cpu: np.ndarray | None = None,
     ) -> torch.Tensor:
+        # Diagnostic only (no-op unless VLLM_DECODE_STEP_PROFILE=1).
+        prof = get_profiler()
+        prof.gpu_begin("draft_prepare")
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
@@ -683,6 +688,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                     self.max_model_len,
                     self.sample_from_anchor,
                 )
+        prof.gpu_end("draft_prepare")
+        prof.gpu_begin("draft_ctxkv")
 
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
         # because the context shape varies per step. During dummy runs the block tables
@@ -704,6 +711,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.context_positions[:num_target_tokens],
                 context_slots,
             )
+        prof.gpu_end("draft_ctxkv")
+        prof.gpu_begin("draft_ngram")
         self._debug_proposal_stage("context kv end")
 
         if not dummy_run and _is_context_only_prefill(input_batch):
@@ -729,7 +738,10 @@ class DFlashSpeculator(DraftModelSpeculator):
             all_token_ids_cpu,
         ):
             self._apply_ngram_assist(num_reqs)
+            prof.gpu_end("draft_ngram")
             return self.draft_tokens[:num_reqs]
+        prof.gpu_end("draft_ngram")
+        prof.gpu_begin("draft_forward")
 
         self._debug_proposal_stage("query preparation begin")
         with record_function_or_nullcontext("dflash: query and selector"):
@@ -782,6 +794,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                     num_tokens_across_dp=num_tokens_across_dp,
                     cudagraph_runtime_mode=batch_desc.cg_mode,
                 )
+        prof.gpu_end("draft_forward")
 
         self._debug_proposal_stage("query and selector end")
         self._apply_ngram_assist(num_reqs)

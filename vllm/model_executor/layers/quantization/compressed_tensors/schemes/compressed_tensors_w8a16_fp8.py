@@ -10,9 +10,18 @@ from compressed_tensors.quantization import QuantizationArgs, QuantizationStrate
 from vllm import _sm70_ops as sm70_ops
 from vllm import envs
 from vllm.config import get_current_vllm_config
+from vllm.config.sm70_dflash2 import (
+    capture_sm70_dflash2_config,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     init_wfp8_a16_linear_kernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
+    _get_sm70_fp8_prefill_exact_dense_workspace,
+    _is_sm70_fp8_qpn8_runtime_contract,
+    _missing_sm70_fp8_qpn8_ops,
+    _try_sm70_fp8_prescaled_decode_scales,
 )
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
@@ -21,12 +30,6 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
 from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     STRATEGY_TO_PARAMETER_TYPE,
     STRATEGY_TO_WEIGHT_QUANT_KEY,
-)
-from vllm.model_executor.layers.quantization.fp8 import (
-    _get_sm70_fp8_prefill_exact_dense_workspace,
-    _is_sm70_fp8_qpn8_runtime_contract,
-    _missing_sm70_fp8_qpn8_ops,
-    _try_sm70_fp8_prescaled_decode_scales,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
@@ -190,6 +193,13 @@ _SM70_CHANNEL_FP8_QPN8_GATED_CONFIG = (8, 2, False)
 
 def _sm70_fp8_qpn8_enabled(enable_by_default: bool) -> bool:
     """Resolve QPN8 while preserving the validated mixed-NVFP4 default."""
+    policy = capture_sm70_dflash2_config()
+    if (
+        policy is not None
+        and policy.resolved
+        and (policy.qualified or "target_fp8_qpn8" in policy.explicit_fields)
+    ):
+        return bool(policy.target_fp8_qpn8)
     if os.getenv("VLLM_SM70_FP8_QPN8") is None:
         return enable_by_default
     return envs.VLLM_SM70_FP8_QPN8

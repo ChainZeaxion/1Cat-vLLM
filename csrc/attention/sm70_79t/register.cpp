@@ -40,6 +40,9 @@ std::shared_ptr<ScoreWorkspace> get_score_workspace(const at::Tensor& query,
 
 extern "C" int64_t onecat_sm70_q8000_accumulation_bits();
 extern "C" int64_t onecat_sm70_q8192_accumulation_bits();
+extern "C" int64_t onecat_sm70_q4096_accumulation_bits();
+extern "C" int64_t onecat_sm70_q3072_accumulation_bits();
+extern "C" int64_t onecat_sm70_q2560_accumulation_bits();
 
 namespace onecat_79t_q8192 {
 at::Tensor sm70_d256_gqa_architecture_q8192_fwd(
@@ -47,7 +50,29 @@ at::Tensor sm70_d256_gqa_architecture_q8192_fwd(
     at::Tensor& out, double softmax_scale, bool causal);
 }
 
+namespace onecat_79t_q4096 {
+at::Tensor sm70_d256_gqa_architecture_q4096_fwd(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    at::Tensor& out, double softmax_scale, bool causal);
+}
+
+namespace onecat_79t_q3072 {
+at::Tensor sm70_d256_gqa_architecture_q3072_fwd(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    at::Tensor& out, double softmax_scale, bool causal);
+}
+
+namespace onecat_79t_q2560 {
+at::Tensor sm70_d256_gqa_architecture_q2560_fwd(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    at::Tensor& out, double softmax_scale, bool causal);
+}
+
 TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
+  // Reports the FP32-accumulation capability of the original qualified widths.
+  // Q4096/Q2560 are built from the identical recipe and flags, so they share
+  // this answer; the probe deliberately stays on the two widths whose presence
+  // is guaranteed by the base build.
   ops.def("sm70_d256_gqa_accumulation_bits() -> int", []() -> int64_t {
     return onecat_sm70_q8000_accumulation_bits() == 32 &&
                    onecat_sm70_q8192_accumulation_bits() == 32
@@ -57,9 +82,24 @@ TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
   ops.def(
       "sm70_d256_gqa_architecture_q8192_fwd(Tensor q, Tensor k, Tensor v, "
       "Tensor(a!) out, float softmax_scale, bool causal) -> Tensor(a!)");
+  ops.def(
+      "sm70_d256_gqa_architecture_q4096_fwd(Tensor q, Tensor k, Tensor v, "
+      "Tensor(a!) out, float softmax_scale, bool causal) -> Tensor(a!)");
+  ops.def(
+      "sm70_d256_gqa_architecture_q3072_fwd(Tensor q, Tensor k, Tensor v, "
+      "Tensor(a!) out, float softmax_scale, bool causal) -> Tensor(a!)");
+  ops.def(
+      "sm70_d256_gqa_architecture_q2560_fwd(Tensor q, Tensor k, Tensor v, "
+      "Tensor(a!) out, float softmax_scale, bool causal) -> Tensor(a!)");
 }
 
 TORCH_LIBRARY_IMPL(_vllm_fa2_C, CUDA, ops) {
   ops.impl("sm70_d256_gqa_architecture_q8192_fwd",
            &onecat_79t_q8192::sm70_d256_gqa_architecture_q8192_fwd);
+  ops.impl("sm70_d256_gqa_architecture_q4096_fwd",
+           &onecat_79t_q4096::sm70_d256_gqa_architecture_q4096_fwd);
+  ops.impl("sm70_d256_gqa_architecture_q3072_fwd",
+           &onecat_79t_q3072::sm70_d256_gqa_architecture_q3072_fwd);
+  ops.impl("sm70_d256_gqa_architecture_q2560_fwd",
+           &onecat_79t_q2560::sm70_d256_gqa_architecture_q2560_fwd);
 }

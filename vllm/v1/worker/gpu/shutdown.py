@@ -8,6 +8,13 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def log_loaded_attention_route_summaries() -> None:
+    """Flush counters before multiprocessing workers bypass Python atexit."""
+    module = sys.modules.get("vllm.v1.attention.backends.flash_attn_v100")
+    if module is not None:
+        module._log_route_summary()
+
+
 def _clear_loaded_gpu_workspaces() -> None:
     """Clear fork-specific GPU caches without importing unused backends."""
     cleanup_functions = (
@@ -16,7 +23,7 @@ def _clear_loaded_gpu_workspaces() -> None:
             "clear_flash_attn_v100_workspaces",
         ),
         (
-            "vllm.model_executor.layers.quantization.fp8",
+            "vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8",
             "clear_sm70_fp8_workspaces",
         ),
         (

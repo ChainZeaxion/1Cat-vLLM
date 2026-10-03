@@ -24,6 +24,10 @@ from typing import cast
 import torch
 
 import vllm.envs as envs
+from vllm.config.sm70_dflash2 import (
+    capture_sm70_dflash2_config,
+    sm70_dflash2_enabled,
+)
 from vllm.config.speculative import get_dflash_model_draft_tokens
 from vllm.forward_context import CUDAGRAPH_VARIANT_LONG_CONTEXT
 from vllm.logger import init_logger
@@ -522,12 +526,70 @@ _fp8_e5m2_paged_kv_to_fp16_checked = False
 _flash_attn_turboquant_decode_paged = None
 _flash_attn_turboquant_decode_checked = False
 _paged_kv_utils = None
+
+# [opt27 restore, 2026-09-30] Aligned hybrid-cache page widths (tokens per
+# physical block, i.e. ``key_cache.shape[1]``) on which the DFlash2 grouped
+# verifier may run.  These are NOT derivable from the launch config: the page is
+# driven by the served model's mamba state size, so the same --max-model-len
+# yields different pages for different models (1728 vs 864 both at 233000), and
+# the same model yields different pages for fp16 vs fp8 (448 vs 864/1728).
+#   fp16 / auto -> unquantized interleaved layout   (448 observed locally)
+#   fp8         -> 1-byte packed layout             (864 and 1728 observed; the
+#                                                    aligned common page is a
+#                                                    fixed byte budget and fp8
+#                                                    halves the per-token bytes)
+# ``VLLM_FLASH_V100_GROUPED_VERIFY_PAGES`` appends extra comma-separated page
+# widths so a newly observed page can be enabled from the environment without a
+# code change; the gate-rejection log prints the observed ``k=(...)`` shape, so
+# the value to add can be read straight off the engine log.
+#
+# NOTE: only fp16 / fp8_e5m2 consult this set.  E4M3 is deliberately excluded --
+# it must use the repaired FP32-partial route instead (see the kv_cache_dtype
+# guard in the grouped-verifier gate and its comment).
+_DEFAULT_GROUPED_VERIFY_FP16_PAGES = (448,)
+_DEFAULT_GROUPED_VERIFY_FP8_PAGES = (864, 896, 1648, 1728, 3296, 3456)
+_GROUPED_VERIFY_PAGES_CACHE: dict[tuple[int, ...], tuple[int, ...]] = {}
+
+
+def _grouped_verify_pages(defaults: tuple[int, ...]) -> tuple[int, ...]:
+    """Return ``defaults`` plus any env-supplied page widths (memoized).
+
+    Called from the per-step attention gate, hence the cache: parsing the
+    environment on every decode step would be pure overhead.
+    """
+    cached = _GROUPED_VERIFY_PAGES_CACHE.get(defaults)
+    if cached is not None:
+        return cached
+    pages = list(defaults)
+    raw = os.getenv("VLLM_FLASH_V100_GROUPED_VERIFY_PAGES")
+    for chunk in raw.split(",") if raw else ():
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            value = int(chunk)
+        except ValueError:
+            logger.warning(
+                "Ignoring non-integer VLLM_FLASH_V100_GROUPED_VERIFY_PAGES "
+                "entry %r",
+                chunk,
+            )
+            continue
+        if value not in pages:
+            pages.append(value)
+    result = tuple(pages)
+    _GROUPED_VERIFY_PAGES_CACHE[defaults] = result
+    return result
+
+
 _warned_feature_fallback = False
 _warned_decode_fallback = False
 _warned_decode_strict_fallback = False
 _warned_prefill_gather_oom = False
 _warned_prefill_dense_splitkv3_oom = False
 _warned_prefill_d256_gqa_architecture_oom = False
+_probed_sm70_79t_added_width_gate = False
+_probed_sm70_79t_added_width_hit = False
 _logged_prefill_flash = False
 _logged_prefill_prefix_flash = False
 _logged_prefill_prefix_contig_dense = False
@@ -590,8 +652,11 @@ _prefill_dense_splitkv3_workspaces: dict[
     tuple[int, int, torch.dtype],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ] = {}
-_sm70_79t_q8192_padding_workspaces: dict[
-    tuple[int, int, torch.dtype, int, int, int],
+# Keyed by (device, stream, dtype, batch, q_heads, head_dim, width) so the
+# original Q8192 padding and every added width share one cache without
+# colliding on shape.
+_sm70_79t_padding_workspaces: dict[
+    tuple[int, int, torch.dtype, int, int, int, int],
     tuple[torch.Tensor, torch.Tensor],
 ] = {}
 
@@ -603,7 +668,7 @@ def clear_flash_attn_v100_workspaces() -> None:
     _fp8_prefill_bridge_tail_workspaces.clear()
     _prefill_gather_dense_workspaces.clear()
     _prefill_dense_splitkv3_workspaces.clear()
-    _sm70_79t_q8192_padding_workspaces.clear()
+    _sm70_79t_padding_workspaces.clear()
 
 
 def _normalize_flash_v100_kv_cache_dtype(kv_cache_dtype: str) -> str:
@@ -972,6 +1037,8 @@ def _is_cuda_graph_capturing(tensor: torch.Tensor) -> bool:
 
 
 def _route_summary_enabled() -> bool:
+    if "VLLM_SM70_DEBUG" in os.environ:
+        return "routing" in envs.VLLM_SM70_DEBUG
     return (
         os.getenv("VLLM_FLASH_V100_ROUTE_SUMMARY", "0") == "1"
         or os.getenv("VLLM_FLASH_V100_DEBUG_ROUTE_SUMMARY", "0") == "1"
@@ -984,6 +1051,7 @@ def _log_route_summary() -> None:
             "FLASH_ATTN_V100 route summary: %s",
             json.dumps(_route_counts, sort_keys=True),
         )
+        _route_counts.clear()
 
 
 def _record_route(route: str) -> None:
@@ -1338,8 +1406,14 @@ def _get_sm70_splitd_d256_ops():
             "sm70_d256_splitd_n32_paged_fwd",
         )
         with suppress(ImportError):
-            # Importing the interface loads the bundled FA2 torch library.
-            from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+            # The FA2 library loads on first use, one per process and chosen
+            # for the worker's device; make sure it is there before the
+            # operators are resolved.
+            from vllm.vllm_flash_attn.flash_attn_interface import (
+                ensure_fa2_library_loaded,
+            )
+
+            ensure_fa2_library_loaded()
 
         namespace = getattr(torch.ops, "_vllm_fa2_C", None)
         if namespace is None or not all(
@@ -1465,6 +1539,82 @@ def _get_sm70_d256_gqa_architecture_q8192_op():
     except (AttributeError, ImportError, RuntimeError):
         _sm70_d256_gqa_architecture_q8192_op = None
     return _sm70_d256_gqa_architecture_q8192_op
+
+
+# Query widths added on top of the original Q8000/Q8192 pair.  The SM70
+# long-prefill route is a *fixed query width* kernel, so a chunk can only use
+# it when its length matches a width the extension was built for.  With only
+# 8000/8192 the route was unreachable for chunked prefill, whose chunk size is
+# `long_prefill_token_threshold` (opt23 derives it as a fraction of
+# --max-num-batched-tokens).  Q2560 and Q4096 cover the two budgets that matter
+# in practice: 0.5*5120 = 2560 and 0.5*8192 = 4096.
+#
+# Each width also serves shorter chunks by right-aligning the chunk inside a
+# width-row query and zeroing the leading rows.  The operator anchors its query
+# block at the end of the KV, so the last `query_len` rows land on exactly the
+# absolute positions they would have unpadded and attend the same keys; the
+# zeroed rows only produce outputs that are discarded.
+#
+# A width serves down to three quarters of itself, not to zero.  Padding a
+# `query_len`-token chunk up to `width` spends padding rows whose cost is
+# proportional to the context length, so the relative waste is about
+# `(width - query_len) / query_len`; capping that at a third keeps the route
+# comfortably ahead of the generic path even at the window's lower edge.  The
+# widths are spaced so consecutive windows overlap -- 2560 -> (1920, 2560],
+# 3072 -> (2304, 3072], 4096 -> (3072, 4096] -- with no hole at a 3/4 boundary.
+#
+# Below `_SM70_79T_MIN_PADDED_QUERY_LEN` the generic path wins outright -- a
+# short chunk padded up to one of these widths would spend most of its work on
+# discarded rows -- so that floor overrides the per-width 3/4 rule (it is what
+# lifts Q2560's own floor from 1920 to 2048).  The net coverage is therefore
+# exactly [2048, 4096]; anything shorter falls back to the original route.
+_SM70_79T_EXACT_WIDTHS = (2560, 3072, 4096)
+_SM70_79T_MIN_PADDED_QUERY_LEN = 2048
+_SM70_79T_WIDTH_NUMERATOR = 3
+_SM70_79T_WIDTH_DENOMINATOR = 4
+_sm70_79t_exact_width_ops: dict[int, Callable[..., torch.Tensor] | None] = {}
+
+
+def _sm70_79t_width_floor(width: int) -> int:
+    """Largest chunk length strictly below the width's padded coverage."""
+    return width * _SM70_79T_WIDTH_NUMERATOR // _SM70_79T_WIDTH_DENOMINATOR
+
+
+def _sm70_79t_padded_width_for(query_len: int) -> int | None:
+    """Smallest added width that serves `query_len`, else None.
+
+    The smallest qualifying width wins, so a chunk always gets the least
+    padding available rather than being pushed to a wider one.
+    """
+    if query_len < _SM70_79T_MIN_PADDED_QUERY_LEN:
+        return None
+    for width in sorted(_SM70_79T_EXACT_WIDTHS):
+        if _sm70_79t_width_floor(width) < query_len <= width:
+            return width
+    return None
+
+
+def _get_sm70_79t_exact_width_op(width: int):
+    """Resolve the native Q<width> specialization for an added width.
+
+    Returns None when the running extension predates the variant, so the
+    caller silently keeps the previous route.
+    """
+    if width in _sm70_79t_exact_width_ops:
+        return _sm70_79t_exact_width_ops[width]
+    op = None
+    op_name = f"sm70_d256_gqa_architecture_q{width}_fwd"
+    try:
+        if not hasattr(torch.ops._vllm_fa2_C, op_name):
+            _get_sm70_splitd_d256_ops()
+        if _sm70_gqa_has_fp32_accumulation() and hasattr(
+            torch.ops._vllm_fa2_C, op_name
+        ):
+            op = getattr(torch.ops._vllm_fa2_C, op_name, None)
+    except (AttributeError, ImportError, RuntimeError):
+        op = None
+    _sm70_79t_exact_width_ops[width] = op
+    return op
 
 
 def _get_sm70_v37_e4m3_bridge_op():
@@ -1606,9 +1756,24 @@ def _should_use_prefill_d256_gqa_architecture(
             and max_seqlen_k % 32 == 0
         )
     else:
+        # The added Q2560/Q3072/Q4096 widths serve chunks down to 3/4 of their
+        # length by padding them up to the width.  The operator's KV bound is
+        # the width it was compiled for, so the padded length must not exceed
+        # the sequence length -- the extra clause rejects a chunk that *is* the
+        # whole sequence, where padding would ask for more KV than exists.
+        added_width = _sm70_79t_padded_width_for(max_seqlen_q)
+        added_width_allowed = (
+            added_width is not None and added_width <= max_seqlen_k
+        )
         shape_allowed = (
-            _SM70_79T_CORE_QUERY_LEN <= max_seqlen_q <= _SM70_79T_MAX_QUERY_LEN
-            and max_seqlen_q <= max_seqlen_k <= 262144
+            (
+                _SM70_79T_CORE_QUERY_LEN
+                <= max_seqlen_q
+                <= _SM70_79T_MAX_QUERY_LEN
+            )
+            or added_width_allowed
+        ) and (
+            max_seqlen_q <= max_seqlen_k <= 262144
             and max_seqlen_k % _SM70_79T_KV_ALIGNMENT == 0
         )
     return (
@@ -1786,12 +1951,14 @@ def _run_sm70_d256_gqa_79t_dispatch(
     return out
 
 
-def _get_sm70_79t_q8192_padding_workspace(
+def _get_sm70_79t_padding_workspace(
     query: torch.Tensor,
+    width: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Right-aligning scratch tensors for the padded width dispatchers."""
     if not query.is_cuda:
         padded_query = torch.empty(
-            (query.shape[0], _SM70_79T_MAX_QUERY_LEN, *query.shape[2:]),
+            (query.shape[0], width, *query.shape[2:]),
             dtype=query.dtype,
             device=query.device,
         )
@@ -1808,14 +1975,66 @@ def _get_sm70_79t_q8192_padding_workspace(
         int(query.shape[0]),
         int(query.shape[2]),
         int(query.shape[3]),
+        int(width),
     )
-    workspace = _sm70_79t_q8192_padding_workspaces.get(cache_key)
+    workspace = _sm70_79t_padding_workspaces.get(cache_key)
     if workspace is None:
-        shape = (query.shape[0], _SM70_79T_MAX_QUERY_LEN, *query.shape[2:])
+        shape = (query.shape[0], width, *query.shape[2:])
         padded_query = torch.empty(shape, dtype=query.dtype, device=query.device)
         workspace = padded_query, torch.empty_like(padded_query)
-        _sm70_79t_q8192_padding_workspaces[cache_key] = workspace
+        _sm70_79t_padding_workspaces[cache_key] = workspace
     return workspace
+
+
+def _run_sm70_d256_gqa_79t_padded_width_dispatch(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    softmax_scale: float,
+    width: int,
+    op: Callable[..., torch.Tensor],
+) -> torch.Tensor:
+    """Run a chunk of length <= `width` through the native Q<width> operator.
+
+    The chunk is the tail of the sequence, so right-aligning it inside a
+    `width`-row query reproduces the exact causal alignment for the real rows;
+    the zeroed leading rows produce outputs that are dropped.  The caller must
+    guarantee `key.shape[1] >= width`, since the operator's own KV bound is the
+    width it was compiled for.
+    """
+    query_len = int(query.shape[1])
+    if not 0 < query_len <= width:
+        raise ValueError(
+            f"unsupported SM70 Q{width} padded dispatch length {query_len}"
+        )
+    if query_len == width:
+        return _run_sm70_gqa_groups(
+            op,
+            query,
+            key,
+            value,
+            out,
+            softmax_scale,
+            True,
+        )
+
+    padded_query, padded_out = _get_sm70_79t_padding_workspace(query, width)
+    leading_padding = width - query_len
+    padded_query[:, :leading_padding].zero_()
+    padded_query[:, leading_padding:].copy_(query)
+    _run_sm70_gqa_groups(
+        op,
+        padded_query,
+        key,
+        value,
+        padded_out,
+        softmax_scale,
+        True,
+    )
+    out.copy_(padded_out[:, leading_padding:])
+    return out
 
 
 def _run_sm70_d256_gqa_79t_q8192_dispatch(
@@ -1831,32 +2050,15 @@ def _run_sm70_d256_gqa_79t_q8192_dispatch(
     query_len = int(query.shape[1])
     if not _SM70_79T_CORE_QUERY_LEN < query_len <= _SM70_79T_MAX_QUERY_LEN:
         raise ValueError(f"unsupported SM70 Q8192 dispatch length {query_len}")
-    if query_len == _SM70_79T_MAX_QUERY_LEN:
-        return _run_sm70_gqa_groups(
-            architecture_q8192_op,
-            query,
-            key,
-            value,
-            out,
-            softmax_scale,
-            True,
-        )
-
-    padded_query, padded_out = _get_sm70_79t_q8192_padding_workspace(query)
-    leading_padding = _SM70_79T_MAX_QUERY_LEN - query_len
-    padded_query[:, :leading_padding].zero_()
-    padded_query[:, leading_padding:].copy_(query)
-    _run_sm70_gqa_groups(
-        architecture_q8192_op,
-        padded_query,
+    return _run_sm70_d256_gqa_79t_padded_width_dispatch(
+        query,
         key,
         value,
-        padded_out,
-        softmax_scale,
-        True,
+        out,
+        softmax_scale=softmax_scale,
+        width=_SM70_79T_MAX_QUERY_LEN,
+        op=architecture_q8192_op,
     )
-    out.copy_(padded_out[:, leading_padding:])
-    return out
 
 
 def _try_sm70_fa2_d256_prefill(
@@ -1964,12 +2166,55 @@ def _try_sm70_fa2_d256_prefill(
         max_seqlen_q % _SM70_79T_EXACT_QUERY_ALIGNMENT == 0
         and max_seqlen_k % _SM70_SPLITD_KV_ALIGNMENT == 0
     )
+    # The added widths accept chunks shorter than the width, so they cannot ride
+    # on the 64-token alignment carried by exact_splitd_shape_eligible; they get
+    # their own clause. Paged KV is excluded because the padded dispatchers run
+    # against a dense K/V tensor.
+    added_padded_width_eligible = (
+        not paged_kv
+        and not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+        and max_seqlen_k % _SM70_79T_KV_ALIGNMENT == 0
+        and _sm70_79t_padded_width_for(max_seqlen_q) is not None
+    )
     splitd_eligible = (
         splitd_ops is not None
         and query.ndim == 4
         and query.shape[1] == max_seqlen_q
-        and (architecture_kv_eligible or exact_splitd_shape_eligible)
+        and (
+            architecture_kv_eligible
+            or exact_splitd_shape_eligible
+            or added_padded_width_eligible
+        )
     )
+    # [opt27-v7 probe] One-shot diagnostic for the added padded widths. Fires
+    # only for a chunk inside an added width's coverage, so an engine log that
+    # never shows it means the chunk never reached this dispatcher at all,
+    # which is a different failure from being turned away here. The flags are
+    # the exact terms of the outer gate, so whichever one is False is the
+    # blocker. Remove once the route is confirmed on real traffic.
+    global _probed_sm70_79t_added_width_gate
+    if (
+        not _probed_sm70_79t_added_width_gate
+        and _sm70_79t_padded_width_for(max_seqlen_q) is not None
+    ):
+        _probed_sm70_79t_added_width_gate = True
+        logger.warning_once(
+            "SM70 added-width probe: q=%s k=%s splitd_eligible=%s "
+            "(splitd_ops=%s ndim4=%s shape1_eq=%s arch_kv=%s exact_shape=%s "
+            "added_padded=%s paged_kv=%s arch_op=%s v37=%s)",
+            max_seqlen_q,
+            max_seqlen_k,
+            splitd_eligible,
+            splitd_ops is not None,
+            query.ndim == 4,
+            query.shape[1] == max_seqlen_q,
+            architecture_kv_eligible,
+            exact_splitd_shape_eligible,
+            added_padded_width_eligible,
+            paged_kv,
+            _get_sm70_d256_gqa_architecture_op() is not None,
+            envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37,
+        )
     if splitd_eligible:
         dense_op, paged_op, splitkv3_op = splitd_ops
         splitd_result = None
@@ -2014,6 +2259,22 @@ def _try_sm70_fa2_d256_prefill(
                     and max_seqlen_q > _SM70_79T_CORE_QUERY_LEN
                     else None
                 )
+                # Added widths serve a window of shorter chunks by padding them
+                # up to the width. `architecture_padded_width` is the width to
+                # pad to; the op is only taken when the sequence is long enough
+                # to satisfy that op's own KV bound.
+                architecture_padded_width = (
+                    _sm70_79t_padded_width_for(max_seqlen_q)
+                    if architecture_op is not None
+                    and not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+                    else None
+                )
+                architecture_exact_width_op = (
+                    _get_sm70_79t_exact_width_op(architecture_padded_width)
+                    if architecture_padded_width is not None
+                    and architecture_padded_width <= max_seqlen_k
+                    else None
+                )
                 if _should_use_prefill_d256_gqa_architecture(
                     query,
                     key,
@@ -2043,6 +2304,32 @@ def _try_sm70_fa2_d256_prefill(
                                 splitd_out,
                                 softmax_scale=softmax_scale,
                                 architecture_q8192_op=architecture_q8192_op,
+                            )
+                        elif architecture_exact_width_op is not None:
+                            # [opt27-v7 probe] One-shot proof that a chunk
+                            # actually ran on an added width, with how much
+                            # padding it cost. Remove once confirmed.
+                            global _probed_sm70_79t_added_width_hit
+                            if not _probed_sm70_79t_added_width_hit:
+                                _probed_sm70_79t_added_width_hit = True
+                                logger.warning_once(
+                                    "SM70 added-width HIT: q=%s padded_to=%s "
+                                    "k=%s padding_rows=%s",
+                                    max_seqlen_q,
+                                    architecture_padded_width,
+                                    max_seqlen_k,
+                                    architecture_padded_width - max_seqlen_q,
+                                )
+                            splitd_result = (
+                                _run_sm70_d256_gqa_79t_padded_width_dispatch(
+                                    query,
+                                    key,
+                                    value,
+                                    splitd_out,
+                                    softmax_scale=softmax_scale,
+                                    width=architecture_padded_width,
+                                    op=architecture_exact_width_op,
+                                )
                             )
                         elif (
                             max_seqlen_q == _SM70_79T_CORE_QUERY_LEN
@@ -2080,6 +2367,20 @@ def _try_sm70_fa2_d256_prefill(
                             _record_route("prefill_dense_d256_gqa_v37")
                         else:
                             _record_route("prefill_dense_d256_gqa_79t_fp32")
+                            if architecture_exact_width_op is not None:
+                                # Report the width, plus a `_pad` marker when the
+                                # chunk was shorter than it, so the log tells an
+                                # exact hit apart from a window hit.
+                                _record_route(
+                                    "prefill_dense_d256_gqa_79t_fp32_q"
+                                    f"{architecture_padded_width}"
+                                    + (
+                                        ""
+                                        if max_seqlen_q
+                                        == architecture_padded_width
+                                        else "_pad"
+                                    )
+                                )
                             if max_seqlen_q > _SM70_79T_CORE_QUERY_LEN:
                                 if architecture_q8192_op is not None:
                                     _record_route(
@@ -3596,15 +3897,33 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             and spec_config.use_dflash()
         )
         selector_engine = uses_dflash_selector_engine(self.vllm_config)
+        # [opt27 restore, 2026-09-30] Widen the selector-target marker so fp16 /
+        # fp8_e5m2 KV can use the DFlash2 grouped verifier at draft widths other
+        # than the audited 7 (G27 runs NST=5, i.e. draft width 5).  The audited
+        # route required ``num_speculative_tokens in (7, 15)`` AND
+        # ``draft_tokens == 7``, which silently excluded every other width and
+        # made the grouped verifier permanently unreachable for this model.
+        #
+        # E4M3 IS DELIBERATELY EXCLUDED.  The e4m3 fast path is the repaired
+        # FP32-partial route, whose admission in ``_smallq_decode_xqa_allowed``
+        # requires ``not is_dflash_selector_target``.  Flipping the marker under
+        # e4m3 would *disable* that route rather than enable anything, and the
+        # legacy verifier it guards stores FP16 partials (wrong for e4m3).
+        _target_kv_dtype = str(getattr(cache_config, "cache_dtype", "") or "")
+        _legacy_verify_eligible = not _target_kv_dtype.startswith("fp8_e4m3")
         self._is_dflash_selector_target = bool(
-            use_dflash
+            _legacy_verify_eligible
+            and use_dflash
             and not self._is_speculative_draft_model
-            and getattr(spec_config, "num_speculative_tokens", None) in (7, 15)
-            and get_dflash_model_draft_tokens(spec_config) == 7
+            and getattr(spec_config, "num_speculative_tokens", None)
+            in (1, 2, 3, 4, 5, 6, 7, 15)
+            and get_dflash_model_draft_tokens(spec_config) in (1, 2, 3, 4, 5, 6, 7, 15)
             and selector_engine
         )
         self._use_sm70_dflash2_fused_smallq_metadata = bool(
-            envs.VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA
+            sm70_dflash2_enabled(
+                "fused_smallq_metadata", capture_sm70_dflash2_config(self.vllm_config)
+            )
             and self.device.type == "cuda"
             and current_platform.is_device_capability(70)
             and use_dflash
@@ -4700,8 +5019,22 @@ def prepare_dflash2_smallq_group_metadata(
         )
 
     if (
-        not envs.VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA
-        or not envs.VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA
+        not sm70_dflash2_enabled(
+            "fused_smallq_metadata",
+            capture_sm70_dflash2_config(
+                getattr(builders_by_group[0][1], "vllm_config", None)
+            )
+            if builders_by_group
+            else None,
+        )
+        or not sm70_dflash2_enabled(
+            "grouped_smallq_metadata",
+            capture_sm70_dflash2_config(
+                getattr(builders_by_group[0][1], "vllm_config", None)
+            )
+            if builders_by_group
+            else None,
+        )
         or not builders_by_group
         or num_reqs <= 0
         or num_query_tokens <= 1
@@ -5829,21 +6162,47 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 num_query_tokens if num_reqs == 1 else 0,
             )
         )
-        single_request_shape = bool(
-            num_reqs == 1
-            and num_query_tokens in (8, 16)
-            and num_query_tokens <= self.dflash2_grouped_verify_max_query_tokens
+        # [opt27 restore, 2026-10-01] Query-width admission MUST mirror the
+        # operator's own guard (flash-attn-v100/kernel/flash_decode_paged.cu:4641):
+        #     batch_size == 1 ? q <= kGroupedVerifyMaxSupportedQ : q == kGroupedVerifyQ8MaxQ
+        # i.e. B1 admits up to q16, but *batched* requests require q == 8 EXACTLY.
+        # An earlier over-broad "2..8 or 16" relaxation admitted q6 (G27 is NST=5,
+        # i.e. 8 reqs x q6 = 48 rows) and crashed the worker on startup with
+        # "grouped verify requires q1..q16 for B1 or request-major q8 for batches".
+        # Consequence to keep in mind: at NST=5 the grouped verifier is
+        # unreachable for batches *by kernel contract*, independent of KV dtype,
+        # the selector-target marker, or the page-size whitelist.
+        _num_requests = (
+            int(block_table.shape[0])
+            if block_table is not None and block_table.ndim == 2
+            else 0
         )
-        batched_request_shape = bool(
-            self.use_dflash2_batched_grouped_verify
-            and self.dflash2_grouped_verify_request_major_abi_version >= 1
-            and num_reqs in (2, 4, 8)
-            and max_query_len == 8
-            and num_query_tokens == num_reqs * 8
+        _q_per_req = num_query_tokens // _num_requests if _num_requests > 0 else 0
+        # The default launch is the PER-REQUEST loop (opt27-v4 behaviour), so
+        # every kernel call sees batch_size == 1 and the operator takes its
+        # `q <= kGroupedVerifyMaxSupportedQ` branch -- q1..q16 are all legal,
+        # including NST=5's q6.  Only the optional request-major batched launch
+        # (q == 8) would hit the stricter batch branch.
+        _shape_ok = bool(
+            _num_requests > 0
+            and num_query_tokens % _num_requests == 0
+            and 1 <= _q_per_req <= self.dflash2_grouped_verify_max_query_tokens
         )
+        # [opt27 restore] Storage dtype and declared KV dtype must agree.  This
+        # mirrors opt27-v4.patch verbatim: fp8_kv deliberately includes E4M3.
+        # (I previously excluded e4m3 here from an upstream comment about FP32
+        # partials -- that was wrong; the validated opt27 gate admits e4m3.)
+        _cache_is_fp16 = (
+            key_cache.dtype == torch.float16 and value_cache.dtype == torch.float16
+        )
+        _cache_is_fp8 = (
+            key_cache.dtype == torch.uint8 and value_cache.dtype == torch.uint8
+        )
+        fp16_kv = self.kv_cache_dtype in ("auto", "float16", "bfloat16") and _cache_is_fp16
+        fp8_kv = self.kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2") and _cache_is_fp8
         allowed = bool(
             self.use_dflash2_grouped_verify
-            and (single_request_shape or batched_request_shape)
+            and _shape_ok
             and self.flash_attn_grouped_verify_paged is not None
             and getattr(attn_metadata, "is_dflash_selector_target", False)
             and getattr(attn_metadata, "max_model_len", 0)
@@ -5857,20 +6216,34 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and value_cache.ndim == 4
             and key_cache.device == query.device
             and value_cache.device == query.device
-            # q15 LABD increases the aligned hybrid-cache page from the
-            # block-8 service's 1648/3296 layout to 1728/3456. The grouped
-            # operator's runtime-stride implementation is exact for both.
-            and key_cache.shape[1] in (1648, 1728, 3296, 3456)
+            # [opt27 restore] Dtype-aware page whitelist; see
+            # _DEFAULT_GROUPED_VERIFY_{FP16,FP8}_PAGES.  q15 LABD raises the
+            # aligned hybrid page from the block-8 service's 1648/3296 layout to
+            # 1728/3456 for fp8, while fp16 keeps the unquantized layout (448
+            # locally).  The operator's runtime-stride implementation is exact
+            # for every page width, so this set only makes the accepted layouts
+            # explicit; VLLM_FLASH_V100_GROUPED_VERIFY_PAGES extends it.
+            and (
+                (
+                    fp16_kv
+                    and key_cache.shape[1]
+                    in _grouped_verify_pages(_DEFAULT_GROUPED_VERIFY_FP16_PAGES)
+                )
+                or (
+                    fp8_kv
+                    and key_cache.shape[1]
+                    in _grouped_verify_pages(_DEFAULT_GROUPED_VERIFY_FP8_PAGES)
+                )
+            )
             and tuple(key_cache.shape[2:]) == (1, 256)
             and tuple(value_cache.shape) == tuple(key_cache.shape)
-            and key_cache.dtype == torch.uint8
-            and value_cache.dtype == torch.uint8
             and key_cache.stride(-1) == 1
             and value_cache.stride(-1) == 1
             # This legacy verifier stores normalized partials in FP16.
-            # E4M3 must reach the repaired FP32 path below, including when
-            # the old native entry advertises E4M3 byte-format support.
-            and self.kv_cache_dtype == "fp8_e5m2"
+            # E4M3 must reach the repaired FP32 path instead, including when the
+            # old native entry advertises E4M3 byte-format support -- hence the
+            # deliberate exclusion of e4m3 below and in the marker guard.
+            and (fp16_kv or fp8_kv)
             and block_table is not None
             and block_table.ndim == 2
             and block_table.shape[0] == num_reqs
@@ -5933,28 +6306,75 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     ) -> None:
         global _logged_prefill_smallq_grouped_verify
         num_reqs = int(attn_metadata.block_table.shape[0])
+        q_per = max(query.shape[0] // max(num_reqs, 1), 1)
+        # [opt27 restore, 2026-10-01] Two launch forms coexist by design:
+        #   * request-major batched -- PRIMARY (one kernel launch per step).
+        #   * per-request loop      -- our own fallback, kept because it is
+        #     independently meaningful: every call carries batch_size == 1, so
+        #     the operator admits q1..q16 and correct behaviour never depends
+        #     on the batched host gate.
+        # Force either explicitly: VLLM_DFLASH2_VERIFY_BATCHED=0 pins the loop.
+        #
+        # The batched form is admitted by ABI so an older build cannot be
+        # batched into a host TORCH_CHECK crash:
+        #   abi >= 1 -> batched is q8-only
+        #   abi >= 2 -> batched admits q1..q8 (relaxed host gate + query-row
+        #               stride uses query_len)
+        # q_per > 8 with several requests stays on the loop (batch_size == 1).
+        _batched_abi = getattr(
+            self, "dflash2_grouped_verify_request_major_abi_version", 0
+        )
+        _verify_batched_enabled = bool(
+            getattr(self, "use_dflash2_batched_grouped_verify", False)
+            or envs.VLLM_DFLASH2_VERIFY_BATCHED
+        )
+        use_batched = bool(
+            num_reqs > 1
+            and 1 <= q_per <= 8
+            and _verify_batched_enabled
+            and _batched_abi >= (2 if q_per < 8 else 1)
+        )
         if not _logged_prefill_smallq_grouped_verify:
             logger.info(
                 "FLASH_ATTN_V100 DFlash2 exact grouped verifier active "
-                "(request-major B%d/q%d/H6/Hkv1/D256, %s KV, one-pass).",
+                "(%s: %d reqs x q%d/H6/Hkv1/D256, %s KV, one-pass).",
+                "request-major batched" if use_batched else "per-request loop",
                 num_reqs,
-                query.shape[0] // num_reqs,
+                q_per,
                 self.kv_cache_dtype,
             )
             _logged_prefill_smallq_grouped_verify = True
-        self.flash_attn_grouped_verify_paged(
-            query,
-            key_cache,
-            value_cache,
-            attn_metadata.block_table[:num_reqs],
-            attn_metadata.seq_lens[:num_reqs],
-            softmax_scale=self.scale,
-            out=out,
-            kv_cache_dtype=self.kv_cache_dtype,
-            k_scale=float(layer._k_scale_float),
-            v_scale=float(layer._v_scale_float),
-            one_pass=True,
-        )
+        if use_batched:
+            self.flash_attn_grouped_verify_paged(
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata.block_table[:num_reqs],
+                attn_metadata.seq_lens[:num_reqs],
+                softmax_scale=self.scale,
+                out=out,
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=float(layer._k_scale_float),
+                v_scale=float(layer._v_scale_float),
+                one_pass=True,
+            )
+        else:
+            for req in range(num_reqs):
+                q0 = req * q_per
+                q1 = q0 + q_per
+                self.flash_attn_grouped_verify_paged(
+                    query[q0:q1],
+                    key_cache,
+                    value_cache,
+                    attn_metadata.block_table[req : req + 1],
+                    attn_metadata.seq_lens[req : req + 1],
+                    softmax_scale=self.scale,
+                    out=out[q0:q1],
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    k_scale=float(layer._k_scale_float),
+                    v_scale=float(layer._v_scale_float),
+                    one_pass=True,
+                )
         _log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "dflash2_grouped_verify")
         _record_route("prefill_smallq_dflash2_grouped_verify")
 

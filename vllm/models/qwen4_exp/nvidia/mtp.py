@@ -226,6 +226,7 @@ def _make_draft_vllm_config(
     draft_vllm_config = replace(
         vllm_config,
         model_config=speculative_config.draft_model_config,
+        is_speculative_draft=True,
     )
     # VllmConfig post-init derives the target quant config, so restore the
     # independently resolved draft quant config after replacement.
@@ -643,6 +644,12 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor:
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+
+    def skip_checkpoint_weight(self, name: str) -> bool:
+        # The drafter ships inside its target's checkpoint; without this the
+        # loader reads the whole target again only for load_weights to drop
+        # everything but the MTP tensors.
+        return _remap_mtp_weight_name(name) is None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():

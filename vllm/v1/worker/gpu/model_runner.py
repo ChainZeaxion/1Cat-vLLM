@@ -86,6 +86,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     get_explicit_cudagraph_memory_reserve,
     get_uniform_decode_token_count,
 )
+from vllm.v1.worker.gpu.decode_step_profile import get_profiler
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
 from vllm.v1.worker.gpu.input_batch import (
@@ -175,6 +176,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.use_async_scheduling = self.scheduler_config.async_scheduling
         self.output_copy_stream = torch.cuda.Stream(self.device)
+
+        # Diagnostic only: per-step stage breakdown, disabled unless
+        # VLLM_DECODE_STEP_PROFILE=1. Never affects inference behavior.
+        self._prof = get_profiler("mrv2")
 
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -441,7 +446,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def _setup_ple_offload(self, ipc_addr: str) -> None:
         """Attach the shared CPU PLE worker to address-stable MRV2 inputs."""
+        from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
         from vllm.v1.ple_offload.connector import PleOffloadConnector
+
+        if not any(
+            isinstance(module, PleOffloadLayer) for module in self.model.modules()
+        ):
+            # PLE layers sit on the first pipeline stage. Later stages have
+            # nothing to connect and must not register: the worker expects
+            # exactly one registration per stage-0 rank.
+            logger.info("PleOffload: no PleOffloadLayer on this rank, no connector")
+            return
 
         query_start_loc_source = getattr(self.model_state, "ple_query_start_loc", None)
         ngram_context_source = getattr(self.model_state, "ngram_context", None)
@@ -1476,6 +1491,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            # Diagnostic only (no-op unless VLLM_DECODE_STEP_PROFILE=1).
+            self._prof.begin_step(
+                len(scheduler_output.num_scheduled_tokens),
+                scheduler_output.total_num_scheduled_tokens,
+            )
             # Update the request states.
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)
@@ -1485,9 +1505,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.block_tables.apply_staged_writes()
             if scheduler_output.new_block_ids_to_zero:
                 self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            self._prof.cpu("req_states")
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
+                self._prof.end_step("empty")
                 return empty_output
 
         # Get batch descriptor and sync across DP ranks.
@@ -1513,6 +1535,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
         )
+        self._prof.cpu("batch_desc")
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
@@ -1524,6 +1547,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            self._prof.cpu("prepare_inputs")
+            self._prof.set_decode(not input_batch.is_prefilling_np.any())
             if (
                 self._ple_offload_connector is not None
                 and batch_desc.cg_mode != CUDAGraphMode.FULL
@@ -1540,6 +1565,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dummy_run=False,
                 )
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+            self._prof.cpu("prepare_attn")
             # Hybrid Mamba align-mode prefix caching migrates recurrent state
             # across block boundaries before attention metadata consumes it.
             self.model_state.preprocess_state(
@@ -1548,6 +1574,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_cache_config,
                 self.req_states.num_computed_tokens.gpu,
             )
+            self._prof.cpu("preprocess_state")
 
             if self.lora_config:
                 # Activate LoRA adapters.
@@ -1615,6 +1642,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.attn_groups,
                 self.kv_cache_config,
             )
+        self._prof.cpu("attn_metadata")
 
         inputs_embeds = None
         if self.supports_mm_inputs and self.is_first_pp_rank:
@@ -1627,6 +1655,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch,
                 self.req_states,
             )
+        self._prof.cpu("mm_embeds")
 
         model_inputs = {
             "input_ids": input_batch.input_ids,
@@ -1640,6 +1669,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else self.model_state.prepare_inputs(input_batch, self.req_states)
             ),
         }
+        self._prof.cpu("model_inputs")
         if self._ple_offload_connector is not None and early_ple_model_inputs is None:
             self._ple_offload_connector.prepare_forward(
                 input_batch.num_reqs,
@@ -1685,6 +1715,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         mtp_target_start = self._sm70_v2_mtp_profile_start(mtp_profile_ctx)
 
         # Run model.
+        self._prof.gpu_begin("target_forward")
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
@@ -1714,6 +1745,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ):
                 self.kv_connector.pre_forward(scheduler_output)
                 model_output = self.model(**model_inputs)
+        self._prof.gpu_end("target_forward")
+        self._prof.cpu("forward_submit")
 
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.release_outputs()
@@ -1745,6 +1778,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
         )
+        self._prof.cpu("state_pack")
+        # Diagnostic: hand this RPC's accumulation to sample_tokens.
+        self._prof.carry_over()
         self._sm70_v2_mtp_profile_pending = mtp_profile_ctx
 
         if not self.is_last_pp_rank:
@@ -1762,6 +1798,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return None
 
         input_batch = self.execute_model_state.input_batch
+        self._prof.begin_sample()
+
         attn_metadata = self.execute_model_state.attn_metadata
         slot_mappings_by_layer = self.execute_model_state.slot_mappings_by_layer
         hidden_states = self.execute_model_state.hidden_states
@@ -1789,6 +1827,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Last rank: sample tokens
+        self._prof.gpu_begin("sample")
         if isinstance(self.speculator, DFlash2Speculator):
             self.speculator.prepare_target_context(
                 input_batch, hidden_states, aux_hidden_states
@@ -1797,6 +1836,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        self._prof.gpu_end("sample")
+        self._prof.cpu("sample")
         self._sm70_v2_mtp_profile_finish(
             mtp_profile_ctx, "target_sample", mtp_sample_start
         )
@@ -1831,6 +1872,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
         )
+        self._prof.cpu("output_copy_submit")
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
         if self.speculator is not None and self.speculator.supports_mm_inputs:
@@ -1855,6 +1897,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # ensuring that `copy_event` is recorded before calling postprocess.
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
+        self._prof.gpu_begin("postprocess")
         mtp_state_update_start = self._sm70_v2_mtp_profile_start(mtp_profile_ctx)
         self.postprocess_sampled(
             input_batch.idx_mapping,
@@ -1866,6 +1909,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._sm70_v2_mtp_profile_finish(
             mtp_profile_ctx, "target_state_update", mtp_state_update_start
         )
+        self._prof.gpu_end("postprocess")
+        self._prof.cpu("postprocess")
         if mtp_profile_ctx is not None:
             # Profiling is explicit and diagnostic-only. This fence turns the
             # target phase into a directly comparable wall measurement while
@@ -1888,6 +1933,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+            self._prof.gpu_begin("draft_propose")
             mtp_draft_start = self._sm70_v2_mtp_profile_start(mtp_profile_ctx)
             draft_tokens = self.speculator.propose(
                 input_batch,
@@ -1921,6 +1967,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     else None
                 ),
             )
+            self._prof.gpu_end("draft_propose")
+            self._prof.cpu("draft_propose")
             self._sm70_v2_mtp_profile_finish(
                 mtp_profile_ctx, "draft_total", mtp_draft_start
             )
@@ -1933,6 +1981,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 draft_tokens,
                 num_draft_tokens=num_draft_tokens,
             )
+            self._prof.cpu("set_draft")
 
         if self.pp_handler is not None:
             # The drafter only runs on the last PP rank. Send its device-side
@@ -1962,8 +2011,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._sm70_v2_mtp_profile_report(mtp_profile_ctx)
 
         if self.use_async_scheduling:
+            self._prof.end_step("return-without-sync")
             return async_output
-        return async_output.get_output()
+        _prof_out = async_output.get_output()
+        self._prof.cpu("d2h_sync")
+        self._prof.end_step()
+        return _prof_out
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.draft_tokens_handler.get_draft_tokens()

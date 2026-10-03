@@ -2184,8 +2184,15 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     const int local_head = row % Traits::kHeadsPerCta;
     const int head_idx = head_start + local_head;
     if (token_idx < query_len && head_idx < kGroupedVerifyHeads) {
+      // [opt27 stride fix] The query tensor is laid out as
+      // [batch_size * query_len, H, D], so the per-request stride is the
+      // ACTUAL query_len, not the schedule's MAX_QUERY_TOKENS template
+      // constant. Using MAX_QUERY_TOKENS reads the wrong request's rows
+      // whenever query_len < MAX_QUERY_TOKENS (e.g. NST=5 -> q6 under the q8
+      // schedule) -- an out-of-range read at high batch. Upstream still has
+      // the buggy constant form; the 09-29 merge lost our local fix.
       const int64_t query_row =
-          static_cast<int64_t>(group_idx) * MAX_QUERY_TOKENS + token_idx;
+          static_cast<int64_t>(group_idx) * query_len + token_idx;
       shared_q_vec[row * kSharedQVecsPerRow + vec_col] = __ldg(
           q_vec + (query_row * kGroupedVerifyHeads + head_idx) * kVecsPerRow +
           vec_col);
@@ -4591,7 +4598,19 @@ int64_t flash_attention_grouped_verify_max_query_tokens() {
   return kGroupedVerifyMaxSupportedQ;
 }
 
-int64_t flash_attention_grouped_verify_request_major_abi_version() { return 1; }
+int64_t flash_attention_grouped_verify_request_major_abi_version() {
+  // Version 1: request-major batched grouped verifier, but the host gate
+  //            required `query_len == 8` for batched requests, so any spec
+  //            width below 8 (G27 NST=5 -> q6) fell back to the per-request
+  //            loop.
+  // Version 2: the host gate admits `query_len <= kGroupedVerifyQ8MaxQ` for
+  //            batched requests, and the partial kernel indexes the query with
+  //            the real `query_len` instead of the MAX_QUERY_TOKENS template
+  //            constant. Callers may therefore use the batched launch for any
+  //            q1..q8 batch; the version lets Python refuse to batch an older
+  //            (== 8 only) build instead of crashing in the host TORCH_CHECK.
+  return 2;
+}
 
 int64_t flash_attention_grouped_sparse_page4_abi_version() {
   // Version 1 accepted FP16 K/V through the nine-argument forward binding.
@@ -4638,10 +4657,18 @@ at::Tensor flash_attention_grouped_verify_paged(
                   q.size(2) == kGroupedVerifyHeadDim,
               "grouped verify q must have shape [batch * query, 6, 256]");
   const int64_t query_len = q.size(0) / batch_size;
+  // [opt27 restore] Batches admit any q up to the q8 schedule, not only q==8.
+  // The 09-29 upstream merge reverted our local relaxation
+  // (`query_len <= kGroupedVerifyQ8MaxQ` -> `== kGroupedVerifyQ8MaxQ`), which
+  // broke the request-major grouped verifier for every spec width below 8
+  // (G27 NST=5 -> q6). The q8 schedule is templated on MAX_QUERY_TOKENS and
+  // masks the unused rows via `token_idx < query_len`, so a shorter per-request
+  // width is safe once the query-row stride uses query_len (see the stride fix
+  // in the partial kernel).
   TORCH_CHECK(
       batch_size == 1 ? query_len <= kGroupedVerifyMaxSupportedQ
-                      : query_len == kGroupedVerifyQ8MaxQ,
-      "grouped verify requires q1..q16 for B1 or request-major q8 for batches");
+                      : query_len <= kGroupedVerifyQ8MaxQ,
+      "grouped verify requires q1..q16 for B1 or request-major q<=8 for batches");
   const bool wide_query = query_len > kGroupedVerifyQ8MaxQ;
   const int max_query_tokens =
       wide_query ? kGroupedVerifyQ16MaxQ : kGroupedVerifyQ8MaxQ;

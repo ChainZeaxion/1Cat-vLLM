@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import os
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable, Iterable
@@ -1310,12 +1311,104 @@ def _load_chat_template(
 _cached_load_chat_template = lru_cache(_load_chat_template)
 
 
+# [opt28] Chat template hot reload.
+#
+# `--chat-template` is read exactly once during startup and every serving object
+# keeps its own copy, so editing the file had no effect until a full restart.
+# These globals let the server follow the file instead: the source path is
+# remembered when it is first loaded, and the API server's middleware calls
+# `refresh_hot_chat_template()` before each request to pick up edits.
+#
+# Enabled by `VLLM_CHAT_TEMPLATE_HOT_RELOAD=1`. The switch is an environment
+# variable on purpose: reload is driven by watching the file, so it needs no
+# HTTP endpoint and therefore adds no request surface that would otherwise have
+# to be authenticated. Cost when enabled is one `stat` per request.
+_HOT_CHAT_TEMPLATE_ENV = "VLLM_CHAT_TEMPLATE_HOT_RELOAD"
+_HOT_CHAT_TEMPLATE_SOURCE: str | None = None
+_HOT_CHAT_TEMPLATE_MTIME: int = -1
+_HOT_CHAT_TEMPLATE_CONTENT: str | None = None
+
+
+def hot_chat_template_enabled() -> bool:
+    """Whether file-watching chat template reload is turned on."""
+    return os.getenv(_HOT_CHAT_TEMPLATE_ENV, "0") == "1"
+
+
+def _remember_hot_chat_template_source(
+    chat_template: Path | str | None, content: str
+) -> None:
+    """Record which file the resolved template came from, for hot reload."""
+    global _HOT_CHAT_TEMPLATE_SOURCE, _HOT_CHAT_TEMPLATE_MTIME
+    global _HOT_CHAT_TEMPLATE_CONTENT
+    if not hot_chat_template_enabled():
+        return
+    try:
+        path = Path(str(chat_template))
+        if not path.is_file():
+            return
+        mtime = path.stat().st_mtime_ns
+    except (OSError, TypeError, ValueError):
+        return
+    _HOT_CHAT_TEMPLATE_SOURCE = str(path)
+    _HOT_CHAT_TEMPLATE_MTIME = mtime
+    _HOT_CHAT_TEMPLATE_CONTENT = content
+    logger.info(
+        "Chat template hot reload is ON, watching %s. Edit the file and the "
+        "next request picks it up -- no restart needed.",
+        path,
+    )
+
+
+def refresh_hot_chat_template() -> bool:
+    """Re-read the chat template file when it changed on disk.
+
+    Returns True only when the file's mtime moved, so the caller can skip
+    touching the serving objects on every request; a rewrite that leaves the
+    content identical still returns True, but the pushed value is then
+    unchanged and costs nothing.
+    A missing or unreadable file is ignored: the last good template stays in
+    use rather than taking the server down.
+    """
+    global _HOT_CHAT_TEMPLATE_MTIME, _HOT_CHAT_TEMPLATE_CONTENT
+    if not hot_chat_template_enabled():
+        return False
+    source = _HOT_CHAT_TEMPLATE_SOURCE
+    if source is None:
+        return False
+    try:
+        mtime = os.stat(source).st_mtime_ns
+        if mtime == _HOT_CHAT_TEMPLATE_MTIME:
+            return False
+        with open(source, encoding="utf-8") as handle:
+            content = handle.read()
+    except OSError:
+        return False
+    _HOT_CHAT_TEMPLATE_CONTENT = content
+    _HOT_CHAT_TEMPLATE_MTIME = mtime
+    logger.info(
+        "Chat template hot-reloaded from %s (%d bytes). Note: the prompt prefix "
+        "changed, so prefix cache entries will miss until the new prefix is "
+        "re-cached.",
+        source,
+        len(content),
+    )
+    return True
+
+
+def current_hot_chat_template() -> str | None:
+    """Latest hot-reloaded template content, or None if none was registered."""
+    return _HOT_CHAT_TEMPLATE_CONTENT
+
+
 def load_chat_template(
     chat_template: Path | str | None,
     *,
     is_literal: bool = False,
 ) -> str | None:
-    return _cached_load_chat_template(chat_template, is_literal=is_literal)
+    resolved = _cached_load_chat_template(chat_template, is_literal=is_literal)
+    if not is_literal and resolved is not None:
+        _remember_hot_chat_template_source(chat_template, resolved)
+    return resolved
 
 
 def _get_interleaved_text_prompt(

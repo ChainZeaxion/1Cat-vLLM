@@ -38,13 +38,362 @@ from vllm.tool_parsers.utils import (
     extract_types_from_schema,
     find_common_prefix,
     find_tool_properties,
+    find_tool_required,
+    request_forbids_tool_calls,
+    split_incomplete_tool_tag_tail,
 )
 
 logger = init_logger(__name__)
 
+def _normalize_qwen3_tag_names(text: str) -> str:
+    """opt22: map Anthropic-style tool-call tag names to the equals form
+    this parser's regexes expect (toolcall->tool_call, tool name="X"->function=X,
+    param name="X"->parameter=X, closing tool/param->function/parameter). Native
+    and unrelated text are left untouched.
+    """
+    if not text:
+        return text
+    e = re.sub(r'<tool name="([^"]*)">', r'<function=\1>', text)
+    e = re.sub(r'<param name="([^"]*)">', r'<parameter=\1>', e)
+    e = re.sub(r'<toolcall>', '<tool_call>', e)
+    e = re.sub(r'</toolcall>', '</tool_call>', e)
+    e = re.sub(r'</tool>', '</function>', e)
+    e = re.sub(r'</param>', '</parameter>', e)
+    return e
+
+
+# opt22d: 预编译“形似工具调用”标签匹配（模块级；含无右尖括号的截断残片分支）
+_TOOL_LIKE_TAG_RE = re.compile(
+    r"</?(?:tool_call|toolcall|tool|function|parameter|param)\b[^<>]*?/?>"
+    r"|</?(?:tool_call|toolcall|tool|function|parameter|param)\b[^<>]*$"
+)
+
+# opt22e：遮罩的**等长哨兵**。把工具类标签的 `<` / `>` 换成私有区单字符，
+# 而非 `⟨'` / `'⟩`（2 字符）。
+# **为何必须等长**：遮罩文本既用于「结构扫描」也用于「参数值切片」，而 partial
+# 流式路径靠 `_partial_emit_offset` 在遮罩文本上做**跨帧偏移累计**。一旦遮罩改变
+# 长度（或围栏开合导致已遮罩段回落），偏移即失配 ⇒ 重复/漏发（实测线上 args 翻倍、
+# `Extra call` 内容错位）。等长后：遮罩坐标 ≡ 原文坐标，偏移天然稳定。
+# 展示形（`⟨'…'⟩`）只在**最终输出**时由 `_to_display` 转换。
+_SENT_LT = "\ue000"
+_SENT_GT = "\ue001"
+
+
+# opt22d 第七轮：抓取“已闭合”的函数名标签（归一化后形如 <function=NAME>）。
+# 用于判断本轮出现的工具是否落在需要流式增量显示的白名单内。
+# 要求右尖括号：分片中的 <function=Wri 不算已确名的工具，避免误判。
+_FN_TAG_RE = re.compile(r"<function=([A-Za-z0-9_.\-]+)>")
+
+# opt22d 第八轮（L-D for coder）：裸标签的行首约束。
+# 同时匹配 <tool_call> 与 <function=（`>?` 兼容分片中的未闭合形式；
+# 闭合与否都要整块纳入匹配，否则 `>` 会被留在原文里、产出 `⟨'function=X>` 畸形）。
+_LD_TAG_RE = re.compile(r"<tool_call>|<function=[A-Za-z0-9_.\-]*>?")
+
+
+# opt22e A：结构标签（闭合/开标签）——判"是否出现正文"时须先剔除，
+# 否则 `</function>` / `</tool_call>` 这类**空结构**会被当成正文
+# （实测：`\n<parameter=command>…</parameter>\n</function>\n` 的尾段
+# `\n</function>\n` 被误判为正文 ⇒ 同轮多调用被误伤）。
+_STRUCT_TAG_RE = re.compile(r"</?(?:function|tool_?call|parameter)\b[^<>]*>")
+
+
+def _strip_struct_tags(text: str) -> str:
+    """剔除结构标签，仅保留可能的正文。"""
+    return _STRUCT_TAG_RE.sub("", text)
+
+
+def _has_toplevel_prose(seg: str, depth: int) -> bool:
+    """opt22e A：``seg`` 中是否存在**参数体外**（顶层）的非空白文本。
+
+    必须逐段跟踪深度 —— 直接把整段 ``seg`` 判为"顶层文本"是错的：两次
+    ``<tool_call>``/``<function=`` 匹配之间往往横跨整个参数体
+    （``\n<parameter=command>\necho one\n</parameter>\n</function>``），
+    那属于**参数值内容**，不是顶层正文。
+    ⚠️ 踩坑：首版用「``_seg.strip()`` 非空」判定，导致**同轮多调用**被误伤 ——
+    第二个调用的 ``_seg`` 含前一个调用的参数体 ⇒ 误判为"已出现正文" ⇒
+    后续调用被转义、**丢掉真实调用**（实测 A2/A4 双调用只剩 1 个）。
+    """
+    d = depth
+    k = 0
+    for m in re.finditer(r"<parameter=|</parameter>", seg):
+        if d == 0 and _strip_struct_tags(seg[k : m.start()]).strip():
+            return True
+        d += 1 if m.group(0).startswith("<parameter=") else -1
+        if d < 0:
+            d = 0
+        k = m.end()
+    return d == 0 and bool(_strip_struct_tags(seg[k:]).strip())
+
+
+def _escape_non_linestart_tool_calls(text: str, *, streaming: bool = True) -> str:
+    """opt22d 第八/九轮（L-D）：**双重必要条件**收紧后，把其余裸标签一律转义。
+
+    真调用需**同时满足**：结构特征 + 位置特征。二者缺一即为展示性文本，
+    转义后并入 content（用户仍可见，但下游不执行）。
+
+    | 标签 | 位置特征 | 结构特征 |
+    |---|---|---|
+    | ``<tool_call>`` | 行首 | **后跟 `<function=`**（允许中间空白） |
+    | 独立 ``<function=`` | 行首 | **有 `</function>` 闭合** |
+    | 被 ``<tool_call>`` 包裹的 ``<function=`` | —（继承包裹的位置） | — |
+
+    **依据（2026-09-18 实测）**：
+      - chat template 的三种注入写法均为 ``\\n\\n<tool_call>\\n<function=``（行首 + 紧跟 function）；
+      - 8 条真实调用提示词 → 标签 **8/8 行首**；
+      - **最强同行诱导**（明确要求"说明文字与调用之间不要换行"）3 例 × 5 次
+        → 真实调用 **15/15 成功**：模型受模板格式支配，即便用户要求紧凑也自动换行。
+
+    **为何必须同时覆盖 `<function=`**：``_get_function_calls`` 有退避分支——
+    找不到 ``<tool_call>`` 时把**整段输出**当候选，再用
+    ``tool_call_function_regex`` 抽 ``<function=``。故围栏外的裸
+    ``<function=Write>`` 同样会产出（参数为空的）调用（实测 E1 曾产出 3 个空 ``Write``）。
+
+    **为何 `<tool_call>` 也影响正文**：``tool_call_regex`` 含 ``<tool_call>(.*?)$``
+    分支（匹配到文本结尾），故**孤立、未闭合**的 ``<tool_call>`` 也会让 impl 进入
+    调用解析模式、**停止输出正文**（实测：模型只输出一行 ``<tool_call>`` 时，
+    非流式正常转义输出 13 字符，**流式 0 字符**）。
+
+    展示性示例常写成行内代码或表格（``| `<tool_call>` |``），其 ``<`` 前有 ``|``
+    与反引号 ⇒ 非行首 ⇒ 降级。
+
+    Args:
+        text: 待处理文本。
+        streaming: 流式下标签可能尚未写全（判据未到齐），此时**暂存**该尾部
+            （从输出中摘除、保持前缀关系），待判据到齐后再决定；非流式下
+            全文已知，直接判定。
+    """
+    if not text:
+        return text
+    out: list[str] = []
+    last = 0
+    wrapper = False  # 前一个被放行的开标签是“行首的 <tool_call>”
+    # opt22e：**参数体深度**。>0 表示当前处于某个 `<parameter=…>` 内部 —— 那里
+    # 的内容是**文档正文**，其中的 `<function=` / `<tool_call>` 是示例，一律按
+    # 展示文本转义。
+    # 为何需要：本函数原判据「行首 + 有 `</function>` ⇒ 真实调用」在**参数体内
+    # 同样成立** ⇒ 文档里原样写的示例（行首的 `<function=Bash>…</function>`）
+    # 被放行成真实调用，产出**空参数的幽灵调用**（实测线上 1/6～3/6 采样出现
+    # `{}` 参数的 Bash 调用）。参数体内不存在真实调用结构，故深度 >0 时禁用该豁免。
+    _depth = 0
+    _cursor = 0
+    # opt22e A：**上下文判据**。「已豁免过一个真实调用」+「其后顶层出现过正文」
+    # ⇒ 后续候选一律转义。
+    # 为何需要：模型会先给出真实调用、**再**在正文里写「格式完全正确」的示例
+    # （实测：`<tool_call><function=Write>…</tool_call>` 后接正文，再接一个
+    # `<tool_call><function=Bash><parameter=command>ls -la</parameter>…`）。
+    # 该示例在参数体**外**、行首、有闭合 ⇒ 全部豁免条件都满足 ⇒ 被当成第二个
+    # 真实调用，**参数非空 ⇒ 下游真的会执行**（不再是"空参数失败"这种轻后果）。
+    # 真调用的多个调用是**连续**输出的，中间不会夹正文；故「出现正文后」可判。
+    # 边界（已接受）：模型「调用 → 说明 → 再调用」的真实场景会被误伤（罕见），
+    # 而「先说明后调用」（E4）不受影响 —— 正文在**首个**调用之前，`_seen_call` 仍为假。
+    _seen_call = False    # 已豁免过至少一个真实调用
+    _seen_prose = False   # 其后顶层（参数体外）出现过非空白正文
+    for m in _LD_TAG_RE.finditer(text):
+        i = m.start()
+        tok = m.group(0)
+        _seg = text[_cursor:i]
+        # ⚠️ 两个必要条件：
+        # ① 必须在**已豁免过真实调用之后**才置位 —— 否则「先说明后调用」（E4）
+        #    的开头说明会立刻置位，导致其后**所有**真实调用被转义。
+        # ② 用 `_has_toplevel_prose` 逐段跟踪深度 —— `_seg` 往往横跨整个参数体，
+        #    直接看整体会把它误判为顶层正文（会丢掉多调用中的后续调用）。
+        if _seen_call and _has_toplevel_prose(_seg, _depth):
+            _seen_prose = True
+        _depth += _seg.count("<parameter=") - _seg.count("</parameter>")
+        _cursor = i
+        line_start = text.rfind("\n", 0, i) + 1
+        at_line_start = text[line_start:i].strip() == ""
+        rest = text[m.end():]
+        # 参数体内、或「已有真实调用 + 其后出现正文」⇒ 不豁免。
+        _in_body = _depth > 0 or (_seen_call and _seen_prose)
+        if tok.startswith("<tool_call"):
+            if at_line_start and not _in_body:
+                if streaming and rest.strip() == "":
+                    # 后续尚未到达，无法判定是否跟 <function= —— 暂存（自限：
+                    # 一旦出现任何非空白字符即重新判定，不会长期扣留）。
+                    return "".join(out) + text[last:i]
+                if rest.lstrip().startswith("<function="):
+                    wrapper = True
+                    _seen_call = True
+                    continue  # 双重条件满足 → 真实调用起点
+                wrapper = False
+            else:
+                wrapper = False
+        else:  # <function=
+            if wrapper:
+                _seen_call = True
+                continue  # 被行首 <tool_call> 包裹 → 继承其真实调用身份
+            if at_line_start and not _in_body:
+                if "</function>" in rest:
+                    _seen_call = True
+                    continue  # 行首 + 有闭合 → 真实调用（退避语法）
+                if streaming and rest.strip() == "":
+                    return "".join(out) + text[last:i]  # 判据未到齐 → 暂存
+                # 行首但无闭合 → 落空，转义
+        out.append(text[last:i])
+        out.append(tok.replace("<", _SENT_LT).replace(">", _SENT_GT))
+        last = m.end()
+    if not out:
+        return text
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _escape_tool_like_tags(text: str) -> str:
+    """opt22d L-B: 把文本里“形似工具调用”的裸标签换成显示安全的形式，
+    使下游 harness 不再把这些文本当成真实调用执行。
+
+    转义形如 `<function=Write>` -> `⟨'function=Write'⟩`（数学尖括号 + 成对单引号）。
+    不用 `&lt;`/`&gt;` 实体的原因：① 纯文本渲染下很难看；② 若下游做 HTML 解码
+    会被还原成 `<` 而失效。不用全角 `＜＞` 的原因：NFKC 会映射回 ASCII `<`/`>`。
+
+    仅命中工具调用词族的标签名；a<b、20<3、<p> 等普通文本不受影响。
+
+    opt22e：内部使用**等长哨兵**（见 `_SENT_LT`），不再直接用 `⟨'…'⟩`；
+    展示形由 `_to_display` 在最终输出时统一转换。"""
+    if not text:
+        return text
+    return _TOOL_LIKE_TAG_RE.sub(
+        lambda m: m.group(0).replace("<", _SENT_LT).replace(">", _SENT_GT), text
+    )
+
+
+def _to_display(text: str) -> str:
+    """opt22e：内部形态 → **用户可见的展示形**（`⟨'…'⟩`）。
+
+    先把哨兵还原成展示形，再对**残留的真实工具标签**做展示转义
+    （部分路径（如未注册调用降级）直接把原始文本转内容，未经遮罩）。
+    """
+    if not text:
+        return text
+    t = text.replace(_SENT_LT, "⟨'").replace(_SENT_GT, "'⟩")
+    return _TOOL_LIKE_TAG_RE.sub(
+        lambda m: m.group(0).replace("<", "⟨'").replace(">", "'⟩"), t
+    )
+
+
+def _to_original(text: str) -> str:
+    """opt22e：内部形态 → **模型原文**（参数值专用）。
+
+    因为哨兵**等长**，遮罩文本上的切片与原文逐字对应，仅哨兵需换回 `<`/`>`。
+    参数值必须是数据本身：实测若把展示形当值，Write 写出的文件内容会变成
+    `⟨'tool_call'⟩`（模型原文是 `<tool_call>`）；xml 侧同场景保留原文。
+    """
+    if not text or _SENT_LT not in text and _SENT_GT not in text:
+        return text
+    return text.replace(_SENT_LT, "<").replace(_SENT_GT, ">")
+
+
+# opt22e: **真收尾三元组** —— `</parameter></function></tool_call>`（三方言）。
+# 关键：它必须**结束整段文本**。文档示例的收尾（`</parameter></function>`，多为两层）
+# 后面还跟着围栏 ``` 或正文，故不匹配；而真收尾恰好结束整段文本。
+# ⚠️ 踩坑：曾用「后跟 `</function>` 即算结构性」，但**示例的收尾同样满足**
+# ⇒ 正常成对围栏被改坏（实测 content 89→46）。
+_TRAILING_CLOSE_RE = re.compile(
+    r"</parameter>\s*</function>\s*</tool_?call\b[^<>]*>\s*$"
+)
+
+
+def _trailing_close_start(text: str) -> int | None:
+    """若 `text` 以**真收尾三元组**结束，返回其 `</parameter>` 的起始位置。"""
+    m = _TRAILING_CLOSE_RE.search(text)
+    return m.start() if m else None
+
+
+def _fenced_ranges(text: str) -> list:
+    """opt22d（L-C）：返回 text 中“markdown 代码围栏”覆盖的字符区间列表。
+
+    只认 **行首** 的三连反引号（CommonMark 语义）——行内出现的反引号不计入，
+    避免正文提及反引号时误开围栏。与 qwen3xml 侧 `_scan_code_fence` 判定一致。
+    """
+    ranges = []
+    in_fence = False
+    fence_start = 0
+    line_start = True
+    run = 0
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            line_start = True
+            run = 0
+            continue
+        if line_start:
+            if ch in " \t":
+                continue
+            if ch == "`":
+                run += 1
+                if run == 3:
+                    if in_fence:
+                        in_fence = False
+                        ranges.append((fence_start, i + 1))
+                    else:
+                        in_fence = True
+                        fence_start = i + 1
+                continue
+            line_start = False
+            run = 0
+    if in_fence:
+        # 流式下闭合标记可能尚未到达：未闭合围栏一直延伸到文本末尾，
+        # 否则围栏内先到的工具调用会被当成真实调用解析
+        ranges.append((fence_start, len(text)))
+    return ranges
+
+
+def _escape_fenced_tags(text: str, *, streaming: bool = True) -> str:
+    """opt22d（L-C）：把代码围栏内的“形似工具调用”标签转义为实体，
+    使其不再被解析成真实调用；围栏外的文本原样保留，真实调用不受影响。
+
+    **opt22e**：非流式（含 EOS 帧）时，若围栏区间以**真收尾三元组**结束，
+    则只转义它**之前**的部分、收尾原样保留。
+
+    背景：模型写文档时，参数值（`Write.content` / `Edit.new_string`）里的
+    markdown 代码块是**文档内容**。若其围栏数为**奇数**或流式下尚未闭合，
+    `_fenced_ranges` 会把区间一路延伸到文本末尾 ⇒ **真收尾**被转义成 `⟨'…'⟩`
+    ⇒ 收尾永远找不到 ⇒ 参数永不闭合 ⇒ **内容整段丢失**（离线 100% 复现）。
+
+    为何只在**非流式/EOS** 豁免：流式中间态下，文档示例的三层收尾会短暂出现在
+    文本末尾、与真收尾**字节同形**（XML 语义上也确实成立），无法区分 ⇒ 此时
+    照常转义（内容继续按参数体处理），待 EOS 判据完整后再放行真收尾。
+    """
+    if not text:
+        return text
+    for start, end in reversed(_fenced_ranges(text)):
+        seg = text[start:end]
+        cut = None if streaming else _trailing_close_start(seg)
+        if cut is None:
+            text = text[:start] + _escape_tool_like_tags(seg) + text[end:]
+        else:
+            text = (
+                text[:start]
+                + _escape_tool_like_tags(seg[:cut])
+                + seg[cut:]
+                + text[end:]
+            )
+    return text
+
+
 
 # opt23 debug log (disabled by default; enable via VLLM_OPT23_DEBUG_LOG=1)
 _OPT23_LOG = None
+
+def _mask_fenced_tags(text: str, *, streaming: bool = True) -> str:
+    """opt22d（L-E）：围栏遮罩 + **丢弃**末尾未闭合的工具类标签片段。
+
+    流式下标签会被切分（``<p`` + ``arameter=file_path>``、``</function`` + ``>``），
+    若在片段粒度上遮罩，会漏出裸 ``<`` 或产出 ``⟨'/function>`` 这类畸形。
+    这里把未闭合尾部整体**从遮罩结果中摘掉**，待其闭合后再以整体转义形式出现；
+    因调用方靠“遮罩(current) − 遮罩(previous)”相减推导增量，摘掉后前缀关系仍成立。
+
+    第八轮追加 L-D：围栏**外**的非行首 ``<tool_call>``（如行内代码 / 表格示例）
+    同样转义，避免 impl 把展示示例当成真实调用、进而停止输出正文。
+
+    第九轮追加：``streaming=False`` 用于**消息结束**时收口——此时判据（后文是否
+    跟 ``<function=``）已完整，不再需要暂存，可把此前扣留的完整标签转义后释放。
+    """
+    head, _held = split_incomplete_tool_tag_tail(text)
+    return _escape_non_linestart_tool_calls(
+        _escape_fenced_tags(head, streaming=streaming), streaming=streaming
+    )
+
 
 def _log(msg: str, *args: Any) -> None:
     global _OPT23_LOG
@@ -97,6 +446,10 @@ class Qwen3CoderToolParser(ToolParser):
         self.current_tool_id: str | None = None  # type: ignore
         self.streamed_args_for_tool: list[str] = []
 
+        # opt22d: 被降级的（未注册）工具调用索引
+        self._opt22d_demoted: set = set()
+        self._opt22d_force_all: bool = False   # opt22d A/B/C：整轮降级
+
         # Sentinel tokens for streaming mode
         self.tool_call_start_token: str = "<tool_call>"
         self.tool_call_end_token: str = "</tool_call>"
@@ -148,6 +501,122 @@ class Qwen3CoderToolParser(ToolParser):
         """Generate a unique tool call ID."""
         return f"call_{uuid.uuid4().hex[:24]}"
 
+    def _registered_tool_names(self) -> set:
+        """已注册工具名集合。tools 未提供时为空集。"""
+        names = set()
+        for tool in (self.tools or []):
+            fn = getattr(tool, "function", None)
+            nm = getattr(fn, "name", None) if fn is not None else None
+            if not nm:
+                nm = getattr(tool, "name", None)
+            if nm:
+                names.add(nm)
+        return names
+
+    def _is_registered_tool(self, name) -> bool:
+        """opt22d L-A: 名称是否在已注册工具内。
+        tools 为空（非工具请求）时一律视为已注册，保持宽松、绝不误伤真实调用。"""
+        if self._opt22d_force_all:
+            return False  # opt22d A/B/C：整轮降级
+        names = self._registered_tool_names()
+        if not names:
+            return True
+        return name in names
+
+    def _missing_required_args(self, tc) -> bool:
+        """opt22e B：该调用的参数是否**缺少 schema 的必填字段**。
+
+        参数无法解析（非法 JSON / 空）时也视为缺失 —— 真实调用的参数总能解析。
+        `tools` 未提供或该工具无 `required` 声明时返回 False（**宽松兜底、不误伤**）。
+        """
+        try:
+            fn = tc.function
+        except Exception:
+            return False
+        if fn is None:
+            return False
+        req = find_tool_required(self.tools, fn.name)
+        if not req:
+            return False
+        args = fn.arguments
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except Exception:
+                return True          # 参数非法 ⇒ 必填必然缺失
+        if not isinstance(args, dict):
+            return True
+        return any(k not in args or args[k] in (None, "") for k in req)
+
+    def _opt22d_should_force_all(self, request, raw_text: str = "") -> bool:
+        """opt22d A/B/C：依“请求侧信号”判断是否整轮降级为文本。
+
+        A `tool_choice == "none"`：客户端显式禁止调用 → 形似调用必为示例
+        B 请求无工具且解析器无工具：无对象可调 → 形似调用必为示例
+        """
+        if request is None:
+            return False
+        if getattr(request, "tool_choice", None) == "none":
+            return True
+        # opt22e C：请求侧「明确禁止调用」信号（与 xml 侧同义）。见 utils 说明。
+        if request_forbids_tool_calls(request):
+            return True
+        if not getattr(request, "tools", None) and not self.tools:
+            return True
+        return False
+
+    def _thinking_enabled_of(self, request) -> bool:
+        """opt22d 第七轮：本次请求是否开启思考。
+
+        缺省视为开启（与模板默认 enable_thinking=True 一致）；仅当客户端显式
+        enable_thinking=False 时才返回 False——那时保持历史的流式解析行为。
+        """
+        kw = getattr(request, "chat_template_kwargs", None) or {}
+        return bool(kw.get("enable_thinking", True))
+
+    def _should_defer_parsing(self, text: str) -> bool:
+        """opt22d 第七轮：是否需要把本轮工具解析推迟到 finish。
+
+        仅当文本里已出现**闭合的**函数名标签、且其中含有 _STREAMING_TOOLS
+        之外的工具时返回 True。函数名尚未闭合（仍处分片）时返回 False——
+        此时 impl 不会产出工具增量，不推迟无副作用；且可避免 Write/Edit
+        因分片被误判为“非白名单”而丢掉流式增量显示。
+        """
+        names = set(_FN_TAG_RE.findall(text))
+        if not names:
+            return False
+        return bool(names - self._STREAMING_TOOLS)
+
+    def _opt22d_filter_delta(self, delta):
+        """opt22d 流式过滤：吞掉未注册调用的结构化增量；内容里的形似标签转义。"""
+        if delta is None:
+            return None
+        demoted = getattr(self, "_opt22d_demoted", None)
+        if demoted is None:
+            demoted = self._opt22d_demoted = set()
+        if delta.tool_calls:
+            hit = False
+            for tc in delta.tool_calls:
+                fn = tc.function
+                nm = fn.name if fn else None
+                idx = tc.index if tc.index is not None else -1
+                if nm and not self._is_registered_tool(nm):
+                    demoted.add(idx)
+                    # 该调用恰为最后一个时从服务层计数剔除（避免 finish_reason 误判）。
+                    # 只动 prev_tool_call_arr：pop streamed_args_for_tool 会让
+                    # _finish_streaming_function 的长度校验报警且索引错位。
+                    if 0 <= idx == len(self.prev_tool_call_arr) - 1:
+                        self.prev_tool_call_arr.pop()
+                if idx in demoted:
+                    hit = True
+            if hit:
+                return None
+        if delta.content:
+            esc = _to_display(delta.content)
+            if esc != delta.content:
+                return DeltaMessage(content=esc)
+        return delta
+
     def _reset_streaming_state(self):
         """Reset all streaming state."""
         self.current_tool_index = 0
@@ -190,6 +659,18 @@ class Qwen3CoderToolParser(ToolParser):
         self._stream_partial_value: str | None = None
         # opt23 =2 优化3: 状态指纹，无变化时跳过 diff
         self._stream_last_fp: tuple | None = None
+        # opt22d 第七轮：按会话 thinking 开关决定解析时机——开启思考时，
+        # 非 _STREAMING_TOOLS 的工具不在流式阶段产出，统一推迟到 finish
+        # 用完整文本解析（避免 thinking 内的标签被误当真实调用执行）。
+        self._thinking_enabled: bool = True
+        self._deferred_used: bool = False
+        # opt22e：EOS 强制收尾所需状态（见 `flush_streaming_finish`）
+        self._opt22e_last_text: str = ""
+        self._opt22e_last_request: object | None = None
+        self._needs_finish_flush: bool = False
+        # 已**真正下发**的增量（按 tool index）——flush 只补缺失部分，避免重复
+        self._opt22e_streamed: dict = {}
+        self._opt22e_name_sent: dict = {}
 
     def _compute_json_diff(self, current_json: str, prev_streamed: str) -> str:
         """Safe-prefix diff on JSON strings for incremental tool args.
@@ -942,6 +1423,10 @@ class Qwen3CoderToolParser(ToolParser):
         """Convert parameter value based on its type in the schema."""
         if not isinstance(param_value, str):
             return param_value
+        # opt22e：先还原遮罩转义 —— 本方法是**三条取值路径的唯一收口**
+        # （非流式 `_extract_parameters_from_text` / `_parse_xml_function_call` /
+        # 流式 impl），在此还原可一次覆盖。详见 `_to_original`。
+        param_value = _to_original(param_value)
         param_schema = param_config.get(param_name, {})
         param_types = extract_types_from_schema(param_schema)
         return coerce_to_schema_type(param_value, param_types)
@@ -1386,6 +1871,54 @@ class Qwen3CoderToolParser(ToolParser):
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
+        """opt22d 包装：围栏遮罩 + L-A 未注册调用降级 + L-B 内容形似标签转义。"""
+        # opt22d（L-C）：代码围栏内的标签先遮罩，使其不被当成真实调用，
+        # 同时以（转义后的）文本形式留在 content 里，用户仍能看到示例
+        self._opt22d_force_all = self._opt22d_should_force_all(request, model_output)
+        info = self._extract_tool_calls_impl(
+            _escape_non_linestart_tool_calls(
+                _escape_fenced_tags(model_output), streaming=False
+            ),
+            request,
+        )
+        kept = []
+        for tc in (info.tool_calls or []):
+            if not (tc.function and self._is_registered_tool(tc.function.name)):
+                continue
+            # opt22e B：**必填参数兜底**。模型写文档时，正文里的完整示例会被
+            # 文本层误判为真实调用；真实调用必然带齐 schema 的 required 参数，
+            # 故「缺必填 ⇒ 不是真实调用」。这是**不依赖枚举形态**的通用判据
+            # （实测线上 `('Bash', {})` 与正文示例两种形态都被它挡住）。
+            if self._missing_required_args(tc):
+                continue
+            kept.append(tc)
+        content = _to_display(info.content) if info.content else info.content
+        if len(kept) != len(info.tool_calls or []):
+            # 有未注册调用被降级 → 其原文并入内容（已转义），不向下游暴露假调用
+            if not kept:
+                content = _to_display(model_output)
+            self.prev_tool_call_arr = [
+                {"name": tc.function.name, "arguments": tc.function.arguments}
+                for tc in kept
+            ]
+            return ExtractedToolCallInformation(
+                tools_called=bool(kept),
+                tool_calls=kept,
+                content=content if content else None,
+            )
+        return ExtractedToolCallInformation(
+            tools_called=info.tools_called,
+            tool_calls=info.tool_calls,
+            content=content if content else None,
+        )
+
+    def _extract_tool_calls_impl(
+        self,
+        model_output: str,
+        request: ChatCompletionRequest,
+    ) -> ExtractedToolCallInformation:
+        # opt22: normalize Anthropic-style tag names before regexes
+        model_output = _normalize_qwen3_tag_names(model_output)
         # opt23 §11.42 (v122 框架迁入): config-first 格式解析——serving 按
         # fix 注入 request.chat_template_kwargs.tool_call_format（fix=2→json、
         # fix=3→xml）优先；无配置则按输出形态检测（_detect_tool_format）。
@@ -1453,6 +1986,32 @@ class Qwen3CoderToolParser(ToolParser):
                 tools_called=False, tool_calls=[], content=model_output
             )
 
+    def extract_tool_calls_deferred(
+        self,
+        model_output: str,
+        request: ChatCompletionRequest,
+    ) -> ExtractedToolCallInformation:
+        """opt22d 第七轮：用完整文本解析“被推迟”的工具调用。
+
+        仅在流式阶段确实发生过推迟时（_deferred_used 为真）由 serving 层在
+        finish 时刻调用。复用非流式 extract_tool_calls——它自带围栏遮罩、
+        L-A 白名单降级与标签转义等 opt22d 全套防护。
+
+        结果剔除 _STREAMING_TOOLS 中的调用：那些已由流式路径即时下发，
+        此处重复产出会让下游收到两份相同调用。
+        """
+        self._reset_streaming_state()
+        info = self.extract_tool_calls(model_output, request)
+        kept = [
+            tc for tc in (info.tool_calls or [])
+            if tc.function and tc.function.name not in self._STREAMING_TOOLS
+        ]
+        return ExtractedToolCallInformation(
+            tools_called=bool(kept),
+            tool_calls=kept,
+            content=info.content,
+        )
+
     def extract_tool_calls_streaming(
         self,
         previous_text: str,
@@ -1463,6 +2022,159 @@ class Qwen3CoderToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        """opt22d 包装：围栏遮罩 + 未注册调用过滤 + 内容转义。"""
+        # opt22d（L-C）：先遮罩代码围栏内的标签，使 impl 不把它们当真实调用。
+        # 遮罩是“文本 → 文本”的确定性函数；delta 直接由遮罩后的 current/previous
+        # 相减得出（而非独立遮罩 delta_text），以保持流式前缀长度关系不错位。
+        # opt22d 第九轮：消息结束时（delta_text 空、却带 token id ⇒ EOS）判据已完整，
+        # 用非流式口径收口，把此前因"不知后文是否跟 <function="而暂存的完整标签
+        # 转义后释放——否则模型只输出一个孤立标签时，该标签会被永久扣留、用户看不到。
+        _is_eos = not delta_text and bool(delta_token_ids)
+        # opt22e：**先遮罩、后归一化**（顺序很关键）。
+        # `_normalize_qwen3_tag_names` 会把方言标签改名（`<toolcall>` → `<tool_call>`，
+        # 长度还 +1）。若先归一化，**文档正文里**写的 `<toolcall>` 也会被改名
+        # ⇒ 参数值（写入文件的内容）与模型原文不符，且与非流式路径（不归一化）
+        # **产出一致性被打破**：实测 flush 的前缀比对在 `\`\`\`\n<toolcall>` 处
+        # 分歧（sent 是 `<tool_call>`、full 是 `<toolcall>`）⇒ 补发错位、JSON 非法。
+        # 先遮罩后：参数体/围栏内的标签已被换成哨兵（私有区字符），归一化正则
+        # 匹配不到 ⇒ 文档内容原样保留；只有**结构标签**（未被遮罩）才被归一化。
+        prev_m = _normalize_qwen3_tag_names(_mask_fenced_tags(previous_text))
+        cur_m = _normalize_qwen3_tag_names(
+            _mask_fenced_tags(current_text, streaming=not _is_eos)
+        )
+        if _is_eos:
+            prev_f = _normalize_qwen3_tag_names(
+                _mask_fenced_tags(previous_text, streaming=False)
+            )
+            if cur_m.startswith(prev_f) and len(cur_m) > len(prev_f):
+                return self._opt22d_filter_delta(
+                    DeltaMessage(content=cur_m[len(prev_f):])
+                )
+        if cur_m.startswith(prev_m):
+            delta_m = cur_m[len(prev_m):]
+        else:
+            delta_m = _normalize_qwen3_tag_names(_mask_fenced_tags(delta_text))
+        # opt22d 第七轮：开启思考时，非 _STREAMING_TOOLS 的工具不在流式阶段产出，
+        # 推迟到 finish 用完整文本解析。拦截点放在 impl 之前——impl 的状态机
+        # 不被推进，因而不会与 opt23 的 partial streaming（_partial_*）状态错位。
+        self._thinking_enabled = self._thinking_enabled_of(request)
+        if self._thinking_enabled and self._should_defer_parsing(cur_m):
+            self._deferred_used = True
+            return None
+        self._opt22d_force_all = self._opt22d_should_force_all(request, current_text)
+        delta = self._extract_tool_calls_streaming_impl(
+            prev_m,
+            cur_m,
+            delta_m,
+            previous_token_ids,
+            current_token_ids,
+            delta_token_ids,
+            request,
+        )
+        # opt22e：记录全文/请求，并在「调用已开启但未收尾」时置标志，
+        # 供 serving.py 的 finish 钩子调用 `flush_streaming_finish`。
+        # 为何需要：奇数/未闭合代码围栏会让**真收尾**在流式期间被转义成 `⟨'…'⟩`
+        # ⇒ 参数永不闭合 ⇒ 内容整段不下发；EOS 时判据完整（`streaming=False`
+        # 会放行尾部真收尾），故在 finish 处用非流式路径补齐。
+        self._opt22e_last_text = current_text
+        self._opt22e_last_request = request
+        if getattr(self, "in_function", False) or getattr(self, "in_param", False):
+            self._needs_finish_flush = True
+        _log("[opt22e] stream cur=%d in_fn=%s in_param=%s flush=%s sent=%s",
+             len(current_text), getattr(self, "in_function", None),
+             getattr(self, "in_param", None),
+             getattr(self, "_needs_finish_flush", None),
+             {k: len(v) for k, v in getattr(self, "_opt22e_streamed", {}).items()})
+        _out = self._opt22d_filter_delta(delta)
+        if _out and _out.tool_calls:
+            for _t in _out.tool_calls:
+                _i = _t.index if _t.index is not None else 0
+                if _t.function:
+                    if _t.function.name:
+                        self._opt22e_name_sent[_i] = True
+                    if _t.function.arguments:
+                        self._opt22e_streamed[_i] = (
+                            self._opt22e_streamed.get(_i, "") + _t.function.arguments
+                        )
+        return _out
+
+    def flush_streaming_finish(self):
+        """opt22e：EOS **强制收尾**（与 xml 侧同构，由 serving.py 的 finish 钩子调用）。
+
+        奇数 / 未闭合代码围栏会让**真收尾**在流式期间被转义 ⇒ 参数永不闭合
+        ⇒ 内容整段无法下发。EOS 时判据已完整，故用非流式路径重解析全文，
+        把**尚未下发**的增量补发（已下发部分按前缀比对跳过，避免重复）。
+
+        ⚠️ 名称只在**从未下发过**时补——重复下发会让客户端看到第二个同名调用
+        （实测线上出现 `['Write', 'Write']`）。返回 `DeltaMessage`（`DeltaFunctionCall`
+        允许 `name=None`），与 xml 侧返回类型一致。
+
+        Returns:
+            ``DeltaMessage``（仅含缺失增量）；无可补发时返回 None。
+        """
+        text = getattr(self, "_opt22e_last_text", "")
+        req = getattr(self, "_opt22e_last_request", None)
+        if not text or req is None:
+            return None
+        try:
+            info = self.extract_tool_calls(text, req)
+        except Exception:
+            return None
+        _log("[opt22e] flush text=%d calls=%s", len(text),
+             [t.function.name for t in (info.tool_calls or [])] if info else None)
+        if not info or not info.tool_calls:
+            return None
+        out = []
+        for i, tc in enumerate(info.tool_calls):
+            full = (tc.function.arguments or "") if tc.function else ""
+            sent = self._opt22e_streamed.get(i, "")
+            # ⚠️ 用**最长公共前缀**补缺，而非 `full.startswith(sent)`：
+            # partial 流式路径会多下发 1 个尾字符（参数值末尾的 `\n`，完成路径
+            # 会 trim 掉），此时 sent 比 full **长** ⇒ `startswith` 为假 ⇒ 会走
+            # "覆盖式补发"把整块 JSON 再发一遍（实测线上 args 翻倍、JSON "Extra data"）。
+            # LCP 只补真正缺失的尾部；sent 多出的尾字符落在 JSON 闭合之后，
+            # 不影响合法性（如 `…XYZEND\n"}`）。
+            # 注：`find_common_prefix` 返回**公共前缀字符串**（非长度）。
+            common = find_common_prefix(sent, full) if sent else ""
+            delta = full[len(common):]
+            name = None
+            if not self._opt22e_name_sent.get(i):
+                name = tc.function.name if tc.function else None
+            _log("[opt22e] flush[%d] name_sent=%s sent=%d full=%d lcp=%d delta=%d",
+                 i, self._opt22e_name_sent.get(i), len(sent), len(full),
+                 len(common) if isinstance(common, str) else -1, len(delta))
+            _lc = len(common) if isinstance(common, str) else 0
+            if _lc < min(len(sent), len(full)):
+                _log("[opt22e]   diverge@%d sent[..]=%r", _lc,
+                     sent[max(0, _lc - 25):_lc + 45])
+                _log("[opt22e]   diverge@%d full[..]=%r", _lc,
+                     full[max(0, _lc - 25):_lc + 45])
+            if not delta and not name:
+                continue
+            out.append(
+                DeltaToolCall(
+                    index=i,
+                    id=tc.id,
+                    type="function",
+                    function=DeltaFunctionCall(name=name, arguments=delta),
+                )
+            )
+        return DeltaMessage(tool_calls=out) if out else None
+
+    def _extract_tool_calls_streaming_impl(
+        self,
+        previous_text: str,
+        current_text: str,
+        delta_text: str,
+        previous_token_ids: Sequence[int],
+        current_token_ids: Sequence[int],
+        delta_token_ids: Sequence[int],
+        request: ChatCompletionRequest,
+    ) -> DeltaMessage | None:
+        # opt22: normalize Anthropic-style tag names (consistent across all three)
+        previous_text = _normalize_qwen3_tag_names(previous_text)
+        current_text = _normalize_qwen3_tag_names(current_text)
+        delta_text = _normalize_qwen3_tag_names(delta_text)
         # Store request for type conversion
         if not previous_text:
             self._reset_streaming_state()
@@ -1610,7 +2322,18 @@ class Qwen3CoderToolParser(ToolParser):
                 if pos != -1
             ]
             tool_start = min(tool_start_candidates) if tool_start_candidates else -1
-            if self.tool_call_start_token_id in delta_token_ids or tool_start != -1:
+            # opt22d 第九轮：token 层判定必须与**文本层**一致。
+            # ``<tool_call>`` 是 special token（id 248058），L-C/L-D 把它在文本里
+            # 转义成 ``⟨'tool_call'⟩`` 后，token id 仍留在 delta_token_ids 里
+            # ⇒ 若只看 token，会把"已判定为展示示例"的内容重新当成调用起点，
+            #   ``is_tool_call_started=True`` 且此后每轮都 ``return None``
+            #   ⇒ **正文自该标签起全部丢失**（实测 E1 流式：944 token 全生成，
+            #   却只下发 17 字符；日志显示首 4 个 delta 正常、第 5 个起恒 None）。
+            # 故要求文本里确实存在**未转义**的裸标签才认。
+            if tool_start != -1 or (
+                self.tool_call_start_token_id in delta_token_ids
+                and self.tool_call_start_token in current_text
+            ):
                 self.is_tool_call_started = True
                 # Return any content before the tool call
                 if tool_start > len(previous_text):
@@ -2059,7 +2782,12 @@ class Qwen3CoderToolParser(ToolParser):
                             == "\n"):
                         _abs_value_start += 1
 
-                    current_value = current_text[_abs_value_start:]
+                    # opt22e：本路径**绕过 `_convert_param_value`** 直接发射原始切片，
+                    # 故须在此单独还原遮罩转义，否则流式下参数值仍是 `⟨'…'⟩`
+                    # （与完成路径的还原结果不一致 ⇒ 前缀比对失配、JSON 非法）。
+                    current_value = _to_original(
+                        current_text[_abs_value_start:]
+                    )
                     if len(current_value) > self._partial_emit_offset:
                         _now = time.monotonic()
                         if (_now - self._last_partial_time) < 0.25:

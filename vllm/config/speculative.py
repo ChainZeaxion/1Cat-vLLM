@@ -3,6 +3,7 @@
 
 import copy
 import math
+import os
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import Field, SkipValidation, field_validator, model_validator
@@ -13,6 +14,7 @@ from vllm.config.cache import CacheDType
 from vllm.config.kernel import MoEBackend
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
+from vllm.config.sm70_dflash2 import Sm70DFlash2Config
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
@@ -107,9 +109,22 @@ def get_dflash_model_draft_tokens(speculative_config: Any) -> int:
     draft_model_config = getattr(speculative_config, "draft_model_config", None)
     hf_config = getattr(draft_model_config, "hf_config", None)
     trained_tokens = _get_dflash2_checkpoint_draft_tokens(hf_config)
+    resolved = verify_tokens
     if trained_tokens is not None and trained_tokens < verify_tokens:
-        return trained_tokens
-    return verify_tokens
+        resolved = trained_tokens
+    # Experimental (2026-09-30): allow forcing a narrower model draft width so
+    # that lookup regains a tail window even when NST <= the trained block.
+    # Unset by default -> byte-identical to the upstream code path.
+    forced = os.getenv("VLLM_DFLASH2_DRAFT_BLOCK")
+    if forced:
+        draft_block = int(forced)
+        if not 0 < draft_block <= resolved:
+            raise ValueError(
+                "VLLM_DFLASH2_DRAFT_BLOCK must be within [1, %d], got %d"
+                % (resolved, draft_block)
+            )
+        return draft_block
+    return resolved
 
 
 def uses_adaptive_dflash_lookup(speculative_config: Any) -> bool:
@@ -376,6 +391,9 @@ class SpeculativeConfig:
     DSpark still generates the checkpoint's complete block; only a prefix is
     scheduled, so values below the checkpoint block size remain lossless."""
 
+    sm70_dflash2: Sm70DFlash2Config = Field(default_factory=Sm70DFlash2Config)
+    """Per-engine SM70 DFlash2 verifier policy; automatic when not specified."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -389,6 +407,10 @@ class SpeculativeConfig:
         the final hidden states.
         """
         factors: list[Any] = []
+        if self.sm70_dflash2.resolved and (
+            self.use_dflash_family() or self.sm70_dflash2.explicit_fields
+        ):
+            factors.append(("sm70_dflash2", self.sm70_dflash2.graph_options()))
         # Eagle3 and extract_hidden_states affect the computation graph because
         # they return intermediate hidden states in addition to the final hidden state.
         uses_aux_hidden_states = (

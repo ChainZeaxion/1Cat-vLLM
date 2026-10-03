@@ -473,7 +473,9 @@ class BlockPool:
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
-    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+    def free_blocks(
+        self, ordered_blocks: Iterable[KVCacheBlock], reuse_first: bool = False
+    ) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
 
@@ -487,6 +489,12 @@ class BlockPool:
         Args:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
+            reuse_first: Hand these blocks out again before any other free
+                block, cached or not. A sliding window that has moved past its
+                blocks releases them with this: their KV can never serve a
+                future hit at any alignment boundary the window still covers,
+                so keeping them cache-valuable would only let the running
+                prefill rotate the whole pool and evict other requests.
         """
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
@@ -498,14 +506,16 @@ class BlockPool:
         for block in blocks_list:
             if block.ref_cnt != 0 or block.is_null:
                 continue
-            if block.block_hash is not None and self.enable_caching:
+            if self.enable_caching and (reuse_first or block.block_hash is None):
+                # Uncached scratch has no reusable prefix to evict, and blocks a
+                # sliding window has moved past (``reuse_first``) can never serve
+                # a future hit. Recycle both before consuming the queue's older
+                # cached entries.
+                scratch_list.append(block)
+            elif self.enable_caching and block.block_hash is not None:
                 # Retain hash: place in warm list with a timestamp.
                 self.warm_blocks[block.block_id] = block
                 self._warm_freed_at[block.block_id] = now
-            elif self.enable_caching:
-                # Uncached scratch has no reusable prefix to evict. Recycle it
-                # before consuming the queue's older cached entries.
-                scratch_list.append(block)
             else:
                 free_list.append(block)
         self.free_block_queue.prepend_n(scratch_list)

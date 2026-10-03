@@ -11,6 +11,11 @@ import vllm.kernels  # noqa: F401
 from vllm import envs, ir
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import get_current_vllm_config
+from vllm.config.sm70_dflash2 import (
+    capture_sm70_dflash2_config,
+    sm70_dflash2_enabled,
+)
+from vllm.config.vllm import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.batch_invariant import rms_norm_batch_invariant
@@ -31,10 +36,13 @@ def _sm70_gated_norm_device_supported(device_id: int | None) -> bool:
 def _sm70_gated_norm_shape_supported(
     x: torch.Tensor, z: torch.Tensor | None, weight: torch.Tensor
 ) -> bool:
+    # [本地 X9 2026-10-03] 去掉行数上限 1..192（与 .cu 同步放开）。
+    # 上游条件下，vLLM 每个编译范围只按最大尺寸追踪一次且丢弃形状守卫 ⇒ 条件
+    # 从不满足、算子从未运行。放开后 decode（288 行）/混合/prefill 各行结果一致。
     return bool(
         z is not None
         and x.ndim == 2
-        and 1 <= x.shape[0] <= 192
+        and x.shape[0] > 0
         and x.shape[1] == 128
         and z.shape == x.shape
         and weight.shape == (128,)
@@ -138,9 +146,10 @@ def _use_sm70_dflash2_fixed_gemma_rms(
     x: torch.Tensor,
     residual: torch.Tensor | None,
     weight: torch.Tensor,
+    policy=None,
 ) -> bool:
     return bool(
-        envs.VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS
+        sm70_dflash2_enabled("fixed_gemma_rms", policy)
         and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
         and _sm70_gemma_long_prefill_available()
         and x.is_cuda
@@ -224,12 +233,13 @@ def _use_sm70_dflash2_gemma_fused_add_rms(
     x: torch.Tensor,
     residual: torch.Tensor | None,
     weight: torch.Tensor,
+    policy=None,
 ) -> bool:
     # Keep the dynamic token dimension out of this Python predicate. AOT traces
     # the target once at a large warmup shape; a decode-only row bound would be
     # constant-folded there and would leave the M=8 replay on the decomposed path.
     return bool(
-        envs.VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS
+        sm70_dflash2_enabled("fused_gemma_rms", policy)
         and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
         # Keep the cached platform query out of the AOT fullgraph. The helper
         # below is explicitly constant-foldable by Dynamo.
@@ -499,6 +509,7 @@ class GemmaRMSNorm(CustomOp):
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
+        self._sm70_dflash2_policy = capture_sm70_dflash2_config()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
 
@@ -573,11 +584,15 @@ class GemmaRMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
-        if _use_sm70_dflash2_fixed_gemma_rms(x, residual, self.weight):
+        if _use_sm70_dflash2_fixed_gemma_rms(
+            x, residual, self.weight, self._sm70_dflash2_policy
+        ):
             return _sm70_dflash2_fixed_gemma_rms_norm(
                 x, residual, self.weight, self.variance_epsilon
             )
-        if _use_sm70_dflash2_gemma_fused_add_rms(x, residual, self.weight):
+        if _use_sm70_dflash2_gemma_fused_add_rms(
+            x, residual, self.weight, self._sm70_dflash2_policy
+        ):
             assert residual is not None
             return _sm70_dflash2_gemma_fused_add_rms_norm(
                 x,
@@ -631,11 +646,15 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if _use_sm70_dflash2_fixed_gemma_rms(x, residual, self.weight):
+        if _use_sm70_dflash2_fixed_gemma_rms(
+            x, residual, self.weight, self._sm70_dflash2_policy
+        ):
             return _sm70_dflash2_fixed_gemma_rms_norm(
                 x, residual, self.weight, self.variance_epsilon
             )
-        if _use_sm70_dflash2_gemma_fused_add_rms(x, residual, self.weight):
+        if _use_sm70_dflash2_gemma_fused_add_rms(
+            x, residual, self.weight, self._sm70_dflash2_policy
+        ):
             assert residual is not None
             return _sm70_dflash2_gemma_fused_add_rms_norm(
                 x,
@@ -716,6 +735,13 @@ class RMSNormGated(CustomOp):
         """
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
+        cfg = get_current_vllm_config_or_none()
+        resolved = cfg.kernel_config.sm70_rmsnorm_gated_exact if cfg else None
+        self._sm70_rmsnorm_gated_exact = (
+            bool(resolved)
+            if resolved is not None
+            else bool(envs.VLLM_SM70_RMSNORM_GATED_EXACT)
+        )
         self.eps = eps
         self.activation = activation
         self.weight = nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
@@ -782,7 +808,7 @@ class RMSNormGated(CustomOp):
     ) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
         if (
-            envs.VLLM_SM70_RMSNORM_GATED_EXACT
+            self._sm70_rmsnorm_gated_exact
             and not envs.VLLM_BATCH_INVARIANT
             and x.is_cuda
             and _sm70_gated_norm_device_supported(x.device.index)

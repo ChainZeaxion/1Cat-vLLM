@@ -49,9 +49,12 @@ __global__ void rmsnorm_gated_exact_kernel(const half* x, const half* z,
 
 void rmsnorm_gated_exact(torch::Tensor out, torch::Tensor x, torch::Tensor z,
                          torch::Tensor weight, double eps, bool silu) {
-  TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(1) == 128 &&
-                  x.size(0) >= 1 && x.size(0) <= 192,
-              "SM70 exact gated RMSNorm requires CUDA [1..192, 128]");
+  // [本地 X9 2026-10-03] 放开行数上限（上游为 1..192）：本算子每行一个 warp，
+  // 网格 = (rows + 3) / 4，接受任意行数。上游的 1..192 让编译期只按最大尺寸
+  // 追踪一次的 vLLM 从不满足条件 ⇒ 算子从未运行，decode/混合/prefill 各行
+  // 算术不一致（舍入差异可改 MoE 路由、翻转 EOS）。改后各图逐行结果一致。
+  TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(1) == 128,
+              "SM70 exact gated RMSNorm requires CUDA [rows, 128]");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,

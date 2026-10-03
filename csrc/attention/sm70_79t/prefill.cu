@@ -5805,7 +5805,17 @@ extern "C" cudaError_t onecat_sm70_d256_dense_state_raw(
 
 namespace FLASH_NAMESPACE {
 
-  #if PREFIX_TORCH_QUERY_TOKENS == 8192
+  // One exported symbol per query width.  Every width is compiled from this
+  // same file with a different PREFIX_TORCH_QUERY_TOKENS, so the symbol name
+  // MUST be unique per width -- a plain #else would make each new width
+  // re-emit the Q8000 symbol and break the link with a duplicate definition.
+  #if PREFIX_TORCH_QUERY_TOKENS == 2560
+extern "C" int64_t onecat_sm70_q2560_accumulation_bits() {
+  #elif PREFIX_TORCH_QUERY_TOKENS == 3072
+extern "C" int64_t onecat_sm70_q3072_accumulation_bits() {
+  #elif PREFIX_TORCH_QUERY_TOKENS == 4096
+extern "C" int64_t onecat_sm70_q4096_accumulation_bits() {
+  #elif PREFIX_TORCH_QUERY_TOKENS == 8192
 extern "C" int64_t onecat_sm70_q8192_accumulation_bits() {
   #else
 extern "C" int64_t onecat_sm70_q8000_accumulation_bits() {
@@ -6081,11 +6091,26 @@ struct Sm70GqaHalf2Workspace {
             q.options().dtype(at::ScalarType::Byte))),
         launch_mutex(shared_scores->mutex) {
     static_assert(kQuery % kTailTileTokens == 0);
+    // Qualified Q widths.  Each entry pairs a query width with the tail tile
+    // the width was built for; kTailTiles is derived (kQuery/kTailTileTokens)
+    // and kFinePVTasks follows from the closed form below, so adding a width
+    // means adding one line here plus its prefill_q<N>.cu shim -- no hand
+    // computed constants.  Q2560/Q3072/Q4096 were added so mid-range and tail
+    // chunks can reach this route instead of falling through to the generic
+    // path; the three are spaced so their padding windows chain without a gap.
     static_assert(
+        (kQuery == 2560 && kTailTileTokens == 256 && kTailTiles == 10) ||
+        (kQuery == 3072 && kTailTileTokens == 256 && kTailTiles == 12) ||
+        (kQuery == 4096 && kTailTileTokens == 256 && kTailTiles == 16) ||
         (kQuery == 8000 && kTailTileTokens == 320 && kTailTiles == 25) ||
         (kQuery == 8192 && kTailTileTokens == 256 && kTailTiles == 32));
     static_assert(kFinePVGroupTiles == 4);
-    static_assert(kFinePVTasks == (kQuery == 8000 ? 91 : 144));
+    static_assert(kFinePVTasks ==
+                  (kQuery == 2560   ? 18
+                   : kQuery == 3072 ? 24
+                   : kQuery == 4096 ? 40
+                   : kQuery == 8000 ? 91
+                                    : 144));
     static_assert(kBlockN >= 8192 && kBlockN <= 16 * 8192 &&
                   kBlockN % 8192 == 0);
     static_assert(kTailScoreElements <= size_t(kBlockN) * kRows);
