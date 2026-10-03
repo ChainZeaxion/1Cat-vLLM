@@ -31,6 +31,37 @@ logger = init_logger(__name__)
 
 _SM70_TP8_HIERARCHICAL_ELEMENTS = frozenset((4096, 8 * 4096))
 _SM70_TP8_HIERARCHICAL_SCRATCH_BYTES = 4 * 8 * 4096 * torch.float16.itemsize
+
+# [SX_OPT_PUSH_AR_WIDE] (batch 2, C4). The native SM70 TP4 push admission
+# (csrc/custom_all_reduce.cuh) also covers every Qwen3.8 FP16 row multiple
+# [M, 2560], M in 2..32 (10..160 KiB), for the regular and the sum2
+# collective, with ceil(bytes / 2048) CTAs. The native side reads the same
+# variable with the same semantics at CUDA-graph capture time; "0" restores
+# the previous admission. It only applies where the push storage is registered
+# below (SM70, fully connected TP4, VLLM_SM70_TP4_PUSH_ALLREDUCE) and
+# VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH is enabled; eager calls stay on the
+# pull path. NOTE: for the local Qwen3.5 hidden=5120 the row is 10240 B, i.e.
+# the window is still a 5120-B multiple and covers 1..16 token payloads.
+_SX_PUSH_AR_WIDE_ENV = "SX_OPT_PUSH_AR_WIDE"
+_SX_PUSH_AR_WIDE_ROW_BYTES = 2560 * torch.float16.itemsize
+_SX_PUSH_AR_WIDE_MIN_ROWS = 2
+_SX_PUSH_AR_WIDE_MAX_ROWS = 32
+
+
+def _sx_push_ar_wide_enabled() -> bool:
+    return os.environ.get(_SX_PUSH_AR_WIDE_ENV, "1") != "0"
+
+
+def _sx_push_ar_wide_payload(nbytes: int) -> bool:
+    """Size contract of the native wide push admission (FP16 row multiples)."""
+    return (
+        nbytes % _SX_PUSH_AR_WIDE_ROW_BYTES == 0
+        and _SX_PUSH_AR_WIDE_MIN_ROWS * _SX_PUSH_AR_WIDE_ROW_BYTES
+        <= nbytes
+        <= _SX_PUSH_AR_WIDE_MAX_ROWS * _SX_PUSH_AR_WIDE_ROW_BYTES
+    )
+
+
 _EXPANDABLE_SEGMENTS_TRUE_PATTERN = re.compile(
     r"((?:^|,)\s*expandable_segments\s*:\s*)True(?=\s*(?:,|$))"
 )
@@ -365,6 +396,21 @@ class CustomAllreduce:
                 qwen38_batch_status,
                 sum2_m1_status,
                 mtp5_status,
+            )
+            # Mirror the native predicate exactly (it accepts only an unset or
+            # "1" batch switch), so the log reports what capture will select.
+            wide = (
+                os.environ.get("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH", "1")
+                == "1"
+                and _sx_push_ar_wide_enabled()
+            )
+            logger.info(
+                "SM70 TP4 push all-reduce for every FP16 [2..32, 2560] "
+                "(10-160 KiB) regular and sum2 payload is %s "
+                "(%s=%s, requires the Qwen3.8 batch admission).",
+                "enabled" if wide else "disabled",
+                _SX_PUSH_AR_WIDE_ENV,
+                os.environ.get(_SX_PUSH_AR_WIDE_ENV, "<unset: 1>"),
             )
         if tp8_hierarchical and envs.VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR:
             assert hierarchical_peer_ranks is not None

@@ -7,15 +7,36 @@ Based on the paper "Qrita: High-performance Top-k and Top-p Algorithm for GPUs
 using Pivot-based Truncation and Selection" By Park et al.
 (https://arxiv.org/abs/2602.01518)
 
+SX_OPT sync-free SM70 top-k/top-p (ShiXiang batch-1, design_5 cpu-1)
+--------------------------------------------------------------------
+The legacy route launches the Qrita kernel on a clone of the logits and then
+runs ``if reference_rows.any():`` on the host. That fence blocks the worker
+until the model forward and the sampler have finished, so step k+1 input
+preparation and graph launch can no longer overlap the GPU (35.6 ms/step of
+cudaStreamSynchronize at M24 in the fork's measurement).
+
+``apply_top_k_top_p_sm70_syncfree`` replaces that route on SM70 for the
+Qwen3.x vocabulary; it never reads a device value on the host. Rows it cannot
+express exactly (``hard``) fall back to the legacy Qrita + reference path, so
+the fence is still present for them. See the fork's module docstring
+(Qixiao02/1Cat-vLLM ``SX_OPT_TOPK_TOPP_SYNCFREE``) for the tie contract and
+the three known reference-mismatch cases.
 """
+
+import functools
+import os
+from typing import NamedTuple
 
 import torch
 
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, tldevice, triton
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.platform_utils import num_compute_units
+
+logger = init_logger(__name__)
 
 _TRITON_TABLE_CACHE: dict[tuple[torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
 _TRITON_BUFFER_CACHE: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
@@ -1188,6 +1209,11 @@ def apply_top_k_top_p_triton(
             reference_logits.masked_fill_(torch.isneginf(reference_logits), mask_value)
         return reference_logits
 
+    # SX_OPT: SM70 sync-free route (see module docstring). Falls through to the
+    # legacy route below whenever the gate does not hold.
+    if sm70_syncfree_topk_topp_eligible(logits, k, p, mask_value):
+        return apply_top_k_top_p_sm70_syncfree(logits, k, p)
+
     # The Triton kernel supports arbitrary row strides, but it still assumes
     # the vocab dimension is laid out contiguously within each row.
     if logits.stride(1) != 1:
@@ -1220,28 +1246,9 @@ def apply_top_k_top_p_triton(
 
     num_sm = num_compute_units(logits.device.index)
     NUM_PROGRAMS = min(num_sm, batch_size)
-
-    # Cache per-Triton Program buffer on each device.
-    buf_key = (logits.device, logits.dtype, vocab_size)
-    buffer = _TRITON_BUFFER_CACHE.get(buf_key)
-    if buffer is None or buffer.shape[0] < NUM_PROGRAMS:
-        size = min(next_power_of_2(NUM_PROGRAMS), num_sm)
-        buffer = logits.new_empty((size, vocab_size))
-        _TRITON_BUFFER_CACHE[buf_key] = buffer
-    if buffer.shape[0] > NUM_PROGRAMS:
-        buffer = buffer[:NUM_PROGRAMS]
-
-    # Cache lookup table entries on each device.
-    tables = _TRITON_TABLE_CACHE.get(logits.device)
-    if tables is None:
-        normal_cdf_to_sigma_table = logits.new_tensor(_NORMAL_CDF_TO_SIGMA_TABLE)
-        percentile_to_std_table = logits.new_tensor(_PERCENTILE_TO_STD_TABLE)
-        _TRITON_TABLE_CACHE[logits.device] = (
-            normal_cdf_to_sigma_table,
-            percentile_to_std_table,
-        )
-    else:
-        normal_cdf_to_sigma_table, percentile_to_std_table = tables
+    buffer, normal_cdf_to_sigma_table, percentile_to_std_table = _qrita_workspace(
+        logits, NUM_PROGRAMS, num_sm
+    )
 
     # Smaller tiles compile and run faster on CPU; GPU benefits from larger tiles.
     if logits.device.type == "cpu":
@@ -1298,6 +1305,469 @@ def apply_top_k_top_p_triton(
         if mask_value != float("-inf"):
             reference_logits.masked_fill_(torch.isneginf(reference_logits), mask_value)
         logits.index_copy_(0, reference_indices, reference_logits)
+    return logits
+
+
+def _qrita_workspace(
+    logits: torch.Tensor, num_programs: int, num_sm: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-device Qrita scratch buffer and lookup tables (cached)."""
+    vocab_size = logits.shape[1]
+    # Cache per-Triton Program buffer on each device.
+    buf_key = (logits.device, logits.dtype, vocab_size)
+    buffer = _TRITON_BUFFER_CACHE.get(buf_key)
+    if buffer is None or buffer.shape[0] < num_programs:
+        size = min(next_power_of_2(num_programs), num_sm)
+        buffer = logits.new_empty((size, vocab_size))
+        _TRITON_BUFFER_CACHE[buf_key] = buffer
+    if buffer.shape[0] > num_programs:
+        buffer = buffer[:num_programs]
+
+    # Cache lookup table entries on each device.
+    tables = _TRITON_TABLE_CACHE.get(logits.device)
+    if tables is None:
+        normal_cdf_to_sigma_table = logits.new_tensor(_NORMAL_CDF_TO_SIGMA_TABLE)
+        percentile_to_std_table = logits.new_tensor(_PERCENTILE_TO_STD_TABLE)
+        _TRITON_TABLE_CACHE[logits.device] = (
+            normal_cdf_to_sigma_table,
+            percentile_to_std_table,
+        )
+    else:
+        normal_cdf_to_sigma_table, percentile_to_std_table = tables
+    return buffer, normal_cdf_to_sigma_table, percentile_to_std_table
+
+
+# ---------------------------------------------------------------------------
+# SX_OPT sync-free SM70 top-k/top-p (see the module docstring).
+# ---------------------------------------------------------------------------
+
+_SX_FULL_BLOCK = 4096  # tile of the full-row passes (threshold mask, tail scan)
+_SX_SM70_DEVICE_CACHE: dict[int, bool] = {}
+_SX_STATS: dict[torch.device, torch.Tensor] = {}
+_SX_STATS_CALLS: dict[torch.device, int] = {}
+_SX_STATS_FIELDS = ("compact", "extended", "hard", "noop", "hard_flagged")
+_SX_LOGGED = False
+
+
+class _SxSyncfreeConfig(NamedTuple):
+    kt: int
+    vocabs: frozenset[int] | None  # None: any vocab size
+    stats: bool
+    stats_every: int
+
+
+@functools.lru_cache(maxsize=32)
+def _sx_parse_config(
+    kt_raw: str, vocabs_raw: str, stats_raw: str, every_raw: str
+) -> _SxSyncfreeConfig:
+    try:
+        kt = int(kt_raw)
+    except ValueError:
+        kt = 128
+    kt = next_power_of_2(max(32, min(1024, kt)))
+    vocabs: frozenset[int] | None
+    if vocabs_raw.strip() == "*":
+        vocabs = None
+    else:
+        parsed = set()
+        for item in vocabs_raw.split(","):
+            item = item.strip()
+            if item.isdigit():
+                parsed.add(int(item))
+        vocabs = frozenset(parsed)
+    try:
+        every = max(1, int(every_raw))
+    except ValueError:
+        every = 2000
+    # Default-off diagnostic (its periodic log line synchronises): an empty or
+    # "false"-like value must not turn it on.
+    stats = stats_raw.strip().lower() not in ("", "0", "false", "no", "off")
+    return _SxSyncfreeConfig(kt, vocabs, stats, every)
+
+
+def _sx_config() -> _SxSyncfreeConfig:
+    env = os.environ
+    return _sx_parse_config(
+        env.get("SX_OPT_TOPK_TOPP_COMPACT_KT", "128"),
+        env.get("SX_OPT_TOPK_TOPP_SYNCFREE_VOCABS", "248320"),
+        env.get("SX_OPT_TOPK_TOPP_STATS", "0"),
+        env.get("SX_OPT_TOPK_TOPP_STATS_EVERY", "2000"),
+    )
+
+
+def _sx_is_sm70(device: torch.device) -> bool:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    cached = _SX_SM70_DEVICE_CACHE.get(index)
+    if cached is None:
+        cached = torch.cuda.get_device_capability(index) == (7, 0)
+        _SX_SM70_DEVICE_CACHE[index] = cached
+    return cached
+
+
+def sm70_syncfree_topk_topp_eligible(
+    logits: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
+    mask_value: float = float("-inf"),
+) -> bool:
+    """Host-only gate for ``apply_top_k_top_p_sm70_syncfree``.
+
+    Reads only tensor metadata and the environment, never device values.
+    ``k is None`` (no row uses top-k) keeps the legacy route: then every
+    active row is top-p only, which the compact candidates cannot represent
+    in general.
+    """
+    if k is None or os.environ.get("SX_OPT_TOPK_TOPP_SYNCFREE", "1") == "0":
+        return False
+    if (
+        not logits.is_cuda
+        or logits.dtype != torch.float32
+        or logits.ndim != 2
+        or logits.stride(1) != 1
+        or mask_value != float("-inf")
+    ):
+        return False
+    batch_size, vocab_size = logits.shape
+    if batch_size == 0:
+        return False
+    if batch_size == 1 and os.environ.get("SX_OPT_TOPK_TOPP_SYNCFREE_B1", "1") == "0":
+        return False
+    if (
+        k.ndim != 1
+        or k.shape[0] != batch_size
+        or k.device != logits.device
+        or k.dtype not in (torch.int32, torch.int64)
+    ):
+        return False
+    if p is not None and (
+        p.ndim != 1
+        or p.shape[0] != batch_size
+        or p.device != logits.device
+        or not p.dtype.is_floating_point
+    ):
+        return False
+    cfg = _sx_config()
+    if cfg.vocabs is not None and vocab_size not in cfg.vocabs:
+        return False
+    if vocab_size < 2 * cfg.kt or vocab_size >= 2**31:
+        return False
+    if not current_platform.is_cuda() or not _sx_is_sm70(logits.device):
+        return False
+    # Direct graph-capture callers keep the legacy capture branch.
+    return not torch.cuda.is_current_stream_capturing()
+
+
+@triton.jit
+def _sx_compact_topk_topp_kernel(
+    LOGITS,
+    LOGITS_STRIDE,
+    CAND_V,
+    CAND_I,
+    CAND_STRIDE,
+    K,
+    P,
+    THRESH,
+    K_HARD,
+    P_HARD,
+    STATS,
+    VOCAB_SIZE: tl.constexpr,
+    KT: tl.constexpr,
+    FULL_BLOCK: tl.constexpr,
+):
+    """Decide one row from its KT largest candidates.
+
+    Writes THRESH (mask every logit < THRESH; -inf means "row not handled
+    here"), scatters -inf into the boundary tie members removed by top-p,
+    and writes K_HARD/P_HARD (the row's k/p for rows the Qrita kernel must
+    finish, V/1.0 otherwise).
+    """
+    NUM_FULL_TILES: tl.constexpr = (VOCAB_SIZE + FULL_BLOCK - 1) // FULL_BLOCK
+    row = tl.program_id(0).to(tl.int64)
+    row_logits = LOGITS + row * LOGITS_STRIDE
+    lanes = tl.arange(0, KT)
+
+    cand_v = tl.load(CAND_V + row * CAND_STRIDE + lanes)
+    cand_i = tl.load(CAND_I + row * CAND_STRIDE + lanes).to(tl.int64)
+
+    # Sort candidates by (value, token id) ascending. That is the order of the
+    # reference's stable full-row torch.sort (ties by ascending token id).
+    # Signed zero is canonicalised so -0.0 and +0.0 stay one tie class, as
+    # under float comparison. Packed keys are unique, so tl.sort needs no
+    # stability. Kept logits are never rewritten from these decoded values.
+    cand_v = tl.where(cand_v == 0.0, 0.0, cand_v)
+    bits = cand_v.to(tl.int32, bitcast=True)
+    key = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
+    packed = ((key.to(tl.int64) & 0xFFFFFFFF) << 32) | cand_i
+    packed = tl.sort(packed, descending=False)
+    s_key = ((packed >> 32) & 0xFFFFFFFF).to(tl.int32)
+    s_idx = (packed & 0xFFFFFFFF).to(tl.int32)
+    s_bits = tl.where(s_key < 0, s_key ^ 0x7FFFFFFF, s_key)
+    s_v = s_bits.to(tl.float32, bitcast=True)
+
+    top_lane = KT - 1
+    v_max = tl.max(s_v, axis=0)
+    v_last = tl.min(s_v, axis=0)  # smallest candidate
+
+    k_raw = tl.load(K + row).to(tl.int32)
+    topk_on = (k_raw > 0) & (k_raw < VOCAB_SIZE)
+    k_c = tl.minimum(tl.maximum(k_raw, 1), KT)
+    v_k = tl.max(tl.where(lanes == KT - k_c, s_v, float("-inf")), axis=0)
+
+    p = tl.full((), 1.0, tl.float32)
+    if P is not None:
+        p = tl.load(P + row).to(tl.float32)
+    # Like the Qrita kernel, p >= 1 means "no top-p" for the row.
+    topp_on = p < 1.0
+
+    finite_max = (v_max > float("-inf")) & (v_max < float("inf"))
+    all_masked = v_max == float("-inf")
+    # A smallest candidate of -inf means the row has fewer than KT finite
+    # logits (e.g. under a grammar mask), so every finite logit is a
+    # candidate. For k > KT the k-th largest is then -inf (v_k reads lane 0,
+    # which is v_last), and the row is exact here instead of hard.
+    k_fits = topk_on & ((k_raw <= KT) | (v_last == float("-inf")))
+    # Every value >= v_k is a candidate when the smallest candidate is below
+    # v_k, or when v_k is -inf (then fewer than k finite values exist).
+    complete = (v_last < v_k) | (v_k == float("-inf"))
+    compact = k_fits & complete & finite_max
+    # The v_k tie group may continue past the candidates.
+    overflow = k_fits & (v_k == v_last) & (v_k > float("-inf")) & finite_max
+    topp_only = (~topk_on) & topp_on & finite_max
+    extended = overflow | topp_only
+    noop = ((~topk_on) & (~topp_on)) | all_masked
+
+    # Top-k (reference contract: keep every value >= the k-th largest).
+    kth = tl.where(topk_on, v_k, float("-inf"))
+    keep_k = s_v >= kth
+
+    # Extended rows: the mass outside the candidates enters the softmax
+    # denominator and the ascending cumsum ahead of the candidates.
+    need_scan = extended & topp_on
+    below_sum = tl.zeros((), dtype=tl.float32)
+    n_eq_total = tl.zeros((), dtype=tl.int32)
+    if need_scan:
+        for t in range(0, NUM_FULL_TILES):
+            offs = t * FULL_BLOCK + tl.arange(0, FULL_BLOCK)
+            in_row = offs < VOCAB_SIZE
+            x = tl.load(row_logits + offs, mask=in_row, other=float("-inf"))
+            below = in_row & (x < v_last)
+            below_sum += tl.sum(
+                tl.where(below, tldevice.exp(x - v_max), 0.0), axis=0
+            )
+            n_eq_total += tl.sum((in_row & (x == v_last)).to(tl.int32), axis=0)
+    n_eq_cand = tl.sum((s_v == v_last).to(tl.int32), axis=0)
+    extra_eq = tl.where(need_scan, n_eq_total - n_eq_cand, 0)
+    e_last = tldevice.exp(v_last - v_max)
+    tail = tl.where(topp_only, below_sum, 0.0) + tl.where(
+        extra_eq > 0, extra_eq.to(tl.float32) * e_last, 0.0
+    )
+
+    # Top-p as the reference computes it: softmax over the kept values
+    # (expf(x - max) / sum, IEEE division), ascending cumsum, remove where
+    # cumsum <= 1 - p, never the largest value. Only the summation order
+    # differs from torch's softmax/cumsum kernels.
+    e = tl.where(keep_k, tldevice.exp(s_v - v_max), 0.0)
+    z = tl.sum(e, axis=0) + tail
+    q = tl.div_rn(e, z)
+    cum = tl.cumsum(q, axis=0) + tl.div_rn(tail, z)
+    rm = (cum <= 1.0 - p) & (lanes != top_lane)
+    keep = keep_k & ~(rm & topp_on)
+
+    thr = tl.min(tl.where(keep, s_v, float("inf")), axis=0)
+    # An extended row is exact when top-p removes the whole v_last tie group
+    # (so every kept value is a candidate), or when it is an overflow row
+    # without top-p (keep every value >= v_k == v_last).
+    ext_ok = extended & (((~topp_on) & overflow) | (thr > v_last))
+    handled = compact | ext_ok
+    hard = ~(handled | noop)
+
+    tl.store(THRESH + row, tl.where(handled, thr, float("-inf")))
+    k_q = tl.where(topk_on, k_raw, VOCAB_SIZE)
+    tl.store(K_HARD + row, tl.where(hard, k_q, VOCAB_SIZE))
+    tl.store(P_HARD + row, tl.where(hard, p, 1.0))
+    # Values below thr are masked by the threshold pass. Removed candidates at
+    # or above thr are exactly the lower-id members of the thr tie group.
+    scatter = handled & (~keep) & (s_v >= thr)
+    tl.store(
+        row_logits + s_idx,
+        tl.full((KT,), float("-inf"), tl.float32),
+        mask=scatter,
+    )
+
+    if STATS is not None:
+        tl.atomic_add(STATS + 0, compact.to(tl.int64))
+        tl.atomic_add(STATS + 1, ext_ok.to(tl.int64))
+        tl.atomic_add(STATS + 2, hard.to(tl.int64))
+        tl.atomic_add(STATS + 3, noop.to(tl.int64))
+
+
+@triton.jit
+def _sx_threshold_mask_kernel(
+    LOGITS,
+    LOGITS_STRIDE,
+    THRESH,
+    VOCAB_SIZE,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    thr = tl.load(THRESH + row)
+    if thr == float("-inf"):
+        return
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    in_row = offs < VOCAB_SIZE
+    ptr = LOGITS + row.to(tl.int64) * LOGITS_STRIDE + offs
+    x = tl.load(ptr, mask=in_row, other=float("inf"))
+    tl.store(
+        ptr,
+        tl.full((BLOCK,), float("-inf"), tl.float32),
+        mask=in_row & (x < thr),
+    )
+
+
+def _sx_stats_tensor(device: torch.device) -> torch.Tensor:
+    stats = _SX_STATS.get(device)
+    if stats is None:
+        stats = torch.zeros(len(_SX_STATS_FIELDS), dtype=torch.int64, device=device)
+        _SX_STATS[device] = stats
+    return stats
+
+
+def get_sm70_syncfree_topk_topp_stats(
+    device: torch.device | None = None,
+) -> dict[str, int]:
+    """Row-class counters (SX_OPT_TOPK_TOPP_STATS=1). Synchronises."""
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    stats = _SX_STATS.get(device)
+    if stats is None:
+        return dict.fromkeys(_SX_STATS_FIELDS, 0)
+    return dict(zip(_SX_STATS_FIELDS, stats.tolist()))
+
+
+def _sx_compact_select(
+    logits: torch.Tensor,
+    k: torch.Tensor,
+    p: torch.Tensor | None,
+    kt: int,
+    stats: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Candidate pass: returns (thresh, k_hard, p_hard) and scatters -inf
+    into removed boundary tie members in place. No host synchronisation."""
+    batch_size = logits.shape[0]
+    vocab_size = logits.shape[1]
+    # sorted=False: the kernel canonicalises the order itself, and the result
+    # does not depend on which tied values torch.topk returns at the KT-th
+    # position (such values are never kept from the candidate list).
+    cand_v, cand_i = torch.topk(logits, kt, dim=1, largest=True, sorted=False)
+    # Separate allocations keep k_hard/p_hard 16-byte aligned, so the Qrita
+    # launch reuses the legacy route's Triton specialisation.
+    thresh = torch.empty(batch_size, dtype=torch.float32, device=logits.device)
+    p_hard = torch.empty(batch_size, dtype=torch.float32, device=logits.device)
+    k_hard = torch.empty(batch_size, dtype=torch.int32, device=logits.device)
+    _sx_compact_topk_topp_kernel[(batch_size,)](
+        logits,
+        logits.stride(0),
+        cand_v,
+        cand_i,
+        cand_v.stride(0),
+        k,
+        p,
+        thresh,
+        k_hard,
+        p_hard,
+        stats,
+        VOCAB_SIZE=vocab_size,
+        KT=kt,
+        FULL_BLOCK=_SX_FULL_BLOCK,
+        num_warps=4 if kt <= 256 else 8,
+    )
+    return thresh, k_hard, p_hard
+
+
+def apply_top_k_top_p_sm70_syncfree(
+    logits: torch.Tensor,
+    k: torch.Tensor,
+    p: torch.Tensor | None,
+) -> torch.Tensor:
+    """Sync-free top-k/top-p masking, in place (see the module docstring).
+
+    Callers must check ``sm70_syncfree_topk_topp_eligible`` first. Returns
+    ``logits`` itself.
+    """
+    global _SX_LOGGED
+    batch_size, vocab_size = logits.shape
+    cfg = _sx_config()
+    stats = _sx_stats_tensor(logits.device) if cfg.stats else None
+    # The kernels index K/P as dense 1-D arrays. `.to()` returns the input
+    # itself when the dtype already matches, so an expanded (stride-0) or
+    # sliced per-row parameter must be made dense here (spec-decode draft
+    # sampling passes `param.expand(num_logits)`).
+    k32 = k.to(torch.int32).contiguous()
+    p32 = p.to(torch.float32).contiguous() if p is not None else None
+    if not _SX_LOGGED:
+        _SX_LOGGED = True
+        logger.info(
+            "Using SM70 sync-free compact top-k/top-p (KT=%d, "
+            "SX_OPT_TOPK_TOPP_SYNCFREE=0 restores the legacy route).",
+            cfg.kt,
+        )
+
+    thresh, k_hard, p_hard = _sx_compact_select(logits, k32, p32, cfg.kt, stats)
+    _sx_threshold_mask_kernel[(batch_size, triton.cdiv(vocab_size, _SX_FULL_BLOCK))](
+        logits,
+        logits.stride(0),
+        thresh,
+        vocab_size,
+        BLOCK=_SX_FULL_BLOCK,
+    )
+
+    # Hard rows: the unchanged Qrita kernel, restricted on device. Every other
+    # row carries k=V, p=1 and is skipped after two scalar loads. Qrita's
+    # ambiguity flags are not acted on (no host fence); see module docstring.
+    topp_enabled = p is not None
+    num_sm = num_compute_units(logits.device.index)
+    num_programs = min(num_sm, batch_size)
+    buffer, normal_cdf_to_sigma_table, percentile_to_std_table = _qrita_workspace(
+        logits, num_programs, num_sm
+    )
+    launch_kwargs: dict[str, int] = {}
+    if _use_sm70_topk_topp_8_warps(
+        logits.device, batch_size, vocab_size, True, topp_enabled
+    ):
+        launch_kwargs["num_warps"] = 8
+    reference_rows = torch.empty(batch_size, dtype=torch.bool, device=logits.device)
+    _topk_topp_kernel[(num_programs,)](
+        logits,
+        logits.stride(0),
+        buffer,
+        percentile_to_std_table,
+        normal_cdf_to_sigma_table,
+        k_hard,
+        p_hard if topp_enabled else logits,
+        BATCH_SIZE=batch_size,
+        MASK_VALUE=float("-inf"),
+        VOCAB_SIZE=vocab_size,
+        BLOCK_SIZE=8192,
+        BLOCK_SIZE_TRUNC=4096,
+        TOPK_ENABLED=True,
+        TOPP_ENABLED=topp_enabled,
+        REFERENCE_ROWS=reference_rows,
+        **launch_kwargs,
+    )
+
+    if stats is not None:
+        hard = k_hard < vocab_size
+        if topp_enabled:
+            hard |= p_hard < 1.0
+        stats[4] += (reference_rows & hard).sum()
+        calls = _SX_STATS_CALLS.get(logits.device, 0) + 1
+        _SX_STATS_CALLS[logits.device] = calls
+        if calls % cfg.stats_every == 0:
+            logger.info(
+                "SM70 sync-free top-k/top-p rows after %d calls: %s",
+                calls,
+                get_sm70_syncfree_topk_topp_stats(logits.device),
+            )
     return logits
 
 

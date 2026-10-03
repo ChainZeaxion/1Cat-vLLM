@@ -14,7 +14,11 @@ from vllm.platforms import CpuArchEnum, current_platform
 from vllm.triton_utils import HAS_TRITON
 
 if HAS_TRITON:
-    from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
+    from vllm.v1.sample.ops.topk_topp_triton import (
+        apply_top_k_top_p_sm70_syncfree,
+        apply_top_k_top_p_triton,
+        sm70_syncfree_topk_topp_eligible,
+    )
 
 logger = init_logger(__name__)
 
@@ -330,6 +334,13 @@ def apply_top_k_top_p(
         if HAS_TRITON:
             return apply_top_k_top_p_triton(logits, k, p)
         return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
+
+    # SX_OPT (SX_OPT_TOPK_TOPP_SYNCFREE, default on): SM70 sync-free compact
+    # top-k/top-p for every batch size, including B=1, whose legacy route is
+    # the full-vocabulary sort below. See topk_topp_triton.py.
+    if HAS_TRITON and sm70_syncfree_topk_topp_eligible(logits, k, p):
+        assert k is not None
+        return apply_top_k_top_p_sm70_syncfree(logits, k, p)
 
     if (
         HAS_TRITON

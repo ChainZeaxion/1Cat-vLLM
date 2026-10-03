@@ -4,6 +4,7 @@
 import asyncio
 import io
 import json
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -80,6 +81,18 @@ if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = init_logger(__name__)
+
+
+def _sx_skip_tool_parser_without_tools() -> bool:
+    """SX_OPT_SKIP_TOOL_PARSER_WITHOUT_TOOLS (default "1"; "0" = old behaviour).
+
+    When on, a streamed chat request without tools, or with tool_choice
+    "none", does not run the configured tool parser over every delta. Such a
+    request cannot receive tool calls, so its content passes through
+    unchanged (design_5 cpu-8). The Mistral grammar path and the harmony
+    path are never affected.
+    """
+    return os.environ.get("SX_OPT_SKIP_TOOL_PARSER_WITHOUT_TOOLS", "1") != "0"
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -495,6 +508,21 @@ class OpenAIServingChat(OpenAIServing):
                     if p is not None:
                         p._stream_state.tool_call_id_type = self.tool_call_id_type
                         p._stream_state.history_tool_call_cnt = history_tool_call_cnt
+                # SX_OPT: without tools (or with tool_choice "none") the
+                # tool parser can only rescan every delta. Detach it, so
+                # parse_delta passes content through after any reasoning.
+                # The Mistral grammar path (which asserts a tool parser and
+                # sets _grammar_from_tool_parser even without tools) and the
+                # harmony path keep their parser unchanged.
+                if (
+                    _sx_skip_tool_parser_without_tools()
+                    and not is_mistral_grammar_path
+                    and not self.use_harmony
+                    and (not request.tools or request.tool_choice == "none")
+                ):
+                    for p in parsers:
+                        if p is not None:
+                            p.tool_parser = None
             else:
                 parsers = [None] * num_choices
         except Exception as e:

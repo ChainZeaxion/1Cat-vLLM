@@ -155,6 +155,79 @@ constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
 static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
 
+// [SX_OPT_PUSH_AR_WIDE] Every Qwen3.8 FP16 row multiple [M, 2560] with
+// M in [2, 32] (10..160 KiB, 5-KiB steps), for the regular and the sum2 push
+// collective. It reuses the storage, sentinel and per-CTA epoch protocol
+// above unchanged; payload and epoch capacity are asserted below.
+//
+// Launch geometry: one 16-byte pack per thread, so the smallest covering grid
+// is ceil(bytes / 2048) CTAs of 128 threads. It is also a protocol requirement,
+// not only a speed choice: every push launch must map pack offset o to
+// CTA o / 128 (the only grid-stride launch, 320 KiB on 80 CTAs, wraps only
+// offsets >= 160 KiB that no other payload touches), so that consecutive push
+// collectives that touch o use the same CTA and therefore alternate that CTA's
+// epoch. A smaller grid would remap o to another CTA whose epoch may equal the
+// previous call's, letting a fast rank overwrite a slot that a slow rank has
+// not consumed. Idle CTAs above the covering count only flip their own epoch
+// word, which is safe because every intervening push collective with a
+// non-empty payload is a full cross-rank barrier.
+constexpr size_t kSm70Tp4PushAllreduceQwen38RowBytes = 2560 * sizeof(half);
+constexpr size_t kSm70Tp4PushAllreduceQwen38WideMinRows = 2;
+constexpr size_t kSm70Tp4PushAllreduceQwen38WideMaxRows = 32;
+constexpr size_t kSm70Tp4PushAllreducePackBytesPerBlock =
+    static_cast<size_t>(kSm70Tp4PushAllreduceThreads) * 16;
+static_assert(kSm70Tp4PushAllreduceQwen38WideMaxRows *
+                      kSm70Tp4PushAllreduceQwen38RowBytes <=
+                  kSm70Tp4PushAllreduceMaxBytes,
+              "wide push payload exceeds the per-rank push slot");
+static_assert((kSm70Tp4PushAllreduceQwen38WideMaxRows *
+                   kSm70Tp4PushAllreduceQwen38RowBytes +
+               kSm70Tp4PushAllreducePackBytesPerBlock - 1) /
+                      kSm70Tp4PushAllreducePackBytesPerBlock <=
+                  kSm70Tp4PushAllreduceBlocks,
+              "wide push covering grid exceeds the push CTA limit");
+static_assert(kSm70Tp4PushAllreduceBlocks * sizeof(uint32_t) <=
+                  kSm70Tp4PushAllreduceSignalBytes,
+              "push CTA limit exceeds the per-CTA epoch words");
+static_assert(kSm70Tp4PushAllreduceQwen38RowBytes % 16 == 0,
+              "wide push rows must be whole 16-byte packs");
+
+// Same semantics as the Python gate in custom_all_reduce.py:
+// os.environ.get("SX_OPT_PUSH_AR_WIDE", "1") != "0".
+inline bool sm70_tp4_push_allreduce_wide_enabled() {
+  const char* raw = std::getenv("SX_OPT_PUSH_AR_WIDE");
+  return raw == nullptr || std::strcmp(raw, "0") != 0;
+}
+
+inline bool sm70_tp4_push_allreduce_wide_bytes(size_t bytes) {
+  return bytes % kSm70Tp4PushAllreduceQwen38RowBytes == 0 &&
+         bytes >= kSm70Tp4PushAllreduceQwen38WideMinRows *
+                      kSm70Tp4PushAllreduceQwen38RowBytes &&
+         bytes <= kSm70Tp4PushAllreduceQwen38WideMaxRows *
+                      kSm70Tp4PushAllreduceQwen38RowBytes;
+}
+
+inline int sm70_tp4_push_allreduce_covering_blocks(size_t bytes) {
+  return static_cast<int>((bytes + kSm70Tp4PushAllreducePackBytesPerBlock - 1) /
+                          kSm70Tp4PushAllreducePackBytesPerBlock);
+}
+
+inline int sm70_tp4_push_allreduce_wide_blocks(size_t bytes) {
+  const int min_blocks = sm70_tp4_push_allreduce_covering_blocks(bytes);
+  // Tuning override for microbenchmarks only. It can widen the grid (idle
+  // CTAs), never shrink it below the covering count (see above).
+  const char* raw = std::getenv("SX_OPT_PUSH_AR_WIDE_BLOCKS");
+  if (raw != nullptr && raw[0] != '\0') {
+    char* end = nullptr;
+    const long parsed = std::strtol(raw, &end, 10);
+    if (end != raw && *end == '\0' && parsed >= min_blocks &&
+        parsed <= kSm70Tp4PushAllreduceBlocks) {
+      return static_cast<int>(parsed);
+    }
+  }
+  return min_blocks;
+}
+
 inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
                                           bool allow_generic = false) {
   // Experimental message-size admission, independent of model or batch shape.
@@ -196,13 +269,24 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
       const int parsed = std::atoi(blocks);
       const int min_blocks = (bytes + kSm70Tp4PushAllreduceThreads * 16 - 1) /
                              (kSm70Tp4PushAllreduceThreads * 16);
-      // This push kernel handles one pack per thread, without a grid-stride
-      // loop. An undersized launch silently leaves the output tail unwritten.
+      // An undersized launch would take the grid-stride loop and remap pack
+      // offsets to other CTAs, breaking the per-CTA epoch alternation between
+      // consecutive push collectives (see the wide-admission note above).
       if (parsed >= min_blocks && parsed <= kSm70Tp4PushAllreduceBlocks) {
         return parsed;
       }
     }
     return static_cast<int>(bytes / (kSm70Tp4PushAllreduceThreads * 16));
+  }
+  // [SX_OPT_PUSH_AR_WIDE] Every other Qwen3.8 row multiple in 10..160 KiB.
+  // The branches above keep their established grids (5 KiB: 3, 20/40 KiB:
+  // 10/20, 80 KiB: 80, 160 KiB with CONCURRENCY: 80; with SMALL_MESSAGES the
+  // regular collective already takes ceil(bytes / 2048) up to 80 KiB), so
+  // this adds the remaining 10/15/25/30/35/45..75 KiB (sum2, and regular
+  // without SMALL_MESSAGES) and 85..155 KiB (both).
+  if (batch_enabled && sm70_tp4_push_allreduce_wide_enabled() &&
+      sm70_tp4_push_allreduce_wide_bytes(bytes)) {
+    return sm70_tp4_push_allreduce_wide_blocks(bytes);
   }
   const char* mtp5 = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5");
   return bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes &&
@@ -2247,11 +2331,17 @@ class CustomAllreduce {
     if constexpr (std::is_same_v<T, half>) {
       const char* batch =
           std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH");
+      // [SX_OPT_PUSH_AR_WIDE] also admits every Qwen3.8 row multiple in
+      // 10..160 KiB. Both kernels upcast the four ranks' FP16 (a + b) in rank
+      // order 0..3 into FP32, so finite results stay bitwise equal to the
+      // pull cross_device_reduce_sum2_1stage used below 512 KiB at TP4.
       const bool qwen38_batch =
           (batch == nullptr || std::strcmp(batch, "1") == 0) &&
           (bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ||
            bytes == kSm70Tp4PushAllreduceQwen38M8Bytes ||
-           bytes == kSm70Tp4PushAllreduceBytes);
+           bytes == kSm70Tp4PushAllreduceBytes ||
+           (sm70_tp4_push_allreduce_wide_enabled() &&
+            sm70_tp4_push_allreduce_wide_bytes(bytes)));
       const char* batch_fastpath =
           std::getenv("VLLM_SM70_QWEN38_BATCH_FASTPATH");
       const bool qwen38_m2 = bytes == kSm70Tp4PushAllreduceQwen38M2Bytes &&
