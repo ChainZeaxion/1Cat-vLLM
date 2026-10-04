@@ -214,10 +214,9 @@ def nvfp4_qpn2_dense_linear(
 
 
 # Mirror of ``kQpn2DispatchMaxRows`` in nvfp4_qpn2_sm70.cu.
-# [本地 2026-10-04] 32 -> 64 与 .cu 对齐（.cu 已于 09-30 改为 64：DFlash2 NST=5
-# @ max_num_seqs=8 verify 8*(1+5)=48 行，旧 32 窗口会把它静默推到 TurboMind
-# 回退路）。此前 Python 镜像未同步 ⇒ M=48 走 dense；对齐后 M<=64 保持 QPN2 快路。
-QPN2_DISPATCH_MAX_ROWS = 64
+# [本地 2026-10-04] 32 -> 64 -> 128 与 .cu 对齐。64 覆盖 8并发 NST=5 的 48 行；
+# 128 覆盖 16并发 NST=7 的 128 行（NST=5 -> 96）。M>该值才落 dense prefill 回退。
+QPN2_DISPATCH_MAX_ROWS = 128
 
 
 def _nvfp4_qpn2_dispatch_linear(

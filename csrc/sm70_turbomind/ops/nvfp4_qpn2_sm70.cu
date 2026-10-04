@@ -36,14 +36,18 @@ namespace {
 
 constexpr int kPrepareThreads = 256;
 constexpr int kQpn2RowsPerCta = 8;
-constexpr int kQpn2MaxRows = 64;
+constexpr int kQpn2MaxRows = 128;
 // 2026-09-30: 32 -> 64 to match kQpn2MaxRows. DFlash2 NST=5 @ max_num_seqs=8
 // verifies 8 * (1 + 5) = 48 rows, which the previous 32-row window silently
 // pushed onto the TurboMind fallback path. The kernel already tiles M via
 // grid.y (launch_qpn2: row_blocks = ceil(m / (kQpn2RowsPerCta * RowTiles)))
 // and its own assert admits kQpn2MaxRows, so widening the dispatch window only
 // changes which of the two implemented paths a shape takes.
-constexpr int kQpn2DispatchMaxRows = 64;
+// 2026-10-04: 64 -> 128 for 16-way concurrency. DFlash2 NST=7 @ max_num_seqs=16
+// verifies 16 * (1 + 7) = 128 rows (NST=5 -> 96). The generic launch_qpn2 path
+// (row_blocks = ceil(m / kRowsPerCta), no M ceiling) already handles m>32, so
+// this only moves the TORCH_CHECK / dispatch boundary.
+constexpr int kQpn2DispatchMaxRows = 128;
 
 __device__ __forceinline__ int qpn2_col_from_lane(int lane) {
   return ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);

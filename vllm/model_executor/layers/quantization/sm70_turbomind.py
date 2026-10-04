@@ -446,9 +446,9 @@ def prepare_nvfp4_linear(
 
 # Mirror of ``kQpn2DispatchMaxRows`` in nvfp4_qpn2_sm70.cu: rows up to this
 # take the QPN2 decode kernels, larger M takes the dense prefill.
-# [本地 2026-10-04] 32 -> 64 与 .cu 对齐（.cu 09-30 已改为 64，覆盖 DFlash2
-# NST=5 @ 8并发 的 48 行；Python 镜像此前未同步）。
-QPN2_DISPATCH_MAX_ROWS = 64
+# [本地 2026-10-04] 32 -> 64 -> 128 与 .cu 对齐（覆盖 8并发 NST=5 的 48 行，
+# 及 16并发 NST=7 的 128 行）。
+QPN2_DISPATCH_MAX_ROWS = 128
 QPN2_GROUP_SIZE = 16
 
 # Launch configurations (split-K, accumulator chains) measured on the

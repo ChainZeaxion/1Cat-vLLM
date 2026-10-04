@@ -2007,8 +2007,14 @@ void fp8_qpn8_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
       qpn8_m32_native_enabled && m > 16 && m <= 32 &&
       ((dense_shape && (split_k == 12 || split_k == 16)) || native_gated_m32) &&
       accumulator_chains == 2 && !prefetch_codes;
+  // [本地 2026-10-04] chunked 准入 32 -> 128：复用下方「for row<m step 16」行循环，
+  // 使 16 并发 × (k+1) 的 M=48/64/96/128 走 QPN8 快路，而非
+  // fp8_qpn8_prefill_sm70_out（整权重 dequant + cuBLAS）。每块 ≤16 行，
+  // 仍满足 fp8_qpn8_gemm_sm70_out 的 m<=32 断言。kw=7 时 per-16 块数 = 8。
+  constexpr int64_t kQpn8ChunkedMaxRows = 128;
   const bool admitted_m = (qpn8_m16_enabled && m <= 16) ||
-                          (qpn8_m32_chunked_enabled && m <= 32) || native_m32;
+                          (qpn8_m32_chunked_enabled && m <= kQpn8ChunkedMaxRows) ||
+                          native_m32;
   if (admitted_m && channel_scales && split_k <= (gated_silu ? 8 : 16) &&
       (dense_shape || gated_shape)) {
     if (native_m32) {
