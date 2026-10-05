@@ -2111,7 +2111,10 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     // Request-major q8 batches carry one contiguous row-length panel per
     // request. Keep the per-group pointer aligned with the q/block-table
     // offsets before any visibility or max-length reads.
-    row_lengths += static_cast<int64_t>(group_idx) * MAX_QUERY_TOKENS;
+    // Per-request stride is the ACTUAL query_len: the request-major panel is
+    // [batch_size * query_len]. MAX_QUERY_TOKENS reads the wrong request's
+    // lengths whenever query_len < MAX_QUERY_TOKENS (NST=5 -> q6).
+    row_lengths += static_cast<int64_t>(group_idx) * query_len;
   }
 
   if constexpr (!SPARSE_PAGE4) {
@@ -2226,7 +2229,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     const int head_idx = head_start + local_head;
     if (token_idx < query_len && head_idx < kGroupedVerifyHeads) {
       const int64_t query_row =
-          static_cast<int64_t>(group_idx) * MAX_QUERY_TOKENS + token_idx;
+          static_cast<int64_t>(group_idx) * query_len + token_idx;
       shared_q_vec[row * kSharedQVecsPerRow + vec_col] = __ldg(
           q_vec + (query_row * kGroupedVerifyHeads + head_idx) * kVecsPerRow +
           vec_col);
@@ -2696,7 +2699,10 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
   }
 
   if constexpr (ROW_SEQLENS) {
-    row_lengths += static_cast<int64_t>(group_idx) * MAX_QUERY_TOKENS;
+    // Per-request stride is the ACTUAL query_len: the request-major panel is
+    // [batch_size * query_len]. MAX_QUERY_TOKENS reads the wrong request's
+    // lengths whenever query_len < MAX_QUERY_TOKENS (NST=5 -> q6).
+    row_lengths += static_cast<int64_t>(group_idx) * query_len;
   }
 
   if constexpr (!SPARSE_PAGE4) {
@@ -2811,7 +2817,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     const int head_idx = head_start + local_head;
     if (token_idx < query_len && head_idx < kGroupedVerifyHeads) {
       const int64_t query_row =
-          static_cast<int64_t>(group_idx) * MAX_QUERY_TOKENS + token_idx;
+          static_cast<int64_t>(group_idx) * query_len + token_idx;
       shared_q_vec[row * kSharedQVecsPerRow + vec_col] = __ldg(
           q_vec + (query_row * kGroupedVerifyHeads + head_idx) * kVecsPerRow +
           vec_col);
@@ -3344,7 +3350,9 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
          kGroupedVerifyHeadDim;
 
   if constexpr (ROW_SEQLENS) {
-    row_lengths += static_cast<int64_t>(request_idx) * MAX_QUERY_TOKENS;
+    // Match the query_len output stride above; MAX_QUERY_TOKENS would read
+    // the wrong request's lengths whenever query_len < MAX_QUERY_TOKENS.
+    row_lengths += static_cast<int64_t>(request_idx) * query_len;
   }
 
   int total_kv = seq_lens[0];

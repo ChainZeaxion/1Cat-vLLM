@@ -2074,7 +2074,11 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     return;
   }
   if constexpr (ROW_SEQLENS) {
-    row_lengths += static_cast<int64_t>(group_idx) * MAX_QUERY_TOKENS;
+    // Per-request stride is the ACTUAL query_len: the request-major panel is
+    // [batch_size * query_len]. MAX_QUERY_TOKENS reads the wrong request's
+    // lengths whenever query_len < MAX_QUERY_TOKENS (NST=5 -> q6), which
+    // silently corrupts visibility and drops speculative acceptance.
+    row_lengths += static_cast<int64_t>(group_idx) * query_len;
   }
 
   if constexpr (!SPARSE_PAGE4) {
@@ -2704,7 +2708,9 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
   out += static_cast<int64_t>(request_idx) * query_len * kGroupedVerifyHeads *
          kGroupedVerifyHeadDim;
   if constexpr (ROW_SEQLENS) {
-    row_lengths += static_cast<int64_t>(request_idx) * MAX_QUERY_TOKENS;
+    // Match the query_len output stride above; MAX_QUERY_TOKENS would read
+    // the wrong request's lengths whenever query_len < MAX_QUERY_TOKENS.
+    row_lengths += static_cast<int64_t>(request_idx) * query_len;
   }
 
   int total_kv = seq_lens[0];
