@@ -1453,13 +1453,17 @@ class MambaManager(SingleTypeKVCacheManager):
             num_required_blocks = (
                 cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
             )
-            if num_required_blocks == len(req_blocks):
+            if num_required_blocks <= len(req_blocks):
+                # [本地 2026-10-06] 移植上游 vllm main 容错：被拒草稿会令
+                # num_computed_tokens 回退跨越 block 边界（scheduler 中
+                # `num_computed_tokens -= num_rejected`），使 cdiv 少 1，
+                # 而 req_blocks 仍持上一轮（过分配）的块数 ⇒ required < len。
+                # 此时保留多余块、本步不分配；token 增长后 required 自然追平。
+                # 原代码此处 assert(num_required_blocks > len(req_blocks))，
+                # 会在该情形直接崩掉 EngineCore（num_required_blocks 63 < 64）。
+                self._allocated_block_reqs.add(request_id)
                 return []
             else:
-                assert num_required_blocks > len(req_blocks), (
-                    "num_required_blocks "
-                    f"{num_required_blocks} < len(req_blocks) {len(req_blocks)}"
-                )
                 prev_block_len = len(req_blocks)
                 blocks_allocated = request_id in self._allocated_block_reqs
                 # [本地 X2 2026-10-03] The index recorded by the previous
