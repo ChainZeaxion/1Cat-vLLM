@@ -218,10 +218,32 @@ class BaseRenderer(ABC, Generic[_T]):
             mm_counts=dict.fromkeys(mm_limits, 1),
             mm_options=mm_config.limit_per_prompt,
         )
+        _t_build = time.perf_counter()
         _ = processor.apply(processor_inputs, timing_ctx=TimingContext(enabled=False))
+        _t_apply = time.perf_counter()
 
-        elapsed = time.perf_counter() - start_time
-        logger.info("%s warmup completed in %.3fs", log_prefix, elapsed)
+        elapsed = _t_apply - start_time
+        # [本地 2026-10-06] 分段计时：build 主要是惰性构造 HF image processor
+        # (AutoImageProcessor.from_pretrained ~12s 起，engine init 期 CPU 争用下 ~30s)，
+        # apply 极快。dummy 图尺寸对总耗时几乎无影响（已实测 10016×4992 与 1024×1024 同耗时）。
+        logger.info(
+            "%s warmup completed in %.3fs (build=%.3fs apply=%.3fs)",
+            log_prefix, elapsed, _t_build - start_time, _t_apply - _t_build,
+        )
+
+    def _warmup_mm_processor_safe(
+        self,
+        processor: "BaseMultiModalProcessor",
+    ) -> None:
+        try:
+            self._warmup_mm_processor(processor, log_prefix="Multi-modal")
+        except Exception:
+            logger.warning("Multi-modal warmup failed", exc_info=True)
+        finally:
+            try:
+                self.clear_mm_cache()
+            except Exception:
+                pass
 
     def warmup(self, chat_params: ChatParams) -> None:
         """
@@ -246,16 +268,33 @@ class BaseRenderer(ABC, Generic[_T]):
             logger.warning("Chat template warmup failed", exc_info=True)
 
         if self.mm_processor:
-            try:
-                logger.debug("Warming up multi-modal processing...")
-                self._warmup_mm_processor(
-                    self.mm_processor,
-                    log_prefix="Multi-modal",
-                )
-            except Exception:
-                logger.warning("Multi-modal warmup failed")
-            finally:
-                self.clear_mm_cache()
+            # [本地 2026-10-06 启动优化] MM warmup 的唯一重头是**惰性构造 HF image
+            # processor**（`AutoImageProcessor.from_pretrained`），实测单独 ~12s、
+            # 与 engine init 争 CPU 时 ~30s；dummy 图大小几乎无影响。它只预热 MM 路径，
+            # **与文本请求无关**，故默认放后台守护线程：服务就绪不再等它，文本流量零影响；
+            # 首个 MM 请求若早于线程完成，仅与之共享同一 processor（与并发请求同路径，本就线程安全）。
+            # 置 VLLM_SM70_MM_WARMUP_BACKGROUND=0 可回退为原先的同步阻塞行为。
+            import os as _os
+            if _os.environ.get("VLLM_SM70_MM_WARMUP_BACKGROUND", "1") != "0":
+                logger.debug("Warming up multi-modal processing (background)...")
+                import threading as _threading
+                _threading.Thread(
+                    target=self._warmup_mm_processor_safe,
+                    args=(self.mm_processor,),
+                    name="sm70-mm-warmup",
+                    daemon=True,
+                ).start()
+            else:
+                try:
+                    logger.debug("Warming up multi-modal processing...")
+                    self._warmup_mm_processor(
+                        self.mm_processor,
+                        log_prefix="Multi-modal",
+                    )
+                except Exception:
+                    logger.warning("Multi-modal warmup failed")
+                finally:
+                    self.clear_mm_cache()
 
         if self._readonly_mm_processor is not None:
             try:
