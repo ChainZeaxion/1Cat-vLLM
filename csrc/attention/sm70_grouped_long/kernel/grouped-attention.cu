@@ -4961,10 +4961,11 @@ at::Tensor private_grouped_e4m3_fp32_paged(
           q.size(0) % batch_size == 0 &&
           (batch_size == 1
                ? (q.size(0) >= 2 && q.size(0) <= 8)
-               : q.size(0) == batch_size * 8) &&
+               : (q.size(0) % batch_size == 0 && q.size(0) / batch_size >= 2 &&
+                  q.size(0) / batch_size <= 8)) &&
           row_lengths.sizes() == at::IntArrayRef({q.size(0)}) &&
           row_lengths.scalar_type() == at::kInt && row_lengths.is_contiguous(),
-      "E4M3 grouped FP32 requires q2..8/B1 or request-major q8/B2..16 "
+      "E4M3 grouped FP32 requires q2..8/B1 or request-major q2..8/B2..16 "
       "and per-query int32 lengths");
   TORCH_CHECK(out.sizes() == q.sizes() && out.is_contiguous() &&
                   out.scalar_type() == at::kHalf,

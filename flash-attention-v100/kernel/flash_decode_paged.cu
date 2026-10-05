@@ -400,7 +400,7 @@ bool xqa_batch_context_routing_trace_enabled() {
 XQABatchContextRoute select_xqa_batch_context_route(const int batch_size,
                                                     const int max_seq_len,
                                                     const int partition_size) {
-  if (!xqa_batch_context_routing_enabled() || batch_size < 4 ||
+  if (!xqa_batch_context_routing_enabled() || batch_size < 2 ||
       max_seq_len <= 0) {
     return XQABatchContextRoute::kDisabled;
   }
@@ -4479,10 +4479,13 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
           block_table.scalar_type() == at::kInt && block_table.size(1) > 0 &&
           block_table.size(1) * k.size(1) <= 266240 &&
           q.size(0) % batch_size == 0 &&
-          (batch_size == 1 ? q.size(0) <= 8 : q.size(0) == batch_size * 8) &&
+(batch_size == 1
+              ? q.size(0) <= 8
+              : (q.size(0) % batch_size == 0 && q.size(0) / batch_size >= 2 &&
+                 q.size(0) / batch_size <= 8)) &&
           row_lengths.sizes() == at::IntArrayRef({q.size(0)}) &&
           row_lengths.scalar_type() == at::kInt && row_lengths.is_contiguous(),
-      "E4M3 grouped FP32 requires q2..8/B1 or request-major q8/B2..16 "
+      "E4M3 grouped FP32 requires q2..8/B1 or request-major q2..8/B2..16 "
       "and per-query int32 lengths");
   TORCH_CHECK(out.sizes() == q.sizes() && out.is_contiguous() &&
                   out.scalar_type() == at::kHalf,
@@ -5311,7 +5314,7 @@ at::Tensor flash_attention_decode_paged_xqa(
         k_cache.size(1) >= 256 && k_cache.size(1) % 16 == 0 &&
         k_cache.scalar_type() == at::kByte;
     const XQABatchContextRoute e4m3_batch_route =
-        e4m3_batch_optimized && batch_context_max_seq_len > 0 && q.size(0) >= 4
+        e4m3_batch_optimized && batch_context_max_seq_len > 0 && q.size(0) >= 2
             ? select_xqa_batch_context_route(
                   q.size(0), batch_context_max_seq_len, partition_size)
             : XQABatchContextRoute::kDisabled;

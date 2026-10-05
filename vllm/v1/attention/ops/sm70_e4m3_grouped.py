@@ -51,7 +51,11 @@ def grouped_e4m3_fp32_allowed(
         and query.ndim == 3
         and (
             (batch_size == 1 and 2 <= query_rows <= 8)
-            or (2 <= batch_size <= 16 and query_rows == batch_size * 8)
+            or (
+                2 <= batch_size <= 16
+                and query_rows % batch_size == 0
+                and query_rows // batch_size in (4, 6, 8)
+            )
         )
         and query.shape[1] > 0
         and query.shape[2] == 256

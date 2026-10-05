@@ -44,6 +44,10 @@ constexpr int kXQATCStride = 128;
 // QSA exposes selected four-token microblocks as virtual paged KV. Keep enough
 // page slots for one full XQA tile at that minimum supported granularity.
 constexpr int kXQATCPageIdsCapacity = kXQATCBlockN / 4;
+// A PARTITION_SIZE window can start anywhere inside a KV page, so it may span
+// ceil((first_offset + part_tokens) / block_size) physical pages rather than
+// two. 132 covers a 1024-token partition down to an 8-token page (1024/8 + 1).
+constexpr int kXQATCMaxPagesPerPartition = 132;
 constexpr int kXQATC256WideWarpCount = 8;
 constexpr int kXQATC256WideThreads = kXQATC256WideWarpCount * kWarpSize;
 constexpr int kXQATC256WideBlockM = 8;
@@ -1069,28 +1073,27 @@ __global__ void flash_attention_decode_partition_kernel(
       static_cast<uint8_t>(threadIdx.x));
   __shared__ __half q_shared[6][D];
   __shared__ float scores_shared[6][PARTITION_SIZE];
-  __shared__ int block_idx_shared[2];
+  __shared__ int block_idx_shared[kXQATCMaxPagesPerPartition];
   const int first_block = start_token_idx / block_size;
   const int first_offset = start_token_idx - first_block * block_size;
-  const int first_page_tokens = min(part_tokens, block_size - first_offset);
+  const int num_pages = min(
+      kXQATCMaxPagesPerPartition,
+      (first_offset + part_tokens + block_size - 1) / block_size);
   for (int i = threadIdx.x; i < 6 * D; i += blockDim.x)
     q_shared[i / D][i % D] = q[(i / D) * q_stride1 + i % D];
-  if (threadIdx.x == 0) {
-    block_idx_shared[0] = block_table[first_block];
-    block_idx_shared[1] = first_page_tokens < part_tokens
-        ? block_table[first_block + 1] : block_idx_shared[0];
-  }
+  for (int i = threadIdx.x; i < num_pages; i += blockDim.x)
+    block_idx_shared[i] = block_table[first_block + i];
   __syncthreads();
   float local_max[6];
 #pragma unroll
   for (int head = 0; head < 6; ++head) local_max[head] = -1.0e20f;
   for (int token_local = warp_idx; token_local < part_tokens;
        token_local += kWarpsPerBlock) {
-    const bool second_page = token_local >= first_page_tokens;
-    const int token_offset = second_page ? token_local - first_page_tokens
-                                         : first_offset + token_local;
+    const int abs_in_page = first_offset + token_local;
+    const int page = abs_in_page / block_size;
+    const int token_offset = abs_in_page - page * block_size;
     const int64_t k_index =
-        static_cast<int64_t>(block_idx_shared[second_page]) * k_block_stride +
+        static_cast<int64_t>(block_idx_shared[page]) * k_block_stride +
         static_cast<int64_t>(token_offset) * k_token_stride;
     float score[6] = {};
     // Each head retains d=lane,lane+32,... and the original warp reduction.
@@ -1135,9 +1138,9 @@ __global__ void flash_attention_decode_partition_kernel(
   }
   for (int d = threadIdx.x; d < D; d += blockDim.x) {
     float acc[6] = {};
-    for (int page = 0; page < 2; ++page) {
-      const int begin = page == 0 ? 0 : first_page_tokens;
-      const int end = page == 0 ? first_page_tokens : part_tokens;
+    for (int page = 0; page < num_pages; ++page) {
+      const int begin = max(0, page * block_size - first_offset);
+      const int end = min(part_tokens, (page + 1) * block_size - first_offset);
       int64_t v_index = static_cast<int64_t>(block_idx_shared[page]) *
           v_block_stride + (page == 0 ? first_offset * v_token_stride : 0) + d;
       for (int i = begin; i < end; ++i, v_index += v_token_stride) {

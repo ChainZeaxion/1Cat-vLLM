@@ -177,37 +177,66 @@ def find_tool_properties(
 # 下列工具」属于**格式约束**而非禁止意图，误匹配会把真实调用整轮吞掉。
 # 故只认**明确的禁止性表述**（「不要真的调用/执行」「禁止调用/执行」）。
 _NO_CALL_INTENT_RE = re.compile(
-    r"不要真的(?:调用|执行)|不得真的(?:调用|执行)|禁止(?:调用|执行)"
+    r"不要真的(?:调用|执行|运行|写|写入|创建|修改|删除|保存|生成)"
+    r"|不得真的(?:调用|执行|运行|写|写入|创建|修改|删除|保存|生成)"
+    r"|禁止(?:调用|执行)"
     r"|不要执行任何|不得执行任何"
+    # opt22e C 扩展（2026-10-04）：**格式讲解/展示**意图（「只讲/只看格式」）。
+    # 用于覆盖用户消息里的 E5 类场景：「请展示 Write 的调用格式，不要真的写文件」。
+    # 需 **只/仅 + 看/讲/… + 格式/用法** 同现，避免误伤「只能调用下列工具」等格式约束。
+    r"|只(?:想|需|要)?(?:看|讲|说|展示|了解|介绍|对比|描述).{0,12}(?:格式|用法|写法|长什么样)"
+    r"|仅(?:想|需|要)?(?:看|讲|说|展示|了解|介绍|对比|描述).{0,12}(?:格式|用法|写法|长什么样)"
 )
 
 
+def _msg_field(m, key):
+    """消息字段取值：兼容 **dict**（生产：`ChatCompletionRequest.messages` 元素为 dict）
+    与**对象**（离线测试的 Msg）。⚠️ 此前只用 `getattr` ⇒ 生产中 role/content 恒为
+    None ⇒ C 规则（含 system 分支）**从未生效**，是 E5 幽灵长期漏网的根因。"""
+    if isinstance(m, dict):
+        return m.get(key)
+    return getattr(m, key, None)
+
+
+def _no_call_intent_hit(content) -> bool:
+    if isinstance(content, str):
+        return bool(_NO_CALL_INTENT_RE.search(content))
+    if isinstance(content, (list, tuple)):
+        for part in content:
+            text = part.get("text") if isinstance(part, dict) else getattr(part, "text", None)
+            if isinstance(text, str) and _NO_CALL_INTENT_RE.search(text):
+                return True
+    return False
+
+
 def request_forbids_tool_calls(request) -> bool:
-    """opt22e：请求的 system/developer 消息是否**明确禁止**工具调用。
+    """opt22e：请求是否**明确禁止**工具调用（整轮降级为文本）。
 
-    仅用于补足 `tool_choice="none"`：有些客户端把该意图写在 system prompt 里
+    仅用于补足 `tool_choice="none"`：客户端可能把该意图写在 prompt 里
     （如「这只是格式分析，不要真的调用工具」），而未传 `tool_choice`。
-    此时模型可能在 **content**（而非 thinking）里裸写完整调用，其字节形态与
-    真实调用**无法区分** ⇒ 只能靠请求侧信号判定。
+    此时模型可能在 **content** 里裸写完整调用，其字节形态与真实调用**无法区分**
+    ⇒ 只能靠请求侧信号判定。
 
-    ⚠️ 模式刻意取窄（见 `_NO_CALL_INTENT_RE`），避免误伤格式约束类提示词。
+    扫描范围（2026-10-04 扩展）：
+      - **system / developer**：**全部**消息（沿用原行为）。
+      - **user**：**仅最后一条**（当前请求；避免历史轮次里的禁调语句误伤后续真实调用）。
+
+    ⚠️ 模式刻意取窄（见 `_NO_CALL_INTENT_RE`），避免误伤格式约束类提示词
+    （如「不要调用未注册的工具」**不得**命中）。
     """
     msgs = getattr(request, "messages", None)
     if not msgs:
         return False
+    last_user = None
     for m in msgs:
-        role = getattr(m, "role", None)
-        if role not in ("system", "developer"):
-            continue
-        content = getattr(m, "content", None)
-        if isinstance(content, str):
-            if _NO_CALL_INTENT_RE.search(content):
+        role = _msg_field(m, "role")
+        if role in ("system", "developer"):
+            if _no_call_intent_hit(_msg_field(m, "content")):
                 return True
-        elif isinstance(content, (list, tuple)):
-            for part in content:
-                text = getattr(part, "text", None) if not isinstance(part, dict) else part.get("text")
-                if isinstance(text, str) and _NO_CALL_INTENT_RE.search(text):
-                    return True
+        elif role == "user":
+            last_user = m
+    if last_user is not None and _no_call_intent_hit(_msg_field(last_user, "content")):
+        return True
     return False
 
 

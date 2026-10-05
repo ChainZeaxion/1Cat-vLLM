@@ -23,9 +23,11 @@ logger = init_logger(__name__)
 # manifest and no environment variable. The manifest stays as an explicit
 # override for an unqualified experimental candidate.
 BUILTIN_SCALAR_OP = "sm70_scalar_attention_fwd"
-# Each 1024-token partition caches at most two physical page IDs. A page of
-# at least 1024 tokens satisfies that bound; its size is a runtime argument.
-SCALAR_MIN_PAGE_SIZE = 1024
+# A PARTITION_SIZE window can start anywhere inside a KV page, so it spans
+# ceil((first_offset + part_tokens) / page) physical pages; the kernel loads up
+# to 132 of them. The page size is a runtime argument, so the floor is the
+# smallest page the kernel was qualified for rather than the whole partition.
+SCALAR_MIN_PAGE_SIZE = 32
 BUILTIN_SCALAR_MANIFEST = {
     "module_name": "_vllm_fa2_C",
     "library_sha256": BUILTIN_SCALAR_OP,
@@ -139,11 +141,7 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
             and q.device == device
             and q.is_contiguous()
             and k.ndim == 4
-            and (
-                k.shape[1] >= SCALAR_MIN_PAGE_SIZE
-                if not manifest_name
-                else k.shape[1] == 3296
-            )
+            and k.shape[1] >= SCALAR_MIN_PAGE_SIZE
             and k.shape[2] * 6 == q.shape[1]
             and k.shape[3] == 256
             and k.dtype == v.dtype == torch.uint8

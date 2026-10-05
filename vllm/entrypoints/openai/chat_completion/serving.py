@@ -176,6 +176,9 @@ class OpenAIServingChat(OpenAIServing):
             enable_auto_tools=enable_auto_tools,
             model_name=self.model_config.model,
         )
+        # [本地 2026-10-04] 工具解析器免重启热重载：保存名字，供 `POST /v1/internal/reload` 刷新解析器类。
+        self._tool_parser_name = tool_parser
+        self._reasoning_parser_name = reasoning_parser
         if (
             is_mistral_tool_parser(self.tool_parser)
             and self.reasoning_parser_cls is not None
@@ -1040,6 +1043,28 @@ class OpenAIServingChat(OpenAIServing):
 
                             # check to see if there's anything left to stream
                             remaining_call = expected_call.replace(actual_call, "", 1)
+                            # [本地 2026-10-05] 收尾 remaining 诊断（env 门控，默认关）。
+                            # 用于定位「流式尾部重复补发」：打印各长度与 remaining 尾部。
+                            if os.environ.get("VLLM_OPT23_DEBUG_LOG"):
+                                try:
+                                    with open(
+                                        "/tmp/log/vllm-tool-log.txt", "a", buffering=1
+                                    ) as _fh:
+                                        _fh.write(
+                                            "[serving-remaining] idx=%s expected=%d "
+                                            "actual=%d latest_delta=%d remaining=%d "
+                                            "rem_tail=%r\n"
+                                            % (
+                                                index,
+                                                len(expected_call),
+                                                len(actual_call),
+                                                latest_delta_len,
+                                                len(remaining_call),
+                                                remaining_call[-40:],
+                                            )
+                                        )
+                                except Exception:
+                                    pass
                             # set that as a delta message
                             delta_message = self._create_remaining_args_delta(
                                 delta_message, remaining_call, index

@@ -248,10 +248,12 @@ def wrap_long_attention(fallback):
         bucket = getattr(descriptor, "attention_context_bucket", None)
         batch_size = int(table.shape[0]) if table.ndim == 2 else 0
         num_rows = q.shape[0] if q.ndim == 3 else 0
-        request_major_q8 = (
+        query_width = num_rows // batch_size if batch_size > 0 else 0
+        request_major = (
             2 <= batch_size <= max_batch_size
-            and 8 in query_rows
-            and num_rows == batch_size * 8
+            and num_rows % batch_size == 0
+            and query_width in (4, 6, 8)
+            and query_width in query_rows
         )
         single_request_tail = batch_size == 1 and num_rows in query_rows
         # The graph builder owns the served window: it stamps the bound it
@@ -261,7 +263,7 @@ def wrap_long_attention(fallback):
             bucket is not None
             and bucket <= capability
             and q.ndim == 3
-            and (single_request_tail or request_major_q8)
+            and (single_request_tail or request_major)
             and q.shape[1] > 0
             and q.shape[2] == 256
             and k.ndim == 4
@@ -289,7 +291,7 @@ def wrap_long_attention(fallback):
         # Allocate a fixed workspace once for each warmup/capture stream. Graph
         # replay never allocates. Layers reuse it in stream order; different
         # streams and versions never share the legacy 80-split buffers.
-        if request_major_q8:
+        if request_major:
             logger.info_once(
                 "SM70 E4M3 long q8 request-major route selected: batch=%d "
                 "page=%d bound=%d; shared full-q8 kernel, FP32 state.",

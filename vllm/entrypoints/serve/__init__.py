@@ -52,6 +52,12 @@ def register_vllm_serve_api_routers(app: FastAPI):
 
     attach_sm70_router(app)
 
+    from vllm.entrypoints.serve.toolparser.api_router import (
+        attach_router as attach_toolparser_router,
+    )
+
+    attach_toolparser_router(app)
+
     from vllm.entrypoints.serve.tokenize.api_router import (
         attach_router as attach_tokenize_router,
     )

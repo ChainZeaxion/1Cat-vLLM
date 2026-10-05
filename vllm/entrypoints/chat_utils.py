@@ -1340,8 +1340,11 @@ def _remember_hot_chat_template_source(
     """Record which file the resolved template came from, for hot reload."""
     global _HOT_CHAT_TEMPLATE_SOURCE, _HOT_CHAT_TEMPLATE_MTIME
     global _HOT_CHAT_TEMPLATE_CONTENT
-    if not hot_chat_template_enabled():
-        return
+    # [本地 2026-10-05] **不再按 env 提前返回**：源路径登记只是记下文件名（几乎零成本），
+    # 是 `POST /v1/internal/reload` 端点强制重载模板的前提。若在此按
+    # `VLLM_CHAT_TEMPLATE_HOT_RELOAD` 早退，则关闭 opt28（env=0）后**端点重载失效**
+    # （实测 holders=0）。env 只应控制**每请求中间件**（refresh_hot_chat_template），
+    # 与「是否登记源路径」无关。
     try:
         path = Path(str(chat_template))
         if not path.is_file():
@@ -1398,6 +1401,30 @@ def refresh_hot_chat_template() -> bool:
 def current_hot_chat_template() -> str | None:
     """Latest hot-reloaded template content, or None if none was registered."""
     return _HOT_CHAT_TEMPLATE_CONTENT
+
+
+def force_reload_chat_template() -> str | None:
+    """[本地 2026-10-04] **端点触发**的强制重载：无视 env 与 mtime，重读模板源文件。
+
+    供 `POST /v1/internal/reload` 使用（每请求不再做任何 stat/比较）。返回新模板内容；
+    未登记源文件或读取失败时返回 None（保留上一版）。
+    """
+    global _HOT_CHAT_TEMPLATE_MTIME, _HOT_CHAT_TEMPLATE_CONTENT
+    source = _HOT_CHAT_TEMPLATE_SOURCE
+    if source is None:
+        return None
+    try:
+        with open(source, encoding="utf-8") as handle:
+            content = handle.read()
+    except OSError:
+        return None
+    _HOT_CHAT_TEMPLATE_CONTENT = content
+    try:
+        _HOT_CHAT_TEMPLATE_MTIME = os.stat(source).st_mtime_ns
+    except OSError:
+        pass
+    logger.info("Chat template force-reloaded from %s (%d bytes).", source, len(content))
+    return content
 
 
 def load_chat_template(

@@ -544,7 +544,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
             )
             else (
                 "page_size"
-                if page_size < 1024
+                if page_size < 32
                 else (
                     None
                     if native["scalar"]

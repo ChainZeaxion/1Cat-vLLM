@@ -726,7 +726,32 @@ class StreamingXMLToolCallParser:
                 found_any = True
 
             except Exception as e:
-                logger.warning("Error when parsing XML elements: %s", e)
+                # [上游 #842 融入 2026-10-04] Expat retains an unmatched
+                # parameter in its XML stack even when our value handler has
+                # recovered at the next parameter. Recover only the closing
+                # element being processed, so a close earlier in a burst cannot
+                # accidentally finish its next call.
+                #
+                # ⚠️ 本 fork 备注（2026-10-04 三重验证）：此分支在**本仓为死代码**，
+                # 永不命中 —— ① 消融「有/无 #842」结果完全一致（畸形输入均回
+                # ['weather']）；② 在 except 处插桩从未打印；③ 上游
+                # tests/tool_parsers/test_qwen3xml_chunk_boundaries.py 有/无均 13 fail。
+                # 原因：本 fork 的**分支归一化 + _preprocess_xml_chunk** 已把畸形输入
+                # 转成 expat 不抛异常的形态，走不到这里。**保留仅为与上游对齐**（无害）；
+                # 本仓的畸形恢复由归一化路径承担。详见
+                # patches/opt22-upstream-842-xml-malformed-close-v1.patch 与优化文档 opt22 段。
+                closing = element.strip()
+                if self.current_call_id is not None and closing in (
+                    self.function_end_token,
+                    self.tool_call_end_token,
+                ):
+                    if closing == self.tool_call_end_token:
+                        self._end_element("tool_call")
+                    elif self.current_function_open:
+                        self._end_element("function")
+                    found_any = True
+                else:
+                    logger.warning("Error when parsing XML elements: %s", e)
 
             # Update processed position
             self.last_processed_pos = end_pos
@@ -2271,6 +2296,76 @@ class Qwen3XMLToolParser(ToolParser):
             return True
         return any(k not in args or args[k] in (None, "") for k in req)
 
+    def _opt22d_salvage_dropped_calls(self, model_output, tool_calls, request):
+        """opt22d 防御纵深（2026-10-04）：退化输入下补捞被吞的相邻调用。
+
+        主解析在**参数缺闭合**（如 `<parameter=city>Dallas\\n<parameter=state>`）或
+        **标签间无换行**时，「扣住」逻辑可能把后续**完整**的 `<tool_call>` 一并吞掉。
+        本方法从原始输出切出**结构完整**的块，用**独立**解析器重解析，凡其 function
+        名未被已发出调用覆盖者，追加之。
+
+        ⚠️ 三重保守门（防与 opt22d/opt22e 幽灵调用防御冲突）：
+          ① 仅当**已有 ≥1 真实调用**时启用（纯正文/示例 ⇒ 主解析 0 调用 ⇒ 不补捞）；
+          ② 无工具上下文（force_all）⇒ 不补捞；
+          ③ 补捞到的调用同样过 `_missing_required_args` 必填兜底。
+        ⚠️ 开关 `VLLM_QWEN3X_TOOL_SALVAGE`（默认 "1"；"0" 关闭）。
+        """
+        import os
+
+        if os.environ.get("VLLM_QWEN3X_TOOL_SALVAGE", "1") == "0":
+            return tool_calls
+        if not tool_calls:
+            return tool_calls
+        # 仅在「**参数标签不平衡**」（开 > 闭）时补捞 —— depth bug 特征（见 coder 侧注）。
+        # 平衡时不得补捞，否则会把「真调用之后的正文示例」误当独立调用（幽灵）。
+        if model_output.count("<parameter=") <= model_output.count("</parameter>"):
+            return tool_calls
+        try:
+            if self._opt22d_should_force_all(request, model_output):
+                return tool_calls
+        except Exception:
+            pass
+        seen = {
+            tc.function.name
+            for tc in tool_calls
+            if getattr(tc, "function", None) and tc.function.name
+        }
+        for blk in re.findall(r"<tool_call>.*?</tool_call>", model_output, re.S):
+            m = re.search(r"<function=([\w.\-]+)\s*>", blk)
+            if not m:
+                continue
+            name = m.group(1)
+            if name in seen:
+                continue
+            try:
+                sub_parser = StreamingXMLToolCallParser()
+                sub_parser.set_tools(self.tools)
+                sub_parser._streaming_mode = False
+                sub_parser._opt22d_force_all = False
+                sub = sub_parser.parse_single_streaming_chunks(
+                    _escape_unclosed_function_tags(blk)
+                )
+            except Exception:
+                continue
+            if sub is None or not sub.tool_calls:
+                continue
+            for t in sub.tool_calls:
+                if not (t.function and t.function.name):
+                    continue
+                cand = ToolCall(
+                    id=t.id,
+                    type=t.type,
+                    function=FunctionCall(
+                        name=t.function.name,
+                        arguments=t.function.arguments,
+                    ),
+                )
+                if self._missing_required_args(cand):
+                    continue
+                tool_calls.append(cand)
+                seen.add(t.function.name)
+        return tool_calls
+
     def adjust_request(
         self,
         request: ChatCompletionRequest | ResponsesRequest,
@@ -2557,6 +2652,11 @@ class Qwen3XMLToolParser(ToolParser):
             tool_calls = [
                 tc for tc in tool_calls if not self._missing_required_args(tc)
             ]
+
+            # opt22d 防御纵深（2026-10-04）：退化输入下补捞被吞的相邻调用
+            tool_calls = self._opt22d_salvage_dropped_calls(
+                model_output, tool_calls, request
+            )
 
             return ExtractedToolCallInformation(
                 tool_calls=tool_calls,
