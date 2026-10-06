@@ -90,13 +90,20 @@ struct KernelConfig {
       WARPS_PER_BLOCK * MAX_THREADS_PER_WARP;
   static constexpr int THREADS_PER_ROW = THREADS_PER_BLOCK / BLOCK_M;
   static constexpr int PAD = (8 - (D % 32) + 32) % 32;
-  static constexpr int Q_STRIDE = D + PAD;
-  static constexpr int KV_STRIDE = D + PAD;
+  // [本地 2026-10-06] D 先向上取整到 16 的倍数(再叠加 bank-pad)，使 WMMA 的
+  // K/N tile（ceil(D/16) 个宽 16 的 tile）永不越过行宽。
+  // 对 16 的倍数维度是 no-op（D_ALIGNED==D）；对非 16 倍数（如 ViT 的 D=72→80）
+  // 尾部列 [D, D_ALIGNED) 由 init_smem 的整块清零保证恒为 0，且各 load 只写前
+  // (D/8) 个 uint4，故尾部不会被改写 —— QK 的 padding 列贡献 0、PV 对 padding
+  // 列写出 0，结果正确（输出写回本就按 D 掩码）。
+  static constexpr int D_ALIGNED = ((D + 15) / 16) * 16;
+  static constexpr int Q_STRIDE = D_ALIGNED + PAD;
+  static constexpr int KV_STRIDE = D_ALIGNED + PAD;
   static constexpr int S_STRIDE = BLOCK_N + PAD;
   static constexpr int P_SUB_TILE = 32;
   static constexpr int P_STRIDE = P_SUB_TILE + PAD;
   static constexpr int P_STRICT_ELEMENTS = (D == 256) ? BLOCK_M * P_STRIDE : 1;
-  static constexpr int O_STRIDE = D + PAD;
+  static constexpr int O_STRIDE = D_ALIGNED + PAD;
   static constexpr int PER_UINT4 = 8;
 
   struct alignas(128) SmemLayout {
@@ -1100,6 +1107,11 @@ std::vector<at::Tensor> flash_attention_forward(
       break;
     case 64:
       launcher_flash_attention_forward<64>(
+          q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, scalar_pv,
+          window_size_left, window_size_right, stream);
+      break;
+    case 72:  // [本地 2026-10-06] ViT (Qwen3.5-VL) head_dim；内部按 D_ALIGNED=80 处理
+      launcher_flash_attention_forward<72>(
           q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, scalar_pv,
           window_size_left, window_size_right, stream);
       break;
