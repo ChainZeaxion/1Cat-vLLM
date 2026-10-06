@@ -135,6 +135,14 @@ def _is_sm70_dflash2_verifier_contract(
     )
 
 
+# KV cache dtypes admitted to the SM70 DFlash2 compiled-subgraph reuse path.
+# Reuse safety across restarts does not depend on this set: the KV dtype is
+# hashed into the compile-cache key, so changing it invalidates the cache and
+# forces a recompile. The set bounds which dtypes may take the fast path at
+# all; only E4M3 carries the cold/warm release qualification.
+_SM70_DFLASH2_GRAPH_CACHE_DTYPES = frozenset({"fp8_e4m3", "fp8_e5m2", "float16"})
+
+
 def _configure_sm70_dflash2_graph_cache(
     model_config: Any,
     speculative_config: Any,
@@ -150,10 +158,18 @@ def _configure_sm70_dflash2_graph_cache(
         or model_config.quantization != "compressed-tensors"
         or not model_config.is_nvfp4_quantized()
         or parallel_config.tensor_parallel_size != 4
-        or cache_config.cache_dtype != "fp8_e4m3"
+        or cache_config.cache_dtype
+        not in _SM70_DFLASH2_GRAPH_CACHE_DTYPES
     ):
         return False
     # The E4M3 release contract passes cold/warm quality with this cache path.
+    # The KV dtype is a factor of VllmConfig.compute_hash() (CacheConfig
+    # .compute_hash() hashes every field except an ignore list that does not
+    # contain cache_dtype), so a dtype change yields a different compile-cache
+    # key and recompiles instead of reusing a stale graph. Consistency across
+    # restarts is therefore enforced by the cache key rather than by refusing
+    # the dtype outright. E5M2/FP16 are admitted here on that mechanism; only
+    # E4M3 has the cold/warm release qualification this path was measured on.
     # Explicit AOT selection remains an override; other model routes keep their
     # existing defaults until their own cache/quality qualification passes.
     os.environ.setdefault("VLLM_USE_AOT_COMPILE", "0")
