@@ -283,6 +283,7 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_TP2_FAST_SELECTOR: bool = True
     VLLM_SM70_AWQ_TP2_FAST_TARGETS: str | None = None
     VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION: bool = False
+    VLLM_SM70_RMSNORM_NATIVE_PRIORITY: bool = False
     VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM: bool = False
     VLLM_SM70_TP4_LONG_FUSED_NORM_THREADS: int = 512
     VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS: int = 80
@@ -339,6 +340,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FA2_D256_LIBRARY: str | None = None
     VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST: str | None = None
     VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS: bool = True
+    VLLM_SM70_STARTUP_CACHE_CLEANUP: bool = True
     VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_NVFP4_QPN2: bool = False
@@ -3678,6 +3680,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("SM70 collectives",),
         user_visible=False,
     ),
+    "VLLM_SM70_RMSNORM_NATIVE_PRIORITY": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_RMSNORM_NATIVE_PRIORITY", "0"))),
+        description=(
+            "SM70 experiment: prefer the native (decomposed) RMSNorm IR so the "
+            "allreduce+Gemma-RMSNorm fusion pattern can match, instead of the "
+            "vllm_c custom RMSNorm op used for 0.0.3 compile-graph parity."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
+        user_visible=False,
+    ),
     # Default-off exact-8K TP4 experiment: fuse the row-parallel reduction,
     # mixed-FP32-residual Gemma RMSNorm, and normalized-output all-gather.
     "VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM": env_var(
@@ -4287,6 +4303,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=True,
+    ),
+    "VLLM_SM70_STARTUP_CACHE_CLEANUP": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_STARTUP_CACHE_CLEANUP", "1"))),
+        description=(
+            "opt21 infrastructure: at engine startup, when compile-cache "
+            "reuse is disabled (VLLM_DISABLE_COMPILE_CACHE=1), reclaim the "
+            "early compile cache and stale /dev/shm offload leftovers. Only "
+            "acts while every GPU is quiet; set 0 to opt out."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
         user_visible=True,
     ),
     "VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST": env_var(
@@ -18716,3 +18747,65 @@ for _sm70_native_allreduce in (
         os.environ[_sm70_native_allreduce] = (
             "1" if environment_variables[_sm70_native_allreduce]() else "0"
         )
+
+
+# --- SM70 worker env overrides (project infrastructure) -----------------------
+# EngineCore / Worker processes do NOT inherit the systemd unit's
+# ``Environment=`` entries: vLLM_*-prefixed variables are stripped from the
+# spawn environment, so any knob those processes read here or via
+# ``os.environ`` silently falls back to its declared default.
+#
+# Re-apply them in-process, at import time -- this module is imported by every
+# process (API server, EngineCore, Worker), so the values land before the first
+# ``envs.X`` access, which is what makes them effective.  The override file path
+# intentionally uses a NON-VLLM_ name, because a VLLM_-prefixed path variable
+# would itself be stripped from the child environment.
+def _sm70_apply_worker_env_overrides() -> None:
+    """Best-effort: never raises into import.
+
+    The override file must be found WITHOUT relying on the environment: the
+    ``SM70_WORKER_ENV_FILE`` variable itself does not survive the EngineCore /
+    Worker spawn (only the API server sees the systemd unit's ``Environment=``),
+    so a lookup that trusted it would silently apply nothing in exactly the
+    processes that need it. Try every candidate path instead -- this module is
+    imported by each process, so whichever path exists takes effect there.
+    """
+    candidates = (
+        os.environ.get("SM70_WORKER_ENV_FILE"),
+        "/home/zeaxion/myproject/1cat-vllm-v130/worker_env.conf",
+        "/etc/1cat-vllm/worker_env",
+    )
+    path = None
+    _lines: list[str] = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            with open(candidate, encoding="utf-8") as _fh:
+                _lines = _fh.readlines()
+        except OSError:
+            continue
+        path = candidate
+        break
+    if path is None:
+        return
+    _applied: list[str] = []
+    for _raw in _lines:
+        _line = _raw.strip()
+        if not _line or _line.startswith("#") or "=" not in _line:
+            continue
+        _key, _, _value = _line.partition("=")
+        _key = _key.strip()
+        if not _key:
+            continue
+        os.environ[_key] = _value.strip()
+        _applied.append(_key)
+    if _applied:
+        logger.info(
+            "SM70 worker env overrides applied from %s: %s",
+            path,
+            ", ".join(sorted(_applied)),
+        )
+
+
+_sm70_apply_worker_env_overrides()

@@ -104,6 +104,7 @@ class InputBatch:
         num_reqs: int,
         num_tokens: int,
         input_buffers: InputBuffers,
+        is_prefilling: bool = False,
     ) -> "InputBatch":
         assert 0 < num_reqs <= num_tokens
         device = input_buffers.device
@@ -163,9 +164,18 @@ class InputBatch:
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=None,
             num_computed_tokens_np=np.zeros(num_reqs, dtype=np.int32),
-            prefill_len_np=np.zeros(num_reqs, dtype=np.int32),
+            # [SM70 prefill-FULL-graph prototype] When capturing a prefill-semantics
+            # graph the dummy batch must look like a *fresh* prefill (nothing computed,
+            # the whole scheduled span is still prompt). `_prepare_prefill_inputs_kernel`
+            # treats `num_computed >= prefill_len` as "not prefill", so leaving both at 0
+            # would make the captured graph take the decode GDN variant.
+            prefill_len_np=(
+                num_scheduled_tokens.copy()
+                if is_prefilling
+                else np.zeros(num_reqs, dtype=np.int32)
+            ),
             num_computed_prefill_tokens_np=np.zeros(num_reqs, dtype=np.int32),
-            is_prefilling_np=np.zeros(num_reqs, dtype=np.bool_),
+            is_prefilling_np=np.full(num_reqs, is_prefilling, dtype=np.bool_),
             max_seq_len_np=None,
             input_ids=input_ids,
             positions=positions,

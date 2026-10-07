@@ -85,6 +85,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     ModelCudaGraphManager,
     get_explicit_cudagraph_memory_reserve,
     get_uniform_decode_token_count,
+    get_uniform_prefill_full_graph_token_count,
 )
 from vllm.v1.worker.gpu.decode_step_profile import get_profiler
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
@@ -1518,6 +1519,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         uniform_tok_count = self._get_uniform_decode_token_count(
             scheduler_output, dummy_run
         )
+        # [SM70 prefill-FULL-graph prototype] A uniform prefill can replay one captured
+        # FULL graph too. Only consulted when the decode classification declined, and
+        # only for query lengths explicitly enabled via SM70_PREFILL_FULL_GRAPH_Q, so
+        # decode-shaped prefills (which need prefill state semantics but look like
+        # decode) keep their existing PIECEWISE route.
+        prefill_full_tok_count = None
+        if uniform_tok_count is None and not dummy_run:
+            prefill_full_tok_count = get_uniform_prefill_full_graph_token_count(
+                num_reqs,
+                num_toks,
+                max(scheduler_output.num_scheduled_tokens.values()),
+            )
+            if prefill_full_tok_count is not None:
+                uniform_tok_count = prefill_full_tok_count
 
         skip_compiled = False
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
@@ -1534,6 +1549,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_size,
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
+            is_prefilling=prefill_full_tok_count is not None,
         )
         self._prof.cpu("batch_desc")
 

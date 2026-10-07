@@ -532,11 +532,13 @@ class Sm70AllReduceGemmaRMSNormPattern(BasePattern):
         dtype: torch.dtype,
         device: str | None,
         residual_dtype: torch.dtype,
+        tp_size: int = 2,
     ) -> None:
         super().__init__(dtype, device)
         self.epsilon = epsilon
         self.group_name = get_tp_group().unique_name
         self.residual_dtype = residual_dtype
+        self.tp_size = tp_size
 
     def get_inputs(self) -> list[torch.Tensor]:
         residual = (
@@ -568,6 +570,14 @@ class Sm70AllReduceGemmaRMSNormPattern(BasePattern):
             input: torch.Tensor,
             weight: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
+            if self.tp_size == 4:
+                return torch.ops.vllm.sm70_tp4_all_reduce_gemma_rms_norm(
+                    input,
+                    residual,
+                    weight,
+                    self.epsilon,
+                    group_name=self.group_name,
+                )
             return torch.ops.vllm.sm70_tp2_all_reduce_gemma_rms_norm(
                 input,
                 residual,
@@ -1031,7 +1041,9 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             and current_platform.is_device_capability(70)
         )
         self.sm70_tp2_mode = (
-            envs.VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION and self.tp_size == 2 and sm70_common
+            envs.VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION
+            and self.tp_size in (2, 4)
+            and sm70_common
         )
         self.sm70_tp4_long_mode = (
             envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM
@@ -1077,7 +1089,13 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             ):
                 logger.warning_once("SM70 TP4 fused collective-norm op is unavailable.")
                 return
-            self.max_token_num = config.scheduler_config.max_num_batched_tokens
+            # The SM70 compile-range endpoint is extended by +1 as a capture
+            # sentinel ("Extending ... compile range endpoint to %d" in
+            # config/vllm.py), so the applicability check must tolerate the +1
+            # or the fusion is silently skipped for the whole decode range.
+            self.max_token_num = (
+                config.scheduler_config.max_num_batched_tokens + 1
+            )
             self.register_sm70_patterns()
             self.dump_patterns(config, self.patterns)
             self.disabled = False
@@ -1156,6 +1174,18 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
                 1e-6,
                 self.model_dtype,
                 self.device,
+            ).register(self.patterns)
+            self.disabled = False
+            return
+        if self.tp_size == 4:
+            # SM70 TP4 fused all-reduce Gemma RMSNorm only supports an fp32
+            # residual accumulator (see can_sm70_tp4_all_reduce_gemma_rms_norm).
+            Sm70AllReduceGemmaRMSNormPattern(
+                1e-6,
+                self.model_dtype,
+                self.device,
+                torch.float32,
+                tp_size=4,
             ).register(self.patterns)
             self.disabled = False
             return

@@ -142,6 +142,49 @@ class CapturedAttentionState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor]
 
 
+def _sm70_prefill_full_graph_queries() -> tuple[int, ...]:
+    """[SM70 prefill-FULL-graph prototype] Query lengths to capture FULL graphs for.
+
+    Read straight from ``os.environ`` under a **non-``VLLM_``-prefixed** name so a
+    systemd unit ``Environment=`` reaches the worker: vLLM strips ``VLLM_*`` when
+    spawning EngineCore/Worker, so a ``VLLM_``-named knob set in the unit would never
+    arrive. Empty/unset/``0`` keeps the feature off (upstream behaviour).
+    """
+    raw = os.environ.get("SM70_PREFILL_FULL_GRAPH_Q", "").strip()
+    if not raw or raw == "0":
+        return ()
+    out: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            q = int(part)
+        except ValueError:
+            logger.warning_once(
+                "SM70_PREFILL_FULL_GRAPH_Q: ignoring non-integer entry %r", part
+            )
+            continue
+        if q > 1:
+            out.append(q)
+    return tuple(dict.fromkeys(out))
+
+
+def _sm70_prefill_full_graph_max_reqs() -> int:
+    """[SM70 prefill-FULL-graph prototype] Cap on requests per captured prefill graph.
+
+    Each captured prefill shape costs its own graph (and a matching PIECEWISE size), so
+    the fan-out is bounded: with ``q=1024`` and the cap at 2 only 1024 and 2048 are
+    captured instead of every multiple up to ``max_num_batched_tokens``.
+    """
+    raw = os.environ.get("SM70_PREFILL_FULL_GRAPH_MAX_REQS", "2").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        return 2
+    return max(1, n)
+
+
 @dataclass(frozen=True)
 class BatchExecutionDescriptor:
     """Describes the shape of the batch and CG mode to run; this is used to make shape
@@ -152,6 +195,11 @@ class BatchExecutionDescriptor:
     num_reqs: int | None  # None means no request padding is needed (PIECEWISE graphs)
     uniform_token_count: int | None = None
     attention_context_bucket: int | None = None
+    # [SM70 prefill-FULL-graph prototype] Which GDN/attention semantics the graph was
+    # captured with. The dummy batch used for capture carries `is_prefilling_np`, and the
+    # model picks its prefill vs decode operator variant from that, so a captured graph is
+    # only valid for batches of the same phase. Must match at dispatch time.
+    is_prefilling: bool = False
 
 
 def _is_compatible(
@@ -159,6 +207,7 @@ def _is_compatible(
     num_reqs: int,
     num_tokens: int,
     uniform_token_count: int | None,
+    is_prefilling: bool = False,
 ) -> bool:
     # desc.uniform_token_count=None (PIECEWISE) can handle any uniform_token_count
     # desc.num_reqs=None means no request padding needed (PIECEWISE)
@@ -169,6 +218,11 @@ def _is_compatible(
         )
         and (desc.num_reqs is None or desc.num_reqs >= num_reqs)
         and desc.num_tokens >= num_tokens
+        # A FULL graph bakes one phase's operator variants, so it must not serve the
+        # other phase. PIECEWISE descriptors carry num_reqs=None and stay phase-agnostic
+        # (their pieces are compiled per-shape, not per-phase), so a prefill batch that
+        # found no FULL match still degrades to PIECEWISE rather than eager.
+        and (desc.num_reqs is None or desc.is_prefilling == is_prefilling)
     )
 
 
@@ -195,6 +249,26 @@ def get_uniform_decode_token_count(
     if has_prefill or num_reqs == 0:
         return None
     return get_uniform_token_count(num_reqs, num_tokens, max_query_len)
+
+
+def get_uniform_prefill_full_graph_token_count(
+    num_reqs: int, num_tokens: int, max_query_len: int
+) -> int | None:
+    """[SM70 prefill-FULL-graph prototype] Uniform prefill query length to serve from a
+    single captured FULL graph, or None when this batch is not an exact uniform-prefill
+    shape whose query length is enabled via ``SM70_PREFILL_FULL_GRAPH_Q``.
+
+    Upstream deliberately refuses FULL graphs for prefills (the operator variants differ
+    by phase). The prototype captures *phase-correct* graphs instead, so a uniform
+    prefill can replay one. Non-uniform batches still fall through to PIECEWISE.
+    """
+    queries = _sm70_prefill_full_graph_queries()
+    if not queries or num_reqs == 0:
+        return None
+    uniform = get_uniform_token_count(num_reqs, num_tokens, max_query_len)
+    if uniform is None or uniform not in queries:
+        return None
+    return uniform
 
 
 class CudaGraphManager:
@@ -295,10 +369,49 @@ class CudaGraphManager:
         if not (self.cudagraph_mode and capture_sizes):
             return
 
-        capture_sizes = sorted(capture_sizes)
         decode_mode = self.cudagraph_mode.decode_mode()
         mixed_mode = self.cudagraph_mode.mixed_mode()
         separate_decode_routine = self.cudagraph_mode.separate_routine()
+        # [SM70 prefill-FULL-graph prototype] Off unless SM70_PREFILL_FULL_GRAPH_Q is set.
+        prefill_full_q = _sm70_prefill_full_graph_queries()
+        if prefill_full_q:
+            # `_candidates` is indexed by capture size, so a multi-request prefill
+            # (e.g. 2 x 1024 = 2048) needs its product to be a *known* size or dispatch
+            # can never select it. Union the products in, bounded by the scheduler's
+            # token budget: a batch larger than max_num_batched_tokens cannot be formed.
+            budget = int(
+                getattr(
+                    self.vllm_config.scheduler_config,
+                    "max_num_batched_tokens",
+                    0,
+                )
+                or 0
+            )
+            if budget <= 0:
+                budget = self.max_num_reqs * max(prefill_full_q)
+            max_reqs_cap = min(
+                self.max_num_reqs, _sm70_prefill_full_graph_max_reqs()
+            )
+            extra = sorted(
+                {
+                    k * q
+                    for q in prefill_full_q
+                    for k in range(1, max_reqs_cap + 1)
+                    if k * q <= budget
+                }
+            )
+            if extra:
+                logger.info_once(
+                    "SM70 prefill FULL graph prototype: capturing prefill shapes %s "
+                    "(queries=%s, max_num_reqs=%d, token budget=%d).",
+                    tuple(extra),
+                    prefill_full_q,
+                    self.max_num_reqs,
+                    budget,
+                    scope="process",
+                )
+            capture_sizes = sorted(set(capture_sizes) | set(extra))
+        capture_sizes = sorted(capture_sizes)
 
         descs_by_token_count = defaultdict(list)
         descs_by_mode = defaultdict(list)
@@ -325,6 +438,29 @@ class CudaGraphManager:
                             num_tokens=num_tokens,
                             num_reqs=num_tokens // query_len,
                             uniform_token_count=query_len,
+                        )
+                        descs_by_mode[decode_mode].append(desc)
+                        descs_by_token_count[num_tokens].append(desc)
+
+            # [SM70 prefill-FULL-graph prototype] Uniform-prefill FULL graphs. Emitted
+            # *before* the PIECEWISE descriptor below so that a matching prefill batch
+            # (which the PIECEWISE descriptor would also accept) prefers a single
+            # full-graph replay instead of the piecewise+eager-island path.
+            if prefill_full_q and decode_mode:
+                max_reqs_cap = min(
+                    self.max_num_reqs, _sm70_prefill_full_graph_max_reqs()
+                )
+                for query_len in prefill_full_q:
+                    if (
+                        query_len <= num_tokens <= max_reqs_cap * query_len
+                        and num_tokens % query_len == 0
+                    ):
+                        desc = BatchExecutionDescriptor(
+                            cg_mode=decode_mode,
+                            num_tokens=num_tokens,
+                            num_reqs=num_tokens // query_len,
+                            uniform_token_count=query_len,
+                            is_prefilling=True,
                         )
                         descs_by_mode[decode_mode].append(desc)
                         descs_by_token_count[num_tokens].append(desc)
@@ -454,11 +590,14 @@ class CudaGraphManager:
         num_reqs: int,
         num_tokens: int,
         uniform_token_count: int | None,
+        is_prefilling: bool = False,
     ) -> BatchExecutionDescriptor:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
         if self._graphs_captured and 0 < num_tokens < len(self._candidates):
             for desc in self._candidates[num_tokens]:
-                if _is_compatible(desc, num_reqs, num_tokens, uniform_token_count):
+                if _is_compatible(
+                    desc, num_reqs, num_tokens, uniform_token_count, is_prefilling
+                ):
                     return desc
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE, num_tokens=num_tokens, num_reqs=num_reqs
@@ -649,6 +788,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 attn_groups,
                 kv_cache_config,
                 skip_attn=(desc.cg_mode == CUDAGraphMode.PIECEWISE),
+                is_prefilling=desc.is_prefilling,
             )
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
@@ -738,8 +878,11 @@ def prepare_inputs_to_capture(
     attn_groups: list[list[AttentionGroup]],
     kv_cache_config: KVCacheConfig,
     skip_attn: bool = False,
+    is_prefilling: bool = False,
 ) -> CapturedAttentionState:
-    input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
+    input_batch = InputBatch.make_dummy(
+        num_reqs, num_tokens, input_buffers, is_prefilling=is_prefilling
+    )
     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
     slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
     slot_mappings_by_layer = build_slot_mappings_by_layer(

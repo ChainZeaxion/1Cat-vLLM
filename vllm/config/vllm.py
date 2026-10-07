@@ -688,7 +688,7 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
 
     sm70_gemma_tp = (
         envs.VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION
-        and cfg.parallel_config.tensor_parallel_size == 2
+        and cfg.parallel_config.tensor_parallel_size in (2, 4)
     )
     if sm70_gemma_tp:
         return (
@@ -2285,17 +2285,26 @@ class VllmConfig:
                     )
                 if self.compilation_config.use_inductor_graph_partition is None:
                     self.compilation_config.use_inductor_graph_partition = False
-                self.kernel_config.ir_op_priority.rms_norm = [
-                    "vllm_c",
-                    "native",
-                ]
-                self.kernel_config.ir_op_priority.fused_add_rms_norm = [
-                    "vllm_c",
-                    "native",
-                ]
+                # SM70 0.0.3 parity defaults to the vllm_c custom RMSNorm op.
+                # The allreduce+Gemma-RMSNorm fusion pattern can only match a
+                # decomposed (native) RMSNorm, so allow an opt-in to flip the
+                # IR priority for A/B measurement of the fusion.
+                _rms_priority = (
+                    ["native", "vllm_c"]
+                    if envs.VLLM_SM70_RMSNORM_NATIVE_PRIORITY
+                    else ["vllm_c", "native"]
+                )
+                self.kernel_config.ir_op_priority.rms_norm = list(_rms_priority)
+                self.kernel_config.ir_op_priority.fused_add_rms_norm = list(
+                    _rms_priority
+                )
                 logger.info_once(
-                    "Using vllm_c RMSNorm priority for SM70 Flash-V100 "
-                    "0.0.3 compile graph quality parity."
+                    "Using %s RMSNorm priority for SM70 Flash-V100 "
+                    "0.0.3 compile graph quality parity%s.",
+                    _rms_priority[0],
+                    " (native opt-in for AR-RMS fusion A/B)"
+                    if envs.VLLM_SM70_RMSNORM_NATIVE_PRIORITY
+                    else "",
                 )
                 if envs.VLLM_SM70_FLASH_V100_0DOT3_ELIMINATE_NOOPS:
                     self.compilation_config.pass_config.eliminate_noops = True

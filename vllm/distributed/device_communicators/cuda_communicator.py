@@ -448,6 +448,39 @@ class CudaCommunicator(DeviceCommunicatorBase):
             input_, residual, weight, epsilon
         )
 
+    def sm70_tp4_all_reduce_gemma_rms_norm(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ca_comm = self.ca_comm
+        if (
+            not self.use_custom_allreduce
+            or ca_comm is None
+            or ca_comm.disabled
+            or not ca_comm.can_sm70_tp4_all_reduce_gemma_rms_norm(
+                input_, residual, weight
+            )
+        ):
+            reduced = self.all_reduce(input_)
+            residual_out = reduced.float() + residual.float()
+            normalized_fp32 = torch.empty_like(residual_out)
+
+            from vllm import _custom_ops as ops
+
+            ops.rms_norm(
+                normalized_fp32,
+                residual_out,
+                weight.float() + 1.0,
+                epsilon,
+            )
+            return normalized_fp32.to(input_.dtype), residual_out
+        return ca_comm.sm70_tp4_all_reduce_gemma_rms_norm(
+            input_, residual, weight, epsilon
+        )
+
     def sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
         self,
         input_: torch.Tensor,

@@ -720,6 +720,12 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 
     decorate_logs("APIServer", skip_if_decorated=True)
 
+    # opt21 infrastructure: before any worker spawns, reclaim stale compile
+    # cache and /dev/shm leftovers when compile-cache reuse is disabled.
+    from vllm._sm70_startup_cleanup import sm70_startup_cleanup
+
+    sm70_startup_cleanup()
+
     # Interrupt initialization if SIGTERM arrives before uvicorn installs its
     # own signal handlers. Once uvicorn is running it replaces this.
     def _interrupt_init(*_) -> None:
