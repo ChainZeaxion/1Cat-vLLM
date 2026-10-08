@@ -45,6 +45,11 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.phase_separation import (
+    Phase,
+    PhaseConfig,
+    PhaseCreditAllocator,
+)
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -125,6 +130,28 @@ class Scheduler(SchedulerInterface):
             self.scheduler_config.mixed_prefill_step_latency_ms,
         )
         self.mixed_prefill_enabled = current_platform.device_type == "cuda"
+        # [相位分离 2026-10-08] 一个整步只喂给 decode 或 prefill 之一，使
+        # decode 相位能命中 FULL CUDA graph（混批步永远拿不到，见
+        # phase_separation.py 头部论证）。None = 关闭 = 现状行为。
+        # ⚠️ 与 VLLM_SM70_MAMBA_SPARSE_MODE 同样的投递限制：EngineCore 收不到
+        #    unit 的 Environment=VLLM_*，开关只能经 worker_env.conf 注入。
+        self.phase_separation: PhaseCreditAllocator | None = None
+        if os.environ.get("VLLM_SM70_PHASE_SEPARATION", "0") not in (
+            "",
+            "0",
+            "false",
+            "False",
+        ):
+            self.phase_separation = PhaseCreditAllocator(
+                PhaseConfig(
+                    decode_time_share=float(
+                        os.environ.get("VLLM_SM70_PHASE_DECODE_SHARE", "0.3333")
+                    ),
+                    max_decode_wait_ms=float(
+                        os.environ.get("VLLM_SM70_PHASE_MAX_WAIT_MS", "700")
+                    ),
+                )
+            )
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events
@@ -627,6 +654,26 @@ class Scheduler(SchedulerInterface):
             and self.current_step >= r.next_decode_eligible_step
         }
         resident_tokens = {rid: n for rid, n in resident_tokens.items() if n > 0}
+
+        # [相位分离 2026-10-08] 本步只跑一个相位。分类原语就是上面的
+        # prefill_remaining：prefill 没跑完的算 PREFILL，跑完的算 DECODE。
+        # ⚠️ 不能按 running/waiting 划分 —— self.running 里【混着】未跑完
+        # prefill 的请求（第 638 行那个字典就是给 limit_prefill 用的现成原语）。
+        phase: Phase | None = None
+        if self.phase_separation is not None:
+            _now = time.monotonic()
+            # 先回填上一步耗时，再决策。反序会让信用滞后一步：prefill 步赚的
+            # 信用要两步后才可见，穿零后需连续两个 prefill 步才能回正，
+            # 白烧一个 prefill 步（实测占比 33% → 23%）。
+            self.phase_separation.charge_elapsed(_now)
+            phase = self.phase_separation.next_phase(
+                has_decode=any(remaining == 0 for remaining in prefill_remaining.values()),
+                has_prefill=bool(self.waiting)
+                or any(remaining > 0 for remaining in prefill_remaining.values()),
+                now=_now,
+            )
+            if phase is not None:
+                self.phase_separation.begin_phase(phase, _now)
         control_mixed_prefill = (
             self.mixed_prefill_enabled
             and bool(resident_tokens)
@@ -698,6 +745,16 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            # [相位分离] 不属于本相位的请求整步跳过，保证相位纯净（混批步拿不到
+            # FULL 图）。prefill_remaining 是本步开始时算的，而相位正好按它划分，
+            # 所以本步内不会出现「请求跨相位」的歧义：prefill 在本步跑完的请求
+            # 仍归 PREFILL，其被调度 token 全部是 prefill token。
+            if phase is not None and (prefill_remaining[request.request_id] > 0) != (
+                phase is Phase.PREFILL
+            ):
+                req_index += 1
+                continue
 
             if self.current_step < request.next_decode_eligible_step:
                 req_index += 1
@@ -987,7 +1044,13 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+        # [相位分离] 准入会引入 prefill 工作，只能发生在 PREFILL 相位；否则
+        # 新请求会污染纯 decode 步，使该步退回 eager（这正是要消除的病理）。
+        if (
+            not preempted_reqs
+            and self._pause_state == PauseState.UNPAUSED
+            and (phase is None or phase is Phase.PREFILL)
+        ):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
@@ -1406,6 +1469,19 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        # [相位分离] 回填本步工作量。相位纯净 ⇒ PREFILL 步的全部 token 都是
+        # prefill token（护栏#1：分母只用 prefill token，不掺 decode）。
+        if self.phase_separation is not None:
+            self.phase_separation.observe_step_work(
+                scheduled_tokens=total_num_scheduled_tokens,
+                prefill_tokens=(
+                    total_num_scheduled_tokens if phase is Phase.PREFILL else 0
+                ),
+            )
+            # 相位选对了却一个 token 都没调度出来（例如解码请求本步都不可用）
+            # ⇒ 下步换相位，否则会空转：空步不推进 credit，是永久自旋。
+            if phase is not None and total_num_scheduled_tokens == 0:
+                self.phase_separation.note_empty_phase_step(phase)
         return scheduler_output
 
     def _build_kv_connector_meta(
