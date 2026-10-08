@@ -10424,14 +10424,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH2_LOOKUP_NSTRONG": env_var(
-        lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_NSTRONG", "6"))),
+        # [1Cat 本地改动 2026-10-08] 上游原默认（注释保留备查）：
+        # lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_NSTRONG", "6"))),
+        # 线上要 8。unit 里写了 VLLM_DFLASH2_LOOKUP_NSTRONG=8，但 unit 的 VLLM_*
+        # 到不了 worker，此前一直静默走默认 6（见 SM70 worker env overrides）。
+        lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_NSTRONG", "8"))),
         description=(
             "vLLM: dflash2 lookup nstrong. The consumer locations and unset "
             "defaults are listed below."
         ),
         category="configuration",
-        declared_default="Computed when unset: max(1, int('6'))",
-        effective_default="Computed when unset: max(1, int('6'))",
+        declared_default="Computed when unset: max(1, int('8'))",
+        effective_default="Computed when unset: max(1, int('8'))",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
         user_visible=False,
@@ -10476,14 +10480,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH2_LOOKUP_SEARCH": env_var(
-        lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_SEARCH", str(1 << 30)))),
+        # [1Cat 本地改动 2026-10-08] 上游原默认（注释保留备查）：
+        # lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_SEARCH", str(1 << 30)))),
+        # 线上要 65536。unit 里写了但到不了 worker，此前一直静默走 2^30；因 2^30
+        # 大于 max_model_len(256000)，实际等价于「搜整个上下文」。
+        lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_SEARCH", "65536"))),
         description=(
             "vLLM: dflash2 lookup search. The consumer locations and unset "
             "defaults are listed below."
         ),
         category="configuration",
-        declared_default="Computed when unset: max(1, int(str(1 << 30)))",
-        effective_default="Computed when unset: max(1, int(str(1 << 30)))",
+        declared_default="Computed when unset: max(1, int('65536'))",
+        effective_default="Computed when unset: max(1, int('65536'))",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
         user_visible=False,
