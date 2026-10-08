@@ -1006,15 +1006,11 @@ class AnthropicServingMessages(OpenAIServingChat):
                                         )
                             continue
                 else:
-                    error_response = AnthropicStreamEvent(
-                        type="error",
-                        error=AnthropicError(
-                            type="internal_error",
-                            message="Invalid data format received",
-                        ),
-                    )
-                    data = error_response.model_dump_json(exclude_unset=True)
-                    yield wrap_data_with_event(data, "error")
+                    # Non-`data:` SSE frames are legal: comment lines (e.g. the
+                    # opt21 `: keepalive` frame emitted after a >=120s silence),
+                    # blank lines, and `event:`/`id:`/`retry:` fields. Ignore
+                    # them instead of aborting the whole stream.
+                    continue
 
         except Exception as e:
             logger.exception("Error in message stream converter.")
