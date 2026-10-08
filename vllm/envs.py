@@ -10405,15 +10405,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # speculative config's ngram_assist flag; these knobs tune only its
     # experimental fusion and adaptive q8/q16 policy.
     "VLLM_DFLASH2_LOOKUP_ADAPTIVE": env_var(
-        lambda: bool(int(os.getenv("VLLM_DFLASH2_LOOKUP_ADAPTIVE", "1"))),
+        # [1Cat 本地改动 2026-10-08] 默认由 "1" 改为 "0"：自适应 q8/q16 验证宽度
+        # 是**异步**决定的（DFlash2 speculator 的 `_queue_lookup_flags` 异步把 q16
+        # 信号拷到 pinned 内存，`want=None` 表示标志尚未落地）。线上要求它**默认
+        # 关闭**，只有显式设 env 才启用；关闭后 = 固定 q16 验证（VllmConfig 里
+        # adaptive_dflash_lookup 分支的官方提示即此解法）。
+        lambda: bool(int(os.getenv("VLLM_DFLASH2_LOOKUP_ADAPTIVE", "0"))),
         description=(
             "Lookup-augmented DFlash2 controller. The lookup itself is enabled"
             " by the speculative config's ngram_assist flag; these knobs tune "
             "only its experimental fusion and adaptive q8/q16 policy."
         ),
         category="experimental",
-        declared_default="True",
-        effective_default="True",
+        declared_default="False",
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
         user_visible=False,
