@@ -819,6 +819,12 @@ if TYPE_CHECKING:
     # they never change compiled kernels, so they are added to `compile_factors`'
     # ignored_factors -- otherwise merely re-tuning the decode share would
     # invalidate the torch.compile cache and force a full recompile.
+    #
+    # Why ignoring is needed even though these are read with os.environ.get:
+    # compile_factors has a second pass that sweeps every VLLM_-prefixed entry
+    # of os.environ precisely so that out-of-tree switches (which this module
+    # never sees) still land in the cache key. Being registered is not enough
+    # to keep them out -- they must be listed in ignored_factors.
     VLLM_SM70_PHASE_SEPARATION: bool = False
     VLLM_SM70_PHASE_DECODE_SHARE: float = 0.4766
     VLLM_SM70_PHASE_MAX_WAIT_MS: float = 300.0
