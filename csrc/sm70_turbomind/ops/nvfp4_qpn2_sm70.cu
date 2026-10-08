@@ -47,6 +47,11 @@ constexpr int kQpn2MaxRows = 128;
 // verifies 16 * (1 + 7) = 128 rows (NST=5 -> 96). The generic launch_qpn2 path
 // (row_blocks = ceil(m / kRowsPerCta), no M ceiling) already handles m>32, so
 // this only moves the TORCH_CHECK / dispatch boundary.
+// 2026-10-09 A/B: tried 256 for DFlash2 NST=15 @ max_num_seqs=16 (M=256 rows).
+// Reverted -- at M>128 the QPN2 tiled path measures SLOWER than the TurboMind
+// fallback it replaces (gen -2.1%, copy -4.3%, 3 rounds each, conc=16), and the
+// sibling QPN8 widening cost -6.5%. The generic launch_qpn2 path is a small-M
+// decode optimisation, not a large-M win.
 constexpr int kQpn2DispatchMaxRows = 128;
 
 __device__ __forceinline__ int qpn2_col_from_lane(int lane) {

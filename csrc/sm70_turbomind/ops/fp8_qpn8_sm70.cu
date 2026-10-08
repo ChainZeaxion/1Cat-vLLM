@@ -2011,6 +2011,8 @@ void fp8_qpn8_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
   // 使 16 并发 × (k+1) 的 M=48/64/96/128 走 QPN8 快路，而非
   // fp8_qpn8_prefill_sm70_out（整权重 dequant + cuBLAS）。每块 ≤16 行，
   // 仍满足 fp8_qpn8_gemm_sm70_out 的 m<=32 断言。kw=7 时 per-16 块数 = 8。
+  // [本地 2026-10-09 隔离实验] 曾试 256，A/B 显示 conc=16 时聚合吞吐 −9%，
+  // 故回退 128。QPN2 的 256 是否保留见 nvfp4_qpn2_sm70.cu。
   constexpr int64_t kQpn8ChunkedMaxRows = 128;
   const bool admitted_m = (qpn8_m16_enabled && m <= 16) ||
                           (qpn8_m32_chunked_enabled && m <= kQpn8ChunkedMaxRows) ||
