@@ -94,6 +94,11 @@ class PhaseConfig:
     # realised share fell below the configured one. The cap and the stall
     # bound are different concerns and must not share a knob.
     credit_cap_floor_ms: float = 1500.0
+    # Below this many prefill tokens a step is dominated by the fixed ~250 ms
+    # host dispatch floor, so dividing its wall-clock by its token count gives
+    # a meaningless per-token cost (observed: 161 ms/token on a 3-token replay).
+    # Such samples are skipped rather than allowed to poison the average.
+    min_prefill_tokens_for_ema: int = 256
     ema_alpha: float = 0.3
 
     @property
@@ -118,6 +123,14 @@ class PhaseCreditAllocator:
         self._last_decode_ts: float | None = None
         # Set when a chosen phase scheduled nothing; see note_empty_phase_step.
         self._force_flip: Phase | None = None
+        # Realised step counts, for tuning. The configured knob is a *time*
+        # share, but operators reason in "N decode steps per prefill step", so
+        # these are what make the two views reconcilable. Counted here rather
+        # than via the step profiler: the profiler samples one step in forty
+        # (too coarse to see the pattern) and forces a device sync when asked
+        # for every step, which would perturb the very cadence being measured.
+        self.decode_steps = 0
+        self.prefill_steps = 0
         # Measured, never fitted. Diagnostics and the chunk cap read these.
         self.decode_step_ms: float | None = None
         self.prefill_ms_per_token: float | None = None
@@ -208,6 +221,11 @@ class PhaseCreditAllocator:
         """Record what the step actually did, once the batch is known."""
         self._prev_did_work = scheduled_tokens > 0
         self._prev_prefill_tokens = prefill_tokens
+        if scheduled_tokens > 0:
+            if prefill_tokens > 0:
+                self.prefill_steps += 1
+            else:
+                self.decode_steps += 1
 
     def _apply_feedback(self, phase: Phase, dt_ms: float) -> None:
         cfg = self.config
@@ -218,7 +236,7 @@ class PhaseCreditAllocator:
             self.credit_ms += cfg.earn_ratio * dt_ms
             # Only prefill tokens divide prefill time. This is guardrail #1:
             # the step was phase-pure, so its whole duration belongs to them.
-            if self._prev_prefill_tokens > 0:
+            if self._prev_prefill_tokens >= cfg.min_prefill_tokens_for_ema:
                 self.prefill_ms_per_token = self._ema(
                     self.prefill_ms_per_token, dt_ms / self._prev_prefill_tokens
                 )
@@ -260,11 +278,19 @@ class PhaseCreditAllocator:
         fits = cfg.max_decode_wait_ms / self.prefill_ms_per_token
         return max(cfg.min_prefill_tokens, min(cfg.max_prefill_tokens, int(fits)))
 
+    def steps_per_prefill(self) -> float:
+        """Realised decode steps per prefill step (0 until both have run)."""
+        if not self.prefill_steps:
+            return 0.0
+        return self.decode_steps / self.prefill_steps
+
     def stats(self) -> str:
         def fmt(v: float | None, nd: int = 2) -> str:
             return "n/a" if v is None else f"{round(v, nd)}"
 
         return (
+            f"D:P={self.decode_steps}:{self.prefill_steps} "
+            f"({self.steps_per_prefill():.2f} dec/pre) "
             f"credit={self.credit_ms:.1f}ms "
             f"dec_step={fmt(self.decode_step_ms)}ms "
             f"pre_ms_per_tok={fmt(self.prefill_ms_per_token, 4)} "

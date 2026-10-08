@@ -1482,6 +1482,10 @@ class Scheduler(SchedulerInterface):
             # ⇒ 下步换相位，否则会空转：空步不推进 credit，是永久自旋。
             if phase is not None and total_num_scheduled_tokens == 0:
                 self.phase_separation.note_empty_phase_step(phase)
+            # 周期性打印实现形态。配置旋钮是【时间占比】，但人按「每轮几步 decode」
+            # 思考，这条日志是两种视角的换算依据（调参主要靠它）。
+            elif phase is not None and self.current_step % 200 == 0:
+                logger.info("[phase-separation] %s", self.phase_separation.stats())
         return scheduler_output
 
     def _build_kv_connector_meta(
