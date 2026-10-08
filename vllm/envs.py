@@ -812,6 +812,9 @@ if TYPE_CHECKING:
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ROCM_CUSTOM_PAGED_ATTN: bool = True
+    # Opt-in only: when SchedulerConfig.async_scheduling is left unset (None),
+    # async scheduling is DISABLED unless this is 1.
+    VLLM_ASYNC_SCHEDULING: bool = False
     VLLM_USE_V1: bool = True
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
@@ -12538,6 +12541,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="True",
         effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    # Async scheduling is opt-in. When --async-scheduling is left unset
+    # (SchedulerConfig.async_scheduling is None) it stays OFF unless this is 1.
+    "VLLM_ASYNC_SCHEDULING": env_var(
+        lambda: bool(int(os.getenv("VLLM_ASYNC_SCHEDULING", "0"))),
+        description=(
+            "Explicit opt-in for asynchronous scheduling. Async scheduling "
+            "defaults to OFF when the --async-scheduling flag is not passed; "
+            "set this to 1 to enable it without changing the launch flags."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,

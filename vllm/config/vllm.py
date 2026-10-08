@@ -1762,8 +1762,15 @@ class VllmConfig:
                     f"`{executor_backend}` does not support async scheduling yet."
                 )
         elif self.scheduler_config.async_scheduling is None:
+            # Async scheduling is opt-in: leaving the flag unset means OFF.
+            # Auto-enabling it silently rewrote the step pipeline (the extra
+            # sample_tokens RPC) with no trace in the launch flags, so it must
+            # now be requested explicitly -- either VLLM_ASYNC_SCHEDULING=1 or
+            # an explicit --async-scheduling.
+            if not envs.VLLM_ASYNC_SCHEDULING:
+                self.scheduler_config.async_scheduling = False
             # Enable async scheduling unless there is an incompatible option.
-            if (
+            elif (
                 self.model_config is not None
                 and self.model_config.runner_type == "pooling"
             ):
