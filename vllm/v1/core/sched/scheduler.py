@@ -148,7 +148,10 @@ class Scheduler(SchedulerInterface):
                         os.environ.get("VLLM_SM70_PHASE_DECODE_SHARE", "0.3333")
                     ),
                     max_decode_wait_ms=float(
-                        os.environ.get("VLLM_SM70_PHASE_MAX_WAIT_MS", "700")
+                        os.environ.get("VLLM_SM70_PHASE_MAX_WAIT_MS", "300")
+                    ),
+                    log_interval_steps=int(
+                        os.environ.get("VLLM_SM70_PHASE_LOG_INTERVAL", "0")
                     ),
                 )
             )
@@ -1482,9 +1485,15 @@ class Scheduler(SchedulerInterface):
             # ⇒ 下步换相位，否则会空转：空步不推进 credit，是永久自旋。
             if phase is not None and total_num_scheduled_tokens == 0:
                 self.phase_separation.note_empty_phase_step(phase)
-            # 周期性打印实现形态。配置旋钮是【时间占比】，但人按「每轮几步 decode」
-            # 思考，这条日志是两种视角的换算依据（调参主要靠它）。
-            elif phase is not None and self.current_step % 200 == 0:
+            # 周期性打印实现形态（默认关：VLLM_SM70_PHASE_LOG_INTERVAL=0）。
+            # 配置旋钮是【时间占比】，但人按「每轮几步 decode」思考，这条日志是
+            # 两种视角的换算依据（调参时开）。⚠️ 别用 step profiler 测这个 ——
+            # 它 40 步才采一次，改成每步采样又会强制设备同步、扰动节奏。
+            elif (
+                phase is not None
+                and self.phase_separation.config.log_interval_steps > 0
+                and self.current_step % self.phase_separation.config.log_interval_steps == 0
+            ):
                 logger.info("[phase-separation] %s", self.phase_separation.stats())
         return scheduler_output
 

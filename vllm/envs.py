@@ -815,6 +815,15 @@ if TYPE_CHECKING:
     # Opt-in only: when SchedulerConfig.async_scheduling is left unset (None),
     # async scheduling is DISABLED unless this is 1.
     VLLM_ASYNC_SCHEDULING: bool = False
+    # prefill/decode phase separation (opt27). These are scheduling-only knobs:
+    # they never change compiled kernels, so they are added to `compile_factors`'
+    # ignored_factors -- otherwise merely re-tuning the decode share would
+    # invalidate the torch.compile cache and force a full recompile.
+    VLLM_SM70_PHASE_SEPARATION: bool = False
+    VLLM_SM70_PHASE_DECODE_SHARE: float = 0.4766
+    VLLM_SM70_PHASE_MAX_WAIT_MS: float = 300.0
+    # 0 disables the periodic phase-pattern log (1 line per N engine steps).
+    VLLM_SM70_PHASE_LOG_INTERVAL: int = 0
     VLLM_USE_V1: bool = True
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
@@ -12561,6 +12570,65 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=True,
     ),
+    # prefill/decode phase separation (opt27). All four are listed in
+    # compile_factors' ignored_factors: they steer the scheduler only and never
+    # change compiled kernels, so tuning them must not invalidate the
+    # torch.compile cache.
+    "VLLM_SM70_PHASE_SEPARATION": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_PHASE_SEPARATION", "0"))),
+        description=(
+            "Run whole scheduler steps as either pure-decode or pure-prefill "
+            "phases so the decode phase can replay a FULL CUDA graph. Default "
+            "off (mixed batching)."
+        ),
+        category="performance",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_SM70_PHASE_DECODE_SHARE": env_var(
+        lambda: float(os.getenv("VLLM_SM70_PHASE_DECODE_SHARE", "0.4766")),
+        description=(
+            "Target share of wall-clock time given to the decode phase when "
+            "phase separation is on. The credit earn rate is "
+            "share/(1-share), so this is NOT the rate itself."
+        ),
+        category="performance",
+        declared_default="0.4766",
+        effective_default="0.4766",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_SM70_PHASE_MAX_WAIT_MS": env_var(
+        lambda: float(os.getenv("VLLM_SM70_PHASE_MAX_WAIT_MS", "300")),
+        description=(
+            "Longest a decode request may go unserved before the phase "
+            "allocator forces a decode phase. The stall a client actually "
+            "observes is this plus one prefill step."
+        ),
+        category="performance",
+        declared_default="300.0",
+        effective_default="300.0",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_SM70_PHASE_LOG_INTERVAL": env_var(
+        lambda: int(os.getenv("VLLM_SM70_PHASE_LOG_INTERVAL", "0")),
+        description=(
+            "Emit the phase-pattern line (realised decode:prefill step ratio) "
+            "once every N engine steps. 0 disables it."
+        ),
+        category="logging",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
     # Legacy benchmark harness knob from 0.0.3. Latest vLLM routes
     # vllm.engine.llm_engine directly to the V1 engine, so this remains a
     # no-op compatibility value.
@@ -18635,6 +18703,13 @@ def compile_factors() -> dict[str, object]:
         "LD_LIBRARY_PATH",
         "VLLM_SERVER_DEV_MODE",
         "VLLM_SM70_REQUIRE_PROFILE_ACCELERATION",
+        # Phase separation steers the scheduler only -- it never changes which
+        # kernels are compiled, so re-tuning these must not drop the
+        # torch.compile cache (a full recompile costs ~200s).
+        "VLLM_SM70_PHASE_SEPARATION",
+        "VLLM_SM70_PHASE_DECODE_SHARE",
+        "VLLM_SM70_PHASE_MAX_WAIT_MS",
+        "VLLM_SM70_PHASE_LOG_INTERVAL",
         "VLLM_DP_MASTER_IP",
         "VLLM_DP_MASTER_PORT",
         "VLLM_NIXL_SIDE_CHANNEL_HOST",

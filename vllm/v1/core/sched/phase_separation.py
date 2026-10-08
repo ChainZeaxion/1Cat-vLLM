@@ -100,6 +100,11 @@ class PhaseConfig:
     # Such samples are skipped rather than allowed to poison the average.
     min_prefill_tokens_for_ema: int = 256
     ema_alpha: float = 0.3
+    # Emit a phase-pattern line every N steps. 0 = silent (the default): this
+    # line is diagnostic, and the step profiler is the wrong tool for the same
+    # question (it samples 1 step in 40, and asking it for every step forces a
+    # device sync that perturbs the cadence being measured).
+    log_interval_steps: int = 0
 
     @property
     def earn_ratio(self) -> float:
