@@ -112,12 +112,29 @@ class CompletionTokenUsageInfo(OpenAIBaseModel):
     reasoning_tokens: int | None = None
 
 
+class RequestTimings(OpenAIBaseModel):
+    # [1Cat P4] Per-request wall-clock breakdown, derived by the engine from
+    # RequestStateStats (v1/metrics/stats.py) at output_processor.py do_tracing.
+    # Studio shows isolated prefill/decode under concurrency from these instead
+    # of estimating off the local token stream. Seconds. Any field is None when
+    # the engine did not collect stats for this request (e.g. log_stats=False).
+    queue_s: float | None = None
+    prefill_s: float | None = None
+    decode_s: float | None = None
+    inference_s: float | None = None
+    # arrival -> first token. Slightly wider than queue_s + prefill_s: it also
+    # covers the frontend-to-core hop, which queue+prefill cannot see.
+    ttft_s: float | None = None
+
+
 class UsageInfo(OpenAIBaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: int | None = 0
     prompt_tokens_details: PromptTokenUsageInfo | None = None
     completion_tokens_details: CompletionTokenUsageInfo | None = None
+    # [1Cat P4] Optional engine-authoritative per-request timing breakdown.
+    timings: RequestTimings | None = None
 
 
 class RequestResponseMetadata(BaseModel):

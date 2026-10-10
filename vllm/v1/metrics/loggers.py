@@ -917,6 +917,58 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             histogram_decode_time_request, per_engine_labelvalues
         )
 
+        # [1Cat P4] Per-request timing gauges carrying the client-facing request
+        # id. The histograms above are anonymous aggregates, so an external
+        # dashboard cannot recover one request's isolated prefill/decode under
+        # concurrency from them. These expose exactly that; the series set grows
+        # with traffic, so _p4_gc_reap() reaps stale label sets on every emit.
+        self._p4_gauge_labels = labelnames + ["request_id"]
+        gauge_p4_prefill = self._gauge_cls(
+            name="vllm:request_prefill_time_ms",
+            documentation=(
+                "[1Cat] Per-request PREFILL phase duration in milliseconds, "
+                "labelled by request id."
+            ),
+            labelnames=self._p4_gauge_labels,
+            multiprocess_mode="mostrecent",
+        )
+        self.gauge_p4_prefill_time_ms = gauge_p4_prefill
+        gauge_p4_decode = self._gauge_cls(
+            name="vllm:request_decode_time_ms",
+            documentation=(
+                "[1Cat] Per-request DECODE phase duration in milliseconds, "
+                "labelled by request id."
+            ),
+            labelnames=self._p4_gauge_labels,
+            multiprocess_mode="mostrecent",
+        )
+        self.gauge_p4_decode_time_ms = gauge_p4_decode
+        gauge_p4_queue = self._gauge_cls(
+            name="vllm:request_queue_time_ms",
+            documentation=(
+                "[1Cat] Per-request queueing duration in milliseconds, "
+                "labelled by request id."
+            ),
+            labelnames=self._p4_gauge_labels,
+            multiprocess_mode="mostrecent",
+        )
+        self.gauge_p4_queue_time_ms = gauge_p4_queue
+        gauge_p4_ttft = self._gauge_cls(
+            name="vllm:request_ttft_time_ms",
+            documentation=(
+                "[1Cat] Per-request time to first token in milliseconds, "
+                "labelled by request id."
+            ),
+            labelnames=self._p4_gauge_labels,
+            multiprocess_mode="mostrecent",
+        )
+        self.gauge_p4_ttft_time_ms = gauge_p4_ttft
+        # request_id -> (last_emit_monotonic, label_values) for TTL reaping.
+        self._p4_last_seen: dict[str, tuple[float, list[object]]] = {}
+        self._p4_ttl_s = 600.0
+        self._p4_gc_interval_s = 60.0
+        self._p4_last_gc = time.monotonic()
+
         histogram_prefill_kv_computed_request = self._histogram_cls(
             name="vllm:request_prefill_kv_computed_tokens",
             documentation=(
@@ -1214,6 +1266,62 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 self.histogram_max_tokens_request[engine_idx].observe(
                     finished_request.max_tokens_param
                 )
+            # [1Cat P4] publish this request's isolated timings under its id.
+            self._p4_emit_finished_request(engine_idx, finished_request)
+
+    def _p4_emit_finished_request(self, engine_idx: int, finished_request) -> None:
+        """[1Cat P4] Set the per-request gauges and reap stale series.
+
+        Called once per finished request. The request id is the client-facing
+        one, so a poller that knows which ids it issued can read back exactly
+        those. Gauges (not counters) because the value is a level, not an
+        accumulation, and the id label makes each series single-use.
+        """
+        request_id = getattr(finished_request, "request_id", None)
+        if not request_id:
+            return
+        labelvalues = self.per_engine_labelvalues.get(
+            engine_idx, [self.vllm_config.model_config.served_model_name,
+                         str(engine_idx)]
+        )
+        full = list(labelvalues) + [str(request_id)]
+        self.gauge_p4_prefill_time_ms.labels(*full).set(
+            float(finished_request.prefill_time) * 1000.0
+        )
+        self.gauge_p4_decode_time_ms.labels(*full).set(
+            float(finished_request.decode_time) * 1000.0
+        )
+        self.gauge_p4_queue_time_ms.labels(*full).set(
+            float(finished_request.queued_time) * 1000.0
+        )
+        self.gauge_p4_ttft_time_ms.labels(*full).set(
+            float(getattr(finished_request, "ttft", 0.0)) * 1000.0
+        )
+        now = time.monotonic()
+        self._p4_last_seen[str(request_id)] = (now, full)
+        if now - self._p4_last_gc >= self._p4_gc_interval_s:
+            self._p4_last_gc = now
+            self._p4_gc_reap(now)
+
+    def _p4_gc_reap(self, now: float) -> None:
+        """[1Cat P4] Drop label sets older than the TTL so /metrics stays bounded."""
+        cutoff = now - self._p4_ttl_s
+        stale = [rid for rid, (ts, _) in self._p4_last_seen.items() if ts < cutoff]
+        for rid in stale:
+            _, full = self._p4_last_seen.pop(rid, (0.0, None))
+            if not full:
+                continue
+            for gauge in (
+                self.gauge_p4_prefill_time_ms,
+                self.gauge_p4_decode_time_ms,
+                self.gauge_p4_queue_time_ms,
+                self.gauge_p4_ttft_time_ms,
+            ):
+                try:
+                    gauge.remove(*full)
+                except Exception:
+                    # Already gone (e.g. registry reset) -- nothing to reap.
+                    pass
 
     def record_sleep_state(self, sleep: int = 0, level: int = 0):
         awake = 1

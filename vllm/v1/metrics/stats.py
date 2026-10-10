@@ -237,6 +237,9 @@ class FinishedRequestStats:
     mean_time_per_output_token: float = 0.0
     is_corrupted: bool = False
     num_cached_tokens: int = 0
+    # [1Cat P4] arrival -> first token. Mirrors RequestStateStats.first_token_latency
+    # so the per-request TTFT can be published alongside the phase timings.
+    ttft: float = 0.0
 
 
 @dataclass
@@ -472,6 +475,7 @@ class IterationStats:
             mean_time_per_output_token=mean_time_per_output_token,
             is_corrupted=req_stats.is_corrupted,
             num_cached_tokens=num_cached_tokens,
+            ttft=req_stats.first_token_latency,
         )
         self.finished_requests.append(finished_req)
 

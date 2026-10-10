@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from vllm.entrypoints.openai.engine.protocol import RequestTimings
+
 
 class AnthropicError(BaseModel):
     """Error structure for Anthropic API"""
@@ -34,6 +36,10 @@ class AnthropicUsage(BaseModel):
     # deliberation differ by several times, so a client cannot size one from the
     # other. Omitted when the engine did not measure it.
     reasoning_tokens: int | None = None
+    # [1Cat P4] Engine per-request prefill/decode breakdown, mirrored from the
+    # OpenAI-layer usage so Anthropic clients can also show isolated timings
+    # under concurrency. Omitted when the engine did not collect stats.
+    timings: RequestTimings | None = None
 
 
 class AnthropicContentBlock(BaseModel):

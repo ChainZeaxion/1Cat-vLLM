@@ -602,6 +602,8 @@ class AnthropicServingMessages(OpenAIServingChat):
                     else None
                 ),
                 reasoning_tokens=self._anthropic_reasoning_tokens(generator.usage),
+                # [1Cat P4] passthrough of the engine-authoritative timings.
+                timings=generator.usage.timings,
             ),
             kv_transfer_params=generator.kv_transfer_params,
             token_ids=output_token_ids or None,
@@ -810,6 +812,11 @@ class AnthropicServingMessages(OpenAIServingChat):
                                             and origin_chunk.usage.prompt_tokens_details.cached_tokens
                                             else None
                                         ),
+                                        # [1Cat P4] usually absent on message_start
+                                        # (stats not finished yet); harmless if None.
+                                        timings=origin_chunk.usage.timings
+                                        if origin_chunk.usage
+                                        else None,
                                     ),
                                     # opt21: the prompt ids are echoed only when the
                                     # request opted in (the prompt can be tens of
@@ -863,6 +870,10 @@ class AnthropicServingMessages(OpenAIServingChat):
                                     reasoning_tokens=self._anthropic_reasoning_tokens(
                                         origin_chunk.usage
                                     ),
+                                    # [1Cat P4] engine timings ride the final delta.
+                                    timings=origin_chunk.usage.timings
+                                    if origin_chunk.usage
+                                    else None,
                                 ),
                             )
                             data = chunk.model_dump_json(exclude_unset=True)

@@ -48,6 +48,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
     FunctionCall,
     PromptTokenUsageInfo,
+    RequestTimings,
     RequestResponseMetadata,
     ToolCall,
     UsageInfo,
@@ -118,6 +119,34 @@ def _count_reasoning_tokens(
         total += reasoning_parser.count_reasoning_tokens(token_ids)
         measured = True
     return total if measured else None
+
+
+def _usage_timings(metrics: object) -> RequestTimings | None:
+    """[1Cat P4] Engine per-request prefill/decode breakdown for the response.
+
+    ``metrics`` is the ``RequestStateStats`` that the engine attaches to every
+    finished ``RequestOutput`` (v1/engine/output_processor.py). We only re-express
+    its monotonic timestamps as durations here -- no new measurement happens in
+    the serving layer. Returns None when stats were not collected (e.g. the
+    engine ran with ``log_stats=False``); the field is then omitted from the
+    response rather than reported as zero.
+    """
+    if metrics is None:
+        return None
+    queued = getattr(metrics, "queued_ts", 0.0)
+    scheduled = getattr(metrics, "scheduled_ts", 0.0)
+    first = getattr(metrics, "first_token_ts", 0.0)
+    last = getattr(metrics, "last_token_ts", 0.0)
+    if not (queued and scheduled and first and last):
+        return None
+    return RequestTimings(
+        queue_s=scheduled - queued,
+        prefill_s=first - scheduled,
+        decode_s=last - first,
+        inference_s=last - scheduled,
+        # Wider than queue_s + prefill_s by the frontend->core hop.
+        ttft_s=getattr(metrics, "first_token_latency", None) or None,
+    )
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -567,6 +596,9 @@ class OpenAIServingChat(OpenAIServing):
 
         last_server_send_time = time.time()
         try:
+            # [1Cat P4] Retain the last engine stats so the trailing usage chunk
+            # can carry the engine-authoritative timing breakdown.
+            last_metrics = None
             async for res in result_generator:
                 # opt21: ignore engine keepalive (15s), handle server keepalive (120s)
                 if res is STREAM_KEEPALIVE:
@@ -575,6 +607,8 @@ class OpenAIServingChat(OpenAIServing):
                         yield ": keepalive\n\n"
                         last_server_send_time = now
                     continue
+
+                last_metrics = getattr(res, "metrics", None)
 
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
@@ -1154,6 +1188,10 @@ class OpenAIServingChat(OpenAIServing):
                         )
                     )
 
+                # [1Cat P4] Engine-authoritative per-request timings (omitted by
+                # exclude_none below when stats were not collected).
+                final_usage.timings = _usage_timings(last_metrics)
+
                 final_usage_chunk = ChatCompletionStreamResponse(
                     id=request_id,
                     object=chunk_object_type,
@@ -1605,6 +1643,8 @@ class OpenAIServingChat(OpenAIServing):
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
         )
+        # [1Cat P4] Engine-authoritative per-request timing breakdown.
+        usage.timings = _usage_timings(getattr(final_res, "metrics", None))
         if self.enable_prompt_tokens_details and final_res.num_cached_tokens:
             usage.prompt_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=final_res.num_cached_tokens
