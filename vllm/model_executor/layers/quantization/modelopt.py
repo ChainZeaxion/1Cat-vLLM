@@ -1182,6 +1182,8 @@ def _prepare_sm70_modelopt_qpn2(layer: torch.nn.Module) -> bool:
         kernel = init_nvfp4_linear_kernel(config)
         if isinstance(kernel, Qpn4NvFp4LinearKernel):
             if kernel.try_process_weights(layer):
+                # The kernel must own dispatch: see ModelOptNvFp4LinearMethod.apply.
+                layer.sm70_modelopt_qpn_kernel = kernel
                 logger.info_once(
                     "SM70 ModelOpt NVFP4 aligned onto the QPN4 route."
                 )
@@ -1189,10 +1191,11 @@ def _prepare_sm70_modelopt_qpn2(layer: torch.nn.Module) -> bool:
             # Workspace admission failed without consuming weights: retry lower.
             kernel = init_nvfp4_linear_kernel(config, skip_qpn4=True)
         if isinstance(kernel, Qpn2NvFp4LinearKernel):
+            kernel.process_weights_after_loading(layer)
+            layer.sm70_modelopt_qpn_kernel = kernel
             logger.info_once(
                 "SM70 ModelOpt NVFP4 aligned onto the QPN2 selector route."
             )
-            kernel.process_weights_after_loading(layer)
             return True
     except Exception:
         logger.warning_once(
@@ -1690,6 +1693,13 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # [1Cat] A QPN2-aligned linear must dispatch through its own kernel, the
+        # way compressed_tensors_w4a4 does. The prepared-linear shortcut below
+        # only understands the plain TurboMind layout, whose prescaled GEMM
+        # requires M > 32 -- routing small-M decode through it aborts.
+        qpn_kernel = getattr(layer, "sm70_modelopt_qpn_kernel", None)
+        if qpn_kernel is not None:
+            return qpn_kernel.apply_weights(layer=layer, x=x, bias=bias)
         if sm70_tm.has_prepared_linear(layer):
             return sm70_tm.apply_prepared_linear(layer, x, bias)
         return self.kernel.apply_weights(layer=layer, x=x, bias=bias)
