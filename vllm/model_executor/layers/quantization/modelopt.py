@@ -1130,6 +1130,90 @@ def _explicit_nvfp4_emulation_requested() -> bool:
     )
 
 
+def _prepare_sm70_modelopt_qpn2(layer: torch.nn.Module) -> bool:
+    """[1Cat] Route a ModelOpt W4A16 NVFP4 linear onto the SM70 QPN2 kernels.
+
+    A compressed-tensors W4A4 checkpoint reaches QPN2 through the SM70 NVFP4
+    selector; this ModelOpt method instead pins Marlin and prepares plain
+    TurboMind, so a ModelOpt checkpoint silently misses that fast decode path.
+    The weights ModelOpt keeps are exactly what the QPN2 kernels read
+    (``weight`` / ``weight_scale`` / ``weight_global_scale``), and QPN2 consumes
+    FP16 activations, so no activation scale is required.
+
+    Two attempts, most faithful first:
+      A) the shared-weight selector route the CT scheme uses, and
+      B) the QPN2-only dense layout (``prepare_nvfp4_qpn2_dense_linear``).
+    Returns False to let the caller keep the historical TurboMind layout.
+    """
+    if not envs.VLLM_SM70_MODELOPT_NVFP4_QPN2:
+        return False
+    # --- Path A: ask the SM70 selector, exactly as compressed_tensors_w4a4 does.
+    kernel = None
+    try:
+        from vllm.model_executor.kernels.linear.nvfp4.sm70 import (
+            Qpn2NvFp4LinearKernel,
+            Qpn4NvFp4LinearKernel,
+            Sm70NvFp4LinearLayerConfig,
+        )
+        from vllm.model_executor.models.config import (
+            sm70_nvfp4_down_qualified,
+            sm70_nvfp4_gate_up_qualified,
+            sm70_nvfp4_projection_qualified,
+            sm70_nvfp4_qpn4_qualified,
+        )
+
+        cfg = get_current_vllm_config()
+        policy = cfg.kernel_config.sm70_nvfp4
+        dense_gated = bool(
+            sm70_nvfp4_gate_up_qualified(layer)
+            and envs.VLLM_SM70_NVFP4_DENSE_GATED_SILU
+        )
+        qpn4_role = sm70_nvfp4_down_qualified(layer) or dense_gated
+        config = Sm70NvFp4LinearLayerConfig(
+            input_size=layer.input_size_per_partition,
+            output_size=layer.output_size_per_partition,
+            weight_shape=tuple(layer.weight.shape),
+            policy=policy,
+            qpn2_qualified=sm70_nvfp4_projection_qualified(layer.prefix),
+            qpn4_qualified=(qpn4_role and sm70_nvfp4_qpn4_qualified(cfg)),
+            gated_silu=layer.prefix.rsplit(".", 1)[-1] == "gate_up_proj",
+            dense_gated_silu=dense_gated,
+        )
+        kernel = init_nvfp4_linear_kernel(config)
+        if isinstance(kernel, Qpn4NvFp4LinearKernel):
+            if kernel.try_process_weights(layer):
+                logger.info_once(
+                    "SM70 ModelOpt NVFP4 aligned onto the QPN4 route."
+                )
+                return True
+            # Workspace admission failed without consuming weights: retry lower.
+            kernel = init_nvfp4_linear_kernel(config, skip_qpn4=True)
+        if isinstance(kernel, Qpn2NvFp4LinearKernel):
+            logger.info_once(
+                "SM70 ModelOpt NVFP4 aligned onto the QPN2 selector route."
+            )
+            kernel.process_weights_after_loading(layer)
+            return True
+    except Exception:
+        logger.warning_once(
+            "SM70 ModelOpt NVFP4 QPN2 selector route declined; trying the "
+            "QPN2 dense layout.",
+            exc_info=True,
+        )
+    # --- Path B: the QPN2-only dense layout, no TurboMind registry involved.
+    try:
+        sm70_tm.prepare_nvfp4_qpn2_dense_linear(layer)
+        logger.info_once("SM70 ModelOpt NVFP4 aligned onto the QPN2 dense layout.")
+        return True
+    except Exception:
+        logger.warning_once(
+            "SM70 ModelOpt NVFP4 QPN2 dense layout failed; keeping the "
+            "historical TurboMind layout.",
+            exc_info=True,
+        )
+        return False
+
+
 def _try_prepare_sm70_modelopt_nvfp4(layer: torch.nn.Module) -> bool:
     """Prepare exact-SM70 TurboMind NVFP4 weights for a ModelOpt linear.
 
@@ -1138,11 +1222,15 @@ def _try_prepare_sm70_modelopt_nvfp4(layer: torch.nn.Module) -> bool:
     ``block * global``. Do not infer convention from scale magnitude.
     """
     if sm70_tm.should_prepare_turbomind(layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND):
-        logger.info_once(
-            "SM70 ModelOpt NVFP4 TurboMind dense path enabled "
-            "(weight-only; activations remain half)."
-        )
-        sm70_tm.prepare_nvfp4_linear(layer)
+        # [1Cat] Prefer the QPN2 route that the compressed-tensors W4A4 scheme
+        # already reaches, so a ModelOpt checkpoint gets the same fast decode
+        # kernels instead of the base TurboMind GEMM.
+        if not _prepare_sm70_modelopt_qpn2(layer):
+            logger.info_once(
+                "SM70 ModelOpt NVFP4 TurboMind dense path enabled "
+                "(weight-only; activations remain half)."
+            )
+            sm70_tm.prepare_nvfp4_linear(layer)
     elif sm70_tm.is_turing_cuda_platform():
         config = TuringNvFp4LinearLayerConfig(
             input_dtype=get_current_vllm_config().model_config.dtype,

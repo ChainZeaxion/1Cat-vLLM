@@ -471,6 +471,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_DENSE_GATED_SILU: bool = True
     VLLM_SM70_NVFP4_QPN4: bool = True
     VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE: bool = False
+    VLLM_SM70_MODELOPT_NVFP4_QPN2: bool = True
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1: bool = False
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS: int = 8
@@ -7113,6 +7114,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
         user_visible=False,
+    ),
+    # [1Cat] Route ModelOpt W4A16 NVFP4 linears onto the SM70 QPN2 kernels that
+    # the compressed-tensors W4A4 scheme already uses. ModelOpt's own method pins
+    # the base TurboMind layout and never consults the SM70 selector, so an
+    # otherwise identical checkpoint misses the fast decode path. Set to 0 to
+    # force the historical ModelOpt layout (base TurboMind / Marlin).
+    # NOTE: this selects different custom ops in the compiled graph, so it stays
+    # a compile factor on purpose -- flipping it costs one AOT recompile.
+    "VLLM_SM70_MODELOPT_NVFP4_QPN2": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MODELOPT_NVFP4_QPN2", "1"))),
+        description=(
+            "SM70: align ModelOpt W4A16 NVFP4 linears with the compressed-tensors "
+            "QPN2 route (selector first, dense layout second, TurboMind fallback)."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4", "QPN2"),
+        user_visible=True,
     ),
     # Memory-neutral native QPN4 M=1 decode for the accepted Qwen3.8-27B
     # NVFP4 TP4 no-MTP contract. Larger-M prefill dequantizes into one bounded
