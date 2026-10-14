@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+import time
 from typing import Any
 
 import numpy as np
@@ -1080,7 +1082,33 @@ class DFlash2Speculator(DFlashSpeculator):
         # The copy stream only depends on target sampling. The main stream can
         # materialize DFlash context K/V while the host waits here, so lookup
         # does not serialize the context projection.
-        output_copy_event.synchronize()
+        #
+        # [SM70 diag 2026-10-11] Bounded wait. This unbounded synchronize() is
+        # exactly where every async-scheduling + ngram-assist deadlock was
+        # observed: the host blocks until the main stream's queued work
+        # retires, and under async scheduling a stuck collective never
+        # retires, so the workers spin forever and the engine wedges. Budget
+        # the wait so a stuck stream degrades this optional ngram assist
+        # instead of wedging the engine. 0 keeps the historical unbounded
+        # behaviour. Diagnostic only: lives in site-packages, not in the
+        # build tree or the patch.
+        _wait_ms = float(
+            os.environ.get("SM70_DFLASH2_NGRAM_ASSIST_WAIT_MS", "0") or 0
+        )
+        if _wait_ms > 0:
+            _deadline = time.monotonic() + _wait_ms / 1000.0
+            while not output_copy_event.query():
+                if time.monotonic() >= _deadline:
+                    logger.warning_once(
+                        "DFlash2 ngram assist skipped: output copy event did "
+                        "not retire within %.0f ms (async+ngram deadlock "
+                        "guard).",
+                        _wait_ms,
+                    )
+                    return False
+                time.sleep(0.0005)
+        else:
+            output_copy_event.synchronize()
         num_reqs = input_batch.num_reqs
         num_draft_tokens = input_batch.num_draft_tokens_per_req
         if num_draft_tokens is None:
