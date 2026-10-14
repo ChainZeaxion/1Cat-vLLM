@@ -128,6 +128,7 @@ class Scheduler(SchedulerInterface):
         self.mixed_prefill_budget = MixedPrefillBudget(
             self.max_num_scheduled_tokens,
             self.scheduler_config.mixed_prefill_step_latency_ms,
+            self.scheduler_config.mixed_prefill_min_tokens,
         )
         self.mixed_prefill_enabled = current_platform.device_type == "cuda"
         # [相位分离 2026-10-08] 一个整步只喂给 decode 或 prefill 之一，使
