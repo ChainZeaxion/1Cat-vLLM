@@ -32,6 +32,11 @@ _RELOAD_ORDER = (
     "vllm.tool_parsers.utils",
     "vllm.tool_parsers.qwen3coder_tool_parser",
     "vllm.tool_parsers.qwen3xml_tool_parser",
+    # [本地 2026-10-12] 纳入 openai chat_completion serving —— 收尾补发口径、
+    # 参数越界/分歧守卫等修复都落在该模块**类的方法**上。reload 后由
+    # api_router._refresh_serving_classes 把新方法覆盖到运行实例所属的旧类，
+    # 实例无需重建（它们长生命、持有 tokenizer / engine client）。
+    "vllm.entrypoints.openai.chat_completion.serving",
 )
 
 _VERSION = 0

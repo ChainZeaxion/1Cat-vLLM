@@ -997,6 +997,15 @@ class OpenAIServingChat(OpenAIServing):
                             and getattr(tool_parser, "_thinking_enabled", False)
                             and getattr(tool_parser, "_deferred_used", False)
                         ):
+                            # [本地 2026-10-13] 捕获「已流式下发」的调用数，供下方
+                            # 被推迟（非流式）调用**续号**。必须在此处读：紧接着的
+                            # `extract_tool_calls_deferred` 内部会调
+                            # `_reset_streaming_state()` 把 current_tool_index 归零。
+                            # ⚠️ 不续号的后果（实测 WebFetch(流式)+Bash/Glob(非流式)）：
+                            # 非流式调用从 0 重编号 ⇒ Bash 也发到 idx0，与流式工具撞车，
+                            # 客户端把两个调用的 arguments 拼进同一 index ⇒ 必然
+                            # `Extra data`（用户报「bash 一堆执行失败」）。
+                            _streamed_base = getattr(tool_parser, "current_tool_index", 0)
                             _, _deferred_content = reasoning_parser.extract_reasoning(
                                 previous_texts[i], request=request
                             )
@@ -1006,12 +1015,24 @@ class OpenAIServingChat(OpenAIServing):
                             if _deferred_info.tools_called:
                                 if delta_message is None:
                                     delta_message = DeltaMessage()
-                                _base = len(delta_message.tool_calls or [])
+                                _base = max(
+                                    _streamed_base,
+                                    len(delta_message.tool_calls or []),
+                                )
+                                # [本地 2026-10-13] 优先用解析器记录的**原始下标**
+                                # （确定性）；`_base + _di` 仅作兜底。
+                                _deferred_indices = (
+                                    getattr(tool_parser, "_deferred_indices", None) or []
+                                )
                                 delta_message.tool_calls = list(
                                     delta_message.tool_calls or []
                                 ) + [
                                     DeltaToolCall(
-                                        index=_base + _di,
+                                        index=(
+                                            _deferred_indices[_di]
+                                            if _di < len(_deferred_indices)
+                                            else _base + _di
+                                        ),
                                         id=_tc.id,
                                         type="function",
                                         function=DeltaFunctionCall(
@@ -1031,11 +1052,41 @@ class OpenAIServingChat(OpenAIServing):
                         )
                         # only check if there are any tool calls
                         # detected by partial parsing
+                        # [本地 2026-10-12] 越界守卫（修 502）。
+                        # 上方 955 的 flush_streaming_finish() 内部会走非流式路径
+                        # extract_tool_calls()，而它会重置这两个列表
+                        # （qwen3coder_tool_parser.py:2086 `.clear()` / :2025 重建）。
+                        # 但 index 是 941 用**重置前的长度**算出来的；若 flush 判定
+                        # 无需补发（_flush_info.tool_calls 为空 ⇒ 不进 957 分支 ⇒
+                        # _deferred_emitted 仍是 False），本块照样会进来 ⇒ 1064/1074
+                        # 按下标取值越界 ⇒ IndexError 被当 error chunk 下发 ⇒
+                        # 客户端 502「Invalid data format received」。
+                        # 故按**当前**长度复核；列表为空即无已入账调用，跳过补发。
+                        # _pca = prev_tool_call_arr，_sat = streamed_args_for_tool。
+                        _pca = getattr(tool_parser, "prev_tool_call_arr", ()) or ()
+                        _sat = getattr(tool_parser, "streamed_args_for_tool", ()) or ()
+                        # [本地 2026-10-13] 「已推迟下发」≠「已下发足够」：
+                        # `_deferred_emitted` 只在 983/1025 标记**发过一次**，但
+                        # 流式侧 `streamed_args_for_tool` 仍可能短于完整值
+                        # （实测 r5：exp=15705 / streamed=15703，差 2 字节）
+                        # ⇒ 客户端 JSON 报 `Unterminated string at char 6771`。
+                        # 故 deferred 只有在 streamed 已达完整长度时才允许跳过补发。
+                        _sat_short = False
+                        if 0 <= index < len(_pca) and 0 <= index < len(_sat):
+                            _av0 = _pca[index].get("arguments", "")
+                            _exp0 = (
+                                _av0
+                                if isinstance(_av0, str)
+                                else json.dumps(_av0, ensure_ascii=False)
+                            )
+                            _sat_short = bool(_exp0) and len(_sat[index]) < len(_exp0)
                         if (
                             should_check
                             and tool_parser
                             and auto_tools_called
-                            and not _deferred_emitted
+                            and (not _deferred_emitted or _sat_short)
+                            and 0 <= index < len(_pca)
+                            and 0 <= index < len(_sat)
                         ):
                             latest_delta_len = 0
                             if (
@@ -1071,15 +1122,81 @@ class OpenAIServingChat(OpenAIServing):
 
                             # get what we've streamed so far for arguments
                             # for the current tool
+                            # [opt22h 2026-10-14] 修「扣减负切片」缺陷：旧写法
+                            # `actual_call[:-latest_delta_len]` 在
+                            # latest_delta_len > len(actual_call) 时静默返回
+                            # **空串**（Python 负切片越界不报错）。触发场景：
+                            # finish 帧的 delta_message 已含 flush_streaming_finish
+                            # 补发的增量（full[sent:]，如 1231B），而流式侧
+                            # streamed_args_for_tool 只有部分（如 30B）——
+                            # 扣减把 30B 吃成 "" ⇒ 误判「客户端什么都没收到」⇒
+                            # remaining 退化成 expected 全文（1261B），且
+                            # _create_remaining_args_delta 用它**整帧替换**
+                            # delta_message ⇒ flush 的正确增量(1231B)被覆盖成
+                            # 全量(1261B) ⇒ 客户端拼接 30+1261=1291B，头部
+                            # 30B 重复、JSON 报 `Expecting ',' delimiter`
+                            # （2026-10-14 活体抓帧实录，write_file 大参数
+                            # max_tokens 截断场景）。修法：扣减将越界时，
+                            # delta 增量属于**收尾补发**而非「本帧新发」——
+                            # 客户端实收 = streamed + 该增量 ⇒ 把增量并入
+                            # actual 后走 _remaining_tool_args 前缀对齐，
+                            # 得 remaining=""（已完整）⇒ 不再重复补发。
                             actual_call = tool_parser.streamed_args_for_tool[index]
                             if latest_delta_len > 0:
-                                actual_call = actual_call[:-latest_delta_len]
+                                _cut = len(actual_call) - latest_delta_len
+                                if _cut >= 0:
+                                    actual_call = actual_call[:_cut]
+                                else:
+                                    _flush_delta = (
+                                        delta_message.tool_calls[0].function.arguments
+                                        or ""
+                                    )
+                                    actual_call = actual_call + _flush_delta
 
                             # check to see if there's anything left to stream
-                            remaining_call = expected_call.replace(actual_call, "", 1)
+                            # [本地 2026-10-12] 分歧守卫（与 parser 侧
+                            # flush_streaming_finish 的 2026-10-05 修正同构）。
+                            # 旧写法 `expected_call.replace(actual_call, "", 1)`
+                            # 在 actual 不是 expected 真前缀时【匹配不到】⇒
+                            # remaining 退化成 expected 全文 ⇒ 客户端已收过
+                            # actual 又收一遍全文 ⇒ arguments 重复 ⇒ JSON 解析
+                            # 失败（线上实测 9 次，harness 报「Edit was called
+                            # with input that could not be parsed as JSON」）。
+                            # 上面 1076-1078 的上游注释已指出 replace 会失败并
+                            # append 整串，此处补上防御。
+                            # [本地 2026-10-13] 幂等守卫（第二道）：本 index 一旦
+                            # 补发完成，后续 finish output 不得再补。
+                            # 触发原因：939 行把 `_deferred_emitted` 在**每个**
+                            # finish output 上重置为 False，故 finish 输出不止一个
+                            # 时本块会重复进入；此时 streamed 已被推进到完整值，
+                            # 上面的 latest_delta_len 扣除会把尾部误判成"待补"
+                            # ⇒ 尾部重复下发（实测多发 6286 B，JSON 报
+                            # `Extra data: line 1 column 15914`）。
+                            _synced = getattr(tool_parser, "_args_synced_idx", None)
+                            if _synced is None:
+                                try:
+                                    _synced = set()
+                                    tool_parser._args_synced_idx = _synced
+                                except Exception:  # noqa: BLE001
+                                    _synced = None
+                            if _synced is not None and index in _synced:
+                                remaining_call = ""
+                            else:
+                                remaining_call = self._remaining_tool_args(
+                                    expected_call, actual_call
+                                )
                             # [本地 2026-10-05] 收尾 remaining 诊断（env 门控，默认关）。
                             # 用于定位「流式尾部重复补发」：打印各长度与 remaining 尾部。
-                            if os.environ.get("VLLM_OPT23_DEBUG_LOG"):
+                            # [opt22 活体抓帧 2026-10-14] 门控扩展：除 env 外支持
+                            # **开关文件** `/tmp/log/.opt23_live`（存在即开）——env
+                            # 改动到不了已运行进程（unit env 历史坑），文件开关配合
+                            # 热重载可**免重启**抓帧；finish 才走此块，一次 stat
+                            # 开销可忽略。关=删除文件。
+                            _opt23_live = (
+                                os.path.exists("/tmp/log/.opt23_live")
+                                or os.environ.get("VLLM_OPT23_DEBUG_LOG")
+                            )
+                            if _opt23_live:
                                 try:
                                     with open(
                                         "/tmp/log/vllm-tool-log.txt", "a", buffering=1
@@ -1100,9 +1217,31 @@ class OpenAIServingChat(OpenAIServing):
                                 except Exception:
                                     pass
                             # set that as a delta message
-                            delta_message = self._create_remaining_args_delta(
-                                delta_message, remaining_call, index
-                            )
+                            # [opt22h 2026-10-14] remaining 为空 ⇒ 无需补发，
+                            # **保留原 delta_message**。旧写法无条件整帧替换，
+                            # 把 delta_message 里已有的收尾增量（flush 补发的
+                            # full[sent:]，如 1259B）替换成空串 ⇒ 客户端只收到
+                            # 流式部分（30B），JSON 截断（本轮活体实录：帧3
+                            # arguments=0B，拼包 len=30 报
+                            # `Expecting ',' delimiter: char 30`）。
+                            if remaining_call:
+                                delta_message = self._create_remaining_args_delta(
+                                    delta_message, remaining_call, index
+                                )
+                            # [本地 2026-10-12] 幂等保护：补发后把「已下发」推进到
+                            # 完整值。上游本块只发 delta、**不更新任何状态**，而
+                            # should_check 只要求 `output.finish_reason is not
+                            # None`——finish_reason 在多个 output 上出现时本块会
+                            # 被反复进入，streamed_args_for_tool 却不变 ⇒ 同一段
+                            # remaining 被反复补发。实测（全文复现）：同一
+                            # 13488 B 完整 arguments 等距重发 5 次，客户端拼出
+                            # 62219 B，JSON 只能解析前 13488 B。
+                            if remaining_call:
+                                self._advance_streamed_args(
+                                    tool_parser, index, expected_call
+                                )
+                                if _synced is not None:
+                                    _synced.add(index)
 
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
@@ -1838,6 +1977,122 @@ class OpenAIServingChat(OpenAIServing):
             and delta_message.tool_calls[0].function
             and delta_message.tool_calls[0].function.arguments is not None
         )
+
+    @staticmethod
+    def _coverage_end(actual_call: str, expected_call: str) -> int | None:
+        """估算 actual_call 覆盖到 expected_call 的哪个位置；无法可靠判定返回 None。
+
+        [本地 2026-10-12] 收尾补发的定位辅助。actual 通常是 expected 的前缀
+        （流式逐步下发），但也可能是它的**近似前缀**：已知 partial 路径会在
+        参数值末尾多发一个 ``\\n``（a[6895:6897]='\\n'），其尾部又被截断。
+        此时 actual 不是 expected 的子串，`str.replace` / `startswith` 都失效。
+
+        办法：拿 actual 尾部的一段作探针，在 expected 中定位它，探针的结束
+        位置即覆盖终点。取多个探针长度以兼顾稳健性，并用「终点与 actual 长度
+        之差有限」约束排除误匹配；全部失败则返回 None（调用方保守不补）。
+        """
+        n = len(actual_call)
+        if n == 0:
+            return 0
+        tol = max(16, n // 100)
+        for probe in (128, 96, 64, 32, 16):
+            if n < probe:
+                continue
+            pos = expected_call.rfind(actual_call[-probe:])
+            if pos < 0:
+                continue
+            end = pos + probe
+            if end <= len(expected_call) and abs(end - n) <= tol:
+                return end
+        return None
+
+    @staticmethod
+    def _remaining_tool_args(expected_call: str, actual_call: str) -> str:
+        """返回仍需下发的参数尾部。
+
+        [本地 2026-10-12] 替换原先的
+        ``remaining_call = expected_call.replace(actual_call, "", 1)``。
+
+        旧写法有两个缺陷：
+        1. 当 actual 不是 expected 的子串（分歧：actual 多发字符且尾部被截断）
+           时 `replace` **匹配不到** ⇒ 返回 expected **全文** ⇒ 客户端已收到
+           actual 后又收一遍完整参数 ⇒ arguments 重复（实测该次 35274 字节，
+           JSON 在 17611 处报错、开头片段出现两次）⇒ harness 报「Edit was
+           called with input that could not be parsed as JSON」。
+        2. 即使匹配上，若 actual 出现在 expected **中间**（非前缀），留下的也是
+           畸形拼接（如 ``{"a":,"b":"XX"}``）。
+
+        现改为：真前缀 ⇒ 补尾部；近似前缀 ⇒ 用覆盖终点补尾部；判定不出
+        （例如 2026-10-05 那类「actual 已完整、expected 是 trim 版」，探针在
+        expected 中找不到）⇒ 不补，避免重复。
+
+        [opt22g 2026-10-14] **静默劣化缺口修复**（评估清单一.1）：上述
+        「判定不出 ⇒ 不补」在 partial 多发值尾场景 = **既不重复、也不补全**
+        （固件 real_incidents 起②：exp=182B / act=139B，act 头 136B 是真前缀、
+        尾部多发 ``\\n"``，探针 rfind 全 -1 ⇒ remaining 空 ⇒ 缺 43B 永不补，
+        客户端拿到截断 JSON）。新增**前缀对齐兜底**：
+          ① 二分找最大 k 使 ``act[:k]`` 是 exp 真前缀（零猜测、O(n log n)）；
+          ② 仅当 k 足够接近尾部（``k ≥ len(act) - tol``，tol 与探针同款）才可信；
+          ③ **语义重叠跳位**：若多发段（``act[k:]`` rstrip 后）的尾字符与待发段
+             （``exp[k:]`` lstrip 后）的首字符相同且都是 JSON 结构符（``" } ] : ,``）
+             —— 即客户端已收过这个闭合符 —— 则跳过 exp 的这一个字符再补。
+             固件起②：act 尾 ``\\n"`` 的 ``"`` 与 exp[k] 的 ``"`` 重叠 ⇒ 跳 1 位
+             ⇒ joined=184B 合法（原本 43B 永缺）。
+          ④ 重叠不成立时按 exp[k:] 全量补（值尾多发 ``\\n`` 留在字符串值内合法，
+             固件起① write 案 780B 合法验证）。
+        探针路径保留在最后（优先级最低），全部失败仍保守不补。
+        """
+        if actual_call and expected_call.startswith(actual_call):
+            return expected_call[len(actual_call):]
+        n = len(actual_call)
+        if n == 0:
+            return expected_call
+        tol = max(16, n // 100)
+        lo, hi = 0, n - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if expected_call.startswith(actual_call[:mid]):
+                lo = mid
+            else:
+                hi = mid - 1
+        k = lo
+        # 收紧：前缀对齐只接受「尾部多发段很短」的形态（partial 值尾多发
+        # 实测 1~2B，4B 为宽裕上界）。中间错位形态（值内多 \n 使后续全部
+        # 错位）的 act[k:] 长达 13B，会被对齐误判 ⇒ 错位补发 ⇒ 必须拒绝
+        # （t_remaining_guard 用例 4 判别力抓到）。
+        if k >= n - tol and k > 0 and (n - k) <= 4:
+            overflow = actual_call[k:].rstrip()
+            head_raw = expected_call[k:]
+            head = head_raw.lstrip()
+            if (overflow and head
+                    and overflow[-1] == head[0]
+                    and overflow[-1] in '"}]:,'):
+                skip = (len(head_raw) - len(head)) + 1
+                return expected_call[k + skip:]
+            return expected_call[k:]
+        end = OpenAIServingChat._coverage_end(actual_call, expected_call)
+        if end is None:
+            return ""
+        return expected_call[end:]
+
+    @staticmethod
+    def _advance_streamed_args(
+        tool_parser, index: int, expected_call: str
+    ) -> None:
+        """补发收尾参数后，把「已下发」推进到完整值（幂等保护）。
+
+        [本地 2026-10-12] 上游本块只发 delta、**不更新任何状态**，而补发的
+        触发条件只要求 ``output.finish_reason is not None``——finish_reason 在
+        多个 output 上出现时本块会被反复进入，``streamed_args_for_tool`` 却
+        不变 ⇒ 同一段 remaining 被反复补发。线上实录：同一个 13488 B 的完整
+        arguments 等距重发 **5 次**，客户端拼出 62219 B，JSON 只能解析前
+        13488 B。推进后第二次调用 ``_remaining_tool_args`` 即返回空串。
+        """
+        try:
+            if index < len(tool_parser.streamed_args_for_tool):
+                tool_parser.streamed_args_for_tool[index] = expected_call
+        except Exception:
+            pass
 
     @staticmethod
     def _create_remaining_args_delta(

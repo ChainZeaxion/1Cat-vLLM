@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
+import os
 import time
 import uuid
 from collections.abc import Sequence
@@ -34,16 +35,32 @@ from vllm.tool_parsers.structural_tag_registry import (
     get_model_structural_tag,
 )
 from vllm.tool_parsers.utils import (
+    TOOL_LIKE_TAG_RE,
     coerce_to_schema_type,
     extract_types_from_schema,
     find_common_prefix,
     find_tool_properties,
-    find_tool_required,
-    request_forbids_tool_calls,
+    missing_required_args as _u_missing_required_args,
+    opt22d_should_force_all as _u_opt22d_should_force_all,
+    registered_tool_names as _u_registered_tool_names,
     split_incomplete_tool_tag_tail,
 )
 
 logger = init_logger(__name__)
+
+# [本地 2026-10-12 → 10-13] partial 发射的**计数制节流**：每 N 个 token 下发一次
+# 新增内容。**1 = 逐 token 吐**（不节流，当前默认）；3 = 每 3 个 token 发一次；
+# <=0 一律按 1 处理。
+# 热切换：`POST :8000/v1/internal/reload` body `{"partial_every_n_tokens": <N>}`
+# （见 entrypoints/serve/toolparser/api_router.py，reload 后回写本变量）。
+# 也支持 env `VLLM_QWEN3X_PARTIAL_EVERY_N_TOKENS` 覆盖（import 时读一次）。
+#
+# 2026-10-13 由**时间制**（0.25 s 间隔）改为计数制：时间制受调度抖动影响，
+# 同一配置下实测时而正常、时而多发/截断（不稳定），计数制是确定的。
+# 2026-10-13 用户决定**全放开**：默认 1（逐 token），暂不做任何节流。
+_PARTIAL_EVERY_N_TOKENS: int = int(
+    os.environ.get("VLLM_QWEN3X_PARTIAL_EVERY_N_TOKENS", "1")
+)
 
 def _normalize_qwen3_tag_names(text: str) -> str:
     """opt22: map Anthropic-style tool-call tag names to the equals form
@@ -63,10 +80,9 @@ def _normalize_qwen3_tag_names(text: str) -> str:
 
 
 # opt22d: 预编译“形似工具调用”标签匹配（模块级；含无右尖括号的截断残片分支）
-_TOOL_LIKE_TAG_RE = re.compile(
-    r"</?(?:tool_call|toolcall|tool|function|parameter|param)\b[^<>]*?/?>"
-    r"|</?(?:tool_call|toolcall|tool|function|parameter|param)\b[^<>]*$"
-)
+# [opt22 去重 2026-10-14] 正则收敛到 utils.TOOL_LIKE_TAG_RE 单一来源（三份字面量
+# 逐字节相同已核实）；下方别名保持本模块内引用点不变。
+_TOOL_LIKE_TAG_RE = TOOL_LIKE_TAG_RE
 
 # opt22e：遮罩的**等长哨兵**。把工具类标签的 `<` / `>` 换成私有区单字符，
 # 而非 `⟨'` / `'⟩`（2 字符）。
@@ -137,7 +153,10 @@ def _has_toplevel_prose(seg: str, depth: int) -> bool:
 # 提前截断（实测：content 含字面示例时外层真实 Write 被截断/丢弃；线上 ≈2%）。
 # 本补偿对**参数值内部**（depth>0）的 <parameter=/</parameter>/</function>/
 # </tool_call>/</toolcall> 同样去括号，使「示例」整块退化为无结构标签的纯文本。
-# ⚠️ 仅用于**非流式**（流式文本不完整，深度不可靠）。
+# [opt22f 2026-10-13 注释勘误] 旧注「仅用于非流式」已过时——wrapper
+# `_escape_non_linestart_tool_calls` 对流式/非流式**均应用**补偿：判据（参数
+# 深度）在流式累积文本上评估，为确定性文本变换（t_coder_suite 流式 1/7、
+# t_roll、dbg_partial、t_typing2 均过，无抖动）。
 _NESTED_STRUCT_RE = re.compile(
     r"<parameter=[^>]*>|</parameter>|</function>|</tool_call>|</toolcall>"
 )
@@ -362,37 +381,44 @@ def _trailing_close_start(text: str) -> int | None:
     return m.start() if m else None
 
 
+# [opt22 性能 2026-10-14（三.1）] 行级正则版 `_fenced_ranges`：把逐字符状态机
+# 化为 splitlines + 行首 `(?:[ \t]*`)*` 前缀正则（C 级），语义逐字等价
+# （run 跨行内空白累积、\n 清零、未闭合延伸到末尾）。5 万 fuzz + 边界用例 +
+# 真实语料 4 场景与旧实现输出全等；无围栏文本 ~2.0×、高围栏 ~1.5×。
+_HEAD_BACKTICK_RUN_RE = re.compile(r"(?:[ \t]*`)*")
+
+
 def _fenced_ranges(text: str) -> list:
     """opt22d（L-C）：返回 text 中“markdown 代码围栏”覆盖的字符区间列表。
 
     只认 **行首** 的三连反引号（CommonMark 语义）——行内出现的反引号不计入，
     避免正文提及反引号时误开围栏。与 qwen3xml 侧 `_scan_code_fence` 判定一致。
+
+    [opt22 性能 2026-10-14] 原「逐字符状态机」对每个流式帧全量重扫（长输出 O(n²)），
+    本版逐行扫描：行首前缀用 C 级正则一次匹配，仅当该前缀含 ≥3 个反引号才进入
+    切换逻辑。等价性验证见上方注释。
     """
     ranges = []
     in_fence = False
     fence_start = 0
-    line_start = True
-    run = 0
-    for i, ch in enumerate(text):
-        if ch == "\n":
-            line_start = True
-            run = 0
-            continue
-        if line_start:
-            if ch in " \t":
-                continue
-            if ch == "`":
-                run += 1
-                if run == 3:
-                    if in_fence:
-                        in_fence = False
-                        ranges.append((fence_start, i + 1))
-                    else:
-                        in_fence = True
-                        fence_start = i + 1
-                continue
-            line_start = False
-            run = 0
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        pre = _HEAD_BACKTICK_RUN_RE.match(line).group(0)
+        ticks = pre.count("`")
+        if ticks >= 3:
+            cnt = 0
+            for j, ch in enumerate(pre):
+                if ch == "`":
+                    cnt += 1
+                    if cnt == 3:
+                        if in_fence:
+                            in_fence = False
+                            ranges.append((fence_start, pos + j + 1))
+                        else:
+                            in_fence = True
+                            fence_start = pos + j + 1
+                        break
+        pos += len(line)
     if in_fence:
         # 流式下闭合标记可能尚未到达：未闭合围栏一直延伸到文本末尾，
         # 否则围栏内先到的工具调用会被当成真实调用解析
@@ -436,6 +462,8 @@ def _escape_fenced_tags(text: str, *, streaming: bool = True) -> str:
 
 # opt23 debug log (disabled by default; enable via VLLM_OPT23_DEBUG_LOG=1)
 _OPT23_LOG = None
+# [opt22f-hotlog 2026-10-13] 加载期读一次 env，热路径 `_log` 不再每次 import os + environ.get
+_OPT23_LOG_ENABLED = bool(os.environ.get("VLLM_OPT23_DEBUG_LOG"))
 
 def _mask_fenced_tags(text: str, *, streaming: bool = True) -> str:
     """opt22d（L-E）：围栏遮罩 + **丢弃**末尾未闭合的工具类标签片段。
@@ -459,13 +487,21 @@ def _mask_fenced_tags(text: str, *, streaming: bool = True) -> str:
 
 def _log(msg: str, *args: Any) -> None:
     global _OPT23_LOG
-    import os as _os
-    if not _os.environ.get("VLLM_OPT23_DEBUG_LOG"):
+    # [opt22f-hotlog 2026-10-13] 热路径开销收敛：env 只在模块加载时读一次（此前每次
+    # _log 都 `import os` + `os.environ.get`，流式逐 delta 调用浪费）。需要
+    # 运行期改 env 的场景走 `_log_reinit()`（无此类场景，保守保留函数）。
+    if not _OPT23_LOG_ENABLED:
         return
     if _OPT23_LOG is None:
         _OPT23_LOG = open("/tmp/log/vllm-tool-log.txt", "a", buffering=1)
     _OPT23_LOG.write(msg % args if args else msg)
     _OPT23_LOG.write("\n")
+
+
+def _log_reinit() -> None:
+    """重新读取 `VLLM_OPT23_DEBUG_LOG`（测试/运行期改 env 后调用）。"""
+    global _OPT23_LOG_ENABLED
+    _OPT23_LOG_ENABLED = bool(os.environ.get("VLLM_OPT23_DEBUG_LOG"))
 
 
 class Qwen3CoderToolParser(ToolParser):
@@ -475,7 +511,12 @@ class Qwen3CoderToolParser(ToolParser):
     # Write/Edit (tools with long string content params that benefit
     # from incremental display).  Path B Native (=1,2) handles all
     # XML tools via diff-based XML streaming — no whitelist needed.
-    _STREAMING_TOOLS: frozenset = frozenset({"Write", "Edit"})
+    # [本地 2026-10-12] 真流式工具集：原为 {Write, Edit}，现并入 Bash / WebFetch
+    # —— 它们也有长字符串参数（Bash.command、WebFetch.prompt/url），值得增量下发，
+    # 否则长命令/长提示在流式阶段完全不输出，前端要等整段生成完。
+    # ⚠️ 配套：partial 路径的「锚参数」条件须通用化（原先硬编码要求 file_path
+    # 已解析，Bash/WebFetch 没有该参数 ⇒ 永远进不去），见下方 gate。
+    _STREAMING_TOOLS: frozenset = frozenset({"Write", "Edit", "WebFetch"})
 
     @property
     def _fix_force_json(self) -> bool:
@@ -564,16 +605,9 @@ class Qwen3CoderToolParser(ToolParser):
         return f"call_{uuid.uuid4().hex[:24]}"
 
     def _registered_tool_names(self) -> set:
-        """已注册工具名集合。tools 未提供时为空集。"""
-        names = set()
-        for tool in (self.tools or []):
-            fn = getattr(tool, "function", None)
-            nm = getattr(fn, "name", None) if fn is not None else None
-            if not nm:
-                nm = getattr(tool, "name", None)
-            if nm:
-                names.add(nm)
-        return names
+        """已注册工具名集合。tools 未提供时为空集。
+        [opt22 去重 2026-10-14] 实现已上提 utils（coder/xml 双份逐字重复），薄委托。"""
+        return _u_registered_tool_names(self.tools)
 
     def _is_registered_tool(self, name) -> bool:
         """opt22d L-A: 名称是否在已注册工具内。
@@ -590,25 +624,9 @@ class Qwen3CoderToolParser(ToolParser):
 
         参数无法解析（非法 JSON / 空）时也视为缺失 —— 真实调用的参数总能解析。
         `tools` 未提供或该工具无 `required` 声明时返回 False（**宽松兜底、不误伤**）。
+        [opt22 去重 2026-10-14] 实现已上提 utils（双份逐字重复），薄委托。
         """
-        try:
-            fn = tc.function
-        except Exception:
-            return False
-        if fn is None:
-            return False
-        req = find_tool_required(self.tools, fn.name)
-        if not req:
-            return False
-        args = fn.arguments
-        if isinstance(args, str):
-            try:
-                args = json.loads(args) if args.strip() else {}
-            except Exception:
-                return True          # 参数非法 ⇒ 必填必然缺失
-        if not isinstance(args, dict):
-            return True
-        return any(k not in args or args[k] in (None, "") for k in req)
+        return _u_missing_required_args(self.tools, tc)
 
     def _opt22d_salvage_dropped_calls(self, raw_model, kept, request):
         """opt22d 防御纵深（2026-10-04）：退化输入下补捞被吞的相邻调用。
@@ -677,17 +695,9 @@ class Qwen3CoderToolParser(ToolParser):
 
         A `tool_choice == "none"`：客户端显式禁止调用 → 形似调用必为示例
         B 请求无工具且解析器无工具：无对象可调 → 形似调用必为示例
+        [opt22 去重 2026-10-14] 实现已上提 utils（双份逐字重复），薄委托。
         """
-        if request is None:
-            return False
-        if getattr(request, "tool_choice", None) == "none":
-            return True
-        # opt22e C：请求侧「明确禁止调用」信号（与 xml 侧同义）。见 utils 说明。
-        if request_forbids_tool_calls(request):
-            return True
-        if not getattr(request, "tools", None) and not self.tools:
-            return True
-        return False
+        return _u_opt22d_should_force_all(request, self.tools)
 
     def _thinking_enabled_of(self, request) -> bool:
         """opt22d 第七轮：本次请求是否开启思考。
@@ -766,6 +776,10 @@ class Qwen3CoderToolParser(ToolParser):
         self._partial_emitted: str = ""
         self._partial_prefix: str = ""
         self._last_partial_time: float = 0.0
+        # [本地 2026-10-13] 计数制节流用：累计自上次 partial 下发以来经过的 token 数。
+        self._partial_tok_acc: int = 0
+        # 本次 streaming 调用带来的 token 数（入口处赋值，供 partial 累加）。
+        self._delta_tok: int = 1
         # opt23: defer standalone "{" to combine with first real delta
         self._pending_brace: bool = False
         # opt23: flag for model duplication of <function=...> in streaming
@@ -827,6 +841,15 @@ class Qwen3CoderToolParser(ToolParser):
         """
         _pos = text.rfind('</')
         if _pos < 0:
+            # [本地 2026-10-12] 值尾换行**保守扣住**，对齐完成路径。
+            # 完成路径会 trim 参数值末尾换行（配对的 param_value.endswith）
+            # 那个 if；partial 若提前把它发出，两条路径的参数值就不一致 ⇒
+            # serving 收尾补发用 expected.replace(actual, "") 匹配不到 ⇒
+            # 重复整段 ⇒ 客户端 arguments JSON 非法（大参数 Edit 实测）。
+            # 只扣住、不丢内容：调用方不把 emit_offset 推进到该字符，下次若
+            # 其后是正文则一并发出，若其后是 close-tag 则由下方规则扣除。
+            if text.endswith("\n"):
+                return len(text) - 1
             return len(text)
 
         _after = text[_pos + 2:]       # text after '</'
@@ -842,6 +865,11 @@ class Qwen3CoderToolParser(ToolParser):
 
         # '</' not followed by a known close-tag name (e.g. </div>)
         # — treat as legitimate string content.
+        # [本地 2026-10-12] 同样扣住值尾换行（对齐完成路径 trim，见上方说明）。
+        # SVG/HTML 参数值里满是 </g>、</path> 这类"未知 tag"，正是它们让
+        # 本分支成为最常见的穿透点 ⇒ 大参数 Edit 值尾多一个 \n。
+        if text.endswith("\n"):
+            return len(text) - 1
         return len(text)
 
     def _is_string_param(self, param_name: str) -> bool:
@@ -2127,10 +2155,21 @@ class Qwen3CoderToolParser(ToolParser):
         """
         self._reset_streaming_state()
         info = self.extract_tool_calls(model_output, request)
-        kept = [
-            tc for tc in (info.tool_calls or [])
-            if tc.function and tc.function.name not in self._STREAMING_TOOLS
-        ]
+        # [本地 2026-10-13] 记录被保留调用的**原始下标**（`_deferred_indices`）。
+        # 流式调用（Write/Edit/…）已占用 idx0..k；被推迟的非流式调用若从 0
+        # 重新编号，会与流式调用**撞车**（实测 WebFetch(流式)+Bash/Glob(非流式)
+        # ⇒ Bash 落到 idx0，客户端把两个调用的 arguments 拼进同一 index
+        # ⇒ `Extra data`，即用户报的「bash 一堆执行失败」）。
+        # 不能依赖 serving 侧读 `current_tool_index`：该值取决于流式调用的
+        # `</tool_call>` 是否已被处理，实测**时而 1 时而 0**（间歇复现），
+        # 故必须在此处用「原始列表下标」做确定性编号。
+        kept = []
+        self._deferred_indices: list[int] = []
+        for _orig_idx, tc in enumerate(info.tool_calls or []):
+            if tc.function and tc.function.name in self._STREAMING_TOOLS:
+                continue
+            kept.append(tc)
+            self._deferred_indices.append(_orig_idx)
         return ExtractedToolCallInformation(
             tools_called=bool(kept),
             tool_calls=kept,
@@ -2155,6 +2194,8 @@ class Qwen3CoderToolParser(ToolParser):
         # 用非流式口径收口，把此前因"不知后文是否跟 <function="而暂存的完整标签
         # 转义后释放——否则模型只输出一个孤立标签时，该标签会被永久扣留、用户看不到。
         _is_eos = not delta_text and bool(delta_token_ids)
+        # [本地 2026-10-13] 记账本次带来的 token 数，供 partial 的计数节流使用。
+        self._delta_tok = max(1, len(delta_token_ids))
         # opt22e：**先遮罩、后归一化**（顺序很关键）。
         # `_normalize_qwen3_tag_names` 会把方言标签改名（`<toolcall>` → `<tool_call>`，
         # 长度还 +1）。若先归一化，**文档正文里**写的 `<toolcall>` 也会被改名
@@ -2274,13 +2315,16 @@ class Qwen3CoderToolParser(ToolParser):
                 name = tc.function.name if tc.function else None
             _log("[opt22e] flush[%d] name_sent=%s sent=%d full=%d delta=%d",
                  i, self._opt22e_name_sent.get(i), len(sent), len(full), len(delta))
-            _common = find_common_prefix(sent, full) if sent else ""
-            _lc = len(_common) if isinstance(_common, str) else 0
-            if _lc < min(len(sent), len(full)):
-                _log("[opt22e]   diverge@%d sent[..]=%r", _lc,
-                     sent[max(0, _lc - 25):_lc + 45])
-                _log("[opt22e]   diverge@%d full[..]=%r", _lc,
-                     full[max(0, _lc - 25):_lc + 45])
+            # [opt22f-hotlog 2026-10-13] 诊断计算（LCP + 双切片）只在日志开启时做——
+            # 此前无条件执行，flush 每个调用都白算一遍 find_common_prefix。
+            if _OPT23_LOG_ENABLED and sent and full:
+                _common = find_common_prefix(sent, full)
+                _lc = len(_common) if isinstance(_common, str) else 0
+                if _lc < min(len(sent), len(full)):
+                    _log("[opt22e]   diverge@%d sent[..]=%r", _lc,
+                         sent[max(0, _lc - 25):_lc + 45])
+                    _log("[opt22e]   diverge@%d full[..]=%r", _lc,
+                         full[max(0, _lc - 25):_lc + 45])
             if not delta and not name:
                 continue
             out.append(
@@ -2862,15 +2906,29 @@ class Qwen3CoderToolParser(ToolParser):
                 self.tools, self.current_function_name or "",
             )
             _expected_total = len(_param_config) if _param_config else 0
+            # [本地 2026-10-12] 锚条件通用化（为 Bash / WebFetch 开真流式）。
+            # 原条件硬编码「file_path 已解析 且 已完成参数数>0 且 参数总数>1」——
+            # 那是为 Edit 的参数顺序（如 [replace_all, file_path, …]）保护 file_path
+            # 不被碎片化。但 Bash 只有 1 个参数 command、WebFetch 是 url+prompt，
+            # **都没有 file_path** ⇒ 永远进不来。
+            # 现改为：有 file_path 的工具保持原语义不变；没有的则从**第一个未完成
+            # 参数**开始流（下限降为 0）。对 Write/Edit 完全等价。
+            _has_fp = bool(_param_config) and ("file_path" in _param_config)
+            _min_done = 1 if _has_fp else 0
+            _anchor_ok = (
+                self.accumulated_params.get("file_path") is not None
+                if _has_fp
+                else True
+            )
 
             if (not json_fragments
                     and self._is_streaming_tool
                     and self.in_function
                     and self.json_started
-                    and self.param_count > 0
+                    and self.param_count >= _min_done
                     and self.param_count < len(param_starts)
-                    and _expected_total > 1
-                    and self.accumulated_params.get("file_path") is not None
+                    and _expected_total > _min_done
+                    and _anchor_ok
                     and self.current_tool_index < len(self.streamed_args_for_tool)):
                 incomplete_start = param_starts[self.param_count]
                 if incomplete_start != self._partial_param_start:
@@ -2898,8 +2956,18 @@ class Qwen3CoderToolParser(ToolParser):
                         return None
 
                     if not self._partial_prefix:
+                        # [本地 2026-10-13] 首个参数的前缀必须自带起始 `{`。
+                        # 原写法漏了它，却长期没暴露：Write/Edit 的**首参数
+                        # file_path** 被上面 `_min_done=1` 挡在 partial 之外，
+                        # 由完整路径下发 `{"file_path": "...", `（已含 `{`），
+                        # 故只有 `param_count != 0` 的分支被用到。但 #98 让
+                        # 无 file_path 的工具（Bash 仅一个 command）从**第 0 个
+                        # 参数**开始流（`_min_done=0`）⇒ 走到 `param_count == 0`
+                        # 分支 ⇒ arguments 变成 `"command": "..."`（缺 `{`），
+                        # 客户端把 `"command"` 当完整 JSON 字符串解析完、
+                        # 余下报 `Extra data: line 1 column 10 (char 9)`。
                         if self.param_count == 0:
-                            _prefix = f'"{param_name}": "'
+                            _prefix = f'{{"{param_name}": "'
                         else:
                             _prefix = f', "{param_name}": "'
                         self._partial_prefix = _prefix
@@ -2921,8 +2989,11 @@ class Qwen3CoderToolParser(ToolParser):
                         current_text[_abs_value_start:]
                     )
                     if len(current_value) > self._partial_emit_offset:
-                        _now = time.monotonic()
-                        if (_now - self._last_partial_time) < 0.25:
+                        # [本地 2026-10-13] 计数制节流（原时间制，见模块级说明）。
+                        self._partial_tok_acc += self._delta_tok
+                        if (_PARTIAL_EVERY_N_TOKENS > 0
+                                and self._partial_tok_acc
+                                < _PARTIAL_EVERY_N_TOKENS):
                             return None
                         _raw_new = current_value[
                             self._partial_emit_offset:]
@@ -2940,6 +3011,12 @@ class Qwen3CoderToolParser(ToolParser):
                             if not self._partial_emitted:
                                 fragment = self._partial_prefix + escaped
                                 self._partial_emitted += fragment
+                                # [本地 2026-10-13] partial 前缀已自带起始 `{`
+                                # （param_count==0 时），必须清掉 `_pending_brace`，
+                                # 否则后续 json_fragments 帧会再前置一个 `{`
+                                # ⇒ 该 `{` 作为独立 delta 插进参数值中间
+                                # （WebFetch 并发实测：url 值尾部出现多余 `{`）。
+                                self._pending_brace = False
                             else:
                                 fragment = escaped
                                 self._partial_emitted += fragment
@@ -2947,7 +3024,7 @@ class Qwen3CoderToolParser(ToolParser):
                                     self.streamed_args_for_tool):
                                 self.streamed_args_for_tool[
                                     self.current_tool_index] += fragment
-                            self._last_partial_time = _now
+                            self._partial_tok_acc = 0
                             return DeltaMessage(
                                 tool_calls=[
                                     DeltaToolCall(

@@ -46,9 +46,12 @@ from vllm.tool_parsers.abstract_tool_parser import (
     ToolParser,
 )
 from vllm.tool_parsers.utils import (
+    TOOL_LIKE_TAG_RE,
     find_common_prefix,
     find_tool_properties,
-    find_tool_required,
+    missing_required_args as _u_missing_required_args,
+    opt22d_should_force_all as _u_opt22d_should_force_all,
+    registered_tool_names as _u_registered_tool_names,
     request_forbids_tool_calls,
     split_incomplete_tool_tag_tail,
 )
@@ -61,10 +64,8 @@ from vllm.tool_parsers.utils import find_common_prefix, find_tool_properties
 logger = init_logger(__name__)
 
 # opt22d: 预编译“形似工具调用”标签匹配（模块级；含无右尖括号的截断残片分支）
-_TOOL_LIKE_TAG_RE = re.compile(
-    r"</?(?:tool_call|toolcall|tool|function|parameter|param)\b[^<>]*?/?>"
-    r"|</?(?:tool_call|toolcall|tool|function|parameter|param)\b[^<>]*$"
-)
+# [opt22 去重 2026-10-14] 正则收敛到 utils.TOOL_LIKE_TAG_RE 单一来源；别名保持引用点不变。
+_TOOL_LIKE_TAG_RE = TOOL_LIKE_TAG_RE
 
 # opt22d 第十二轮（缺陷B）：参数值**内部**的工具类标签（开闭都含）。
 # 体内标签都是**文档内容**（模型写说明文档时原样写出示例），必须让 expat 视作文本。
@@ -1274,16 +1275,9 @@ class StreamingXMLToolCallParser:
         return processed
 
     def _registered_tool_names(self) -> set:
-        """已注册工具名集合。tools 未提供时为空集。"""
-        names = set()
-        for tool in (self.tools or []):
-            fn = getattr(tool, "function", None)
-            nm = getattr(fn, "name", None) if fn is not None else None
-            if not nm:
-                nm = getattr(tool, "name", None)
-            if nm:
-                names.add(nm)
-        return names
+        """已注册工具名集合。tools 未提供时为空集。
+        [opt22 去重 2026-10-14] 实现已上提 utils（coder/xml 双份逐字重复），薄委托。"""
+        return _u_registered_tool_names(self.tools)
 
     def _is_registered_tool(self, name) -> bool:
         """opt22d L-A: 名称是否在已注册工具内。
@@ -2255,46 +2249,19 @@ class Qwen3XMLToolParser(ToolParser):
 
         A `tool_choice == "none"`：客户端显式禁止调用 → 形似调用必为示例
         B 请求无工具且解析器无工具：无对象可调 → 形似调用必为示例
+        [opt22 去重 2026-10-14] 实现已上提 utils（双份逐字重复），薄委托。
         """
-        if request is None:
-            return False
-        if getattr(request, "tool_choice", None) == "none":
-            return True
-        # opt22e C：请求侧「明确禁止调用」信号（补足 tool_choice 的缺失场景）。
-        # 例："这只是格式分析，不要真的调用工具。" —— 此时模型可能在 **content**
-        # 里裸写完整调用，字节形态与真实调用**无法区分**，只能靠请求侧意图判定。
-        if request_forbids_tool_calls(request):
-            return True
-        if not getattr(request, "tools", None) and not self.tools:
-            return True
-        return False
+        return _u_opt22d_should_force_all(request, self.tools)
 
     def _missing_required_args(self, tc) -> bool:
         """opt22e B：该调用的参数是否**缺少 schema 的必填字段**。
 
         参数无法解析（非法 JSON / 空）时也视为缺失 —— 真实调用的参数总能解析。
         `tools` 未提供或该工具无 `required` 声明时返回 False（**宽松兜底、不误伤**）。
+        [opt22 去重 2026-10-14] 实现已上提 utils（双份重复；xml 侧函数内
+        `import json as _json` 与 coder 模块级 json 逻辑同构），薄委托。
         """
-        import json as _json
-
-        try:
-            fn = tc.function
-        except Exception:
-            return False
-        if fn is None:
-            return False
-        req = find_tool_required(self.tools, fn.name)
-        if not req:
-            return False
-        args = fn.arguments
-        if isinstance(args, str):
-            try:
-                args = _json.loads(args) if args.strip() else {}
-            except Exception:
-                return True          # 参数非法 ⇒ 必填必然缺失
-        if not isinstance(args, dict):
-            return True
-        return any(k not in args or args[k] in (None, "") for k in req)
+        return _u_missing_required_args(self.tools, tc)
 
     def _opt22d_salvage_dropped_calls(self, model_output, tool_calls, request):
         """opt22d 防御纵深（2026-10-04）：退化输入下补捞被吞的相邻调用。
