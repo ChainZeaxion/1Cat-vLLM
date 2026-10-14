@@ -34,18 +34,20 @@ _SM70_TP8_HIERARCHICAL_SCRATCH_BYTES = 4 * 8 * 4096 * torch.float16.itemsize
 
 # [SX_OPT_PUSH_AR_WIDE] (batch 2, C4). The native SM70 TP4 push admission
 # (csrc/custom_all_reduce.cuh) also covers every Qwen3.8 FP16 row multiple
-# [M, 2560], M in 2..32 (10..160 KiB), for the regular and the sum2
+# [M, 2560], M in 2..20 (10..100 KiB), for the regular and the sum2
 # collective, with ceil(bytes / 2048) CTAs. The native side reads the same
 # variable with the same semantics at CUDA-graph capture time; "0" restores
 # the previous admission. It only applies where the push storage is registered
 # below (SM70, fully connected TP4, VLLM_SM70_TP4_PUSH_ALLREDUCE) and
 # VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH is enabled; eager calls stay on the
-# pull path. NOTE: for the local Qwen3.5 hidden=5120 the row is 10240 B, i.e.
-# the window is still a 5120-B multiple and covers 1..16 token payloads.
+# pull path. NOTE: for the local Qwen3.5 hidden=5120 the payload row is 10240 B,
+# i.e. the window is still a 5120-B multiple and now covers 1..10 token payloads;
+# 11..16 tokens stay on the pull path, except that 16 tokens is separately
+# admitted for the regular collective by PUSH_ALLREDUCE_CONCURRENCY.
 _SX_PUSH_AR_WIDE_ENV = "SX_OPT_PUSH_AR_WIDE"
 _SX_PUSH_AR_WIDE_ROW_BYTES = 2560 * torch.float16.itemsize
 _SX_PUSH_AR_WIDE_MIN_ROWS = 2
-_SX_PUSH_AR_WIDE_MAX_ROWS = 32
+_SX_PUSH_AR_WIDE_MAX_ROWS = 20
 
 
 def _sx_push_ar_wide_enabled() -> bool:
@@ -405,8 +407,8 @@ class CustomAllreduce:
                 and _sx_push_ar_wide_enabled()
             )
             logger.info(
-                "SM70 TP4 push all-reduce for every FP16 [2..32, 2560] "
-                "(10-160 KiB) regular and sum2 payload is %s "
+                "SM70 TP4 push all-reduce for every FP16 [2..20, 2560] "
+                "(10-100 KiB) regular and sum2 payload is %s "
                 "(%s=%s, requires the Qwen3.8 batch admission).",
                 "enabled" if wide else "disabled",
                 _SX_PUSH_AR_WIDE_ENV,

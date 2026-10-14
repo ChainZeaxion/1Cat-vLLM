@@ -357,6 +357,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "nvfp4_qpn2_prepare_sm70(Tensor weight_packed, Tensor weight_scale) -> "
       "Tensor[]");
   ops.impl("nvfp4_qpn2_prepare_sm70", torch::kCUDA, &nvfp4_qpn2_prepare_sm70);
+  ops.def("nvfp4_qpn2_bundle_sm70(Tensor codes, Tensor scales) -> Tensor[]");
+  ops.impl("nvfp4_qpn2_bundle_sm70", torch::kCUDA, &nvfp4_qpn2_bundle_sm70);
 
   ops.def("nvfp4_qpn2_prepare_scales_sm70(Tensor weight_scale) -> Tensor");
   ops.def(
@@ -1079,6 +1081,16 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
       "full_unroll=False, bool fused_chain=False) -> "
       "()");
   custom_ar.impl("sm70_qwen38_hc_batch", torch::kCUDA, &sm70_qwen38_hc_batch);
+  custom_ar.def(
+      "sm70_qwen38_hc_down_local(Tensor input, Tensor packed, "
+      "Tensor(a!) partials, Tensor(b!) output, int rank) -> ()");
+  custom_ar.impl("sm70_qwen38_hc_down_local", torch::kCUDA,
+                 &sm70_qwen38_hc_down_local);
+  custom_ar.def(
+      "sm70_qwen38_hc_up_local(Tensor lora, Tensor packed, Tensor branches, "
+      "Tensor(a!) output, int rank) -> ()");
+  custom_ar.impl("sm70_qwen38_hc_up_local", torch::kCUDA,
+                 &sm70_qwen38_hc_up_local);
   custom_ar.def(
       "sm70_qwen38_hc_gate_mix(int fa, Tensor local_gate, Tensor branches, "
       "Tensor! out) -> ()");

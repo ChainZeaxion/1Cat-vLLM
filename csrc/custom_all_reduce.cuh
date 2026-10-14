@@ -156,7 +156,7 @@ static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
 
 // [SX_OPT_PUSH_AR_WIDE] Every Qwen3.8 FP16 row multiple [M, 2560] with
-// M in [2, 32] (10..160 KiB, 5-KiB steps), for the regular and the sum2 push
+// M in [2, 20] (10..100 KiB, 5-KiB steps), for the regular and the sum2 push
 // collective. It reuses the storage, sentinel and per-CTA epoch protocol
 // above unchanged; payload and epoch capacity are asserted below.
 //
@@ -173,7 +173,12 @@ static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
 // non-empty payload is a full cross-rank barrier.
 constexpr size_t kSm70Tp4PushAllreduceQwen38RowBytes = 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen38WideMinRows = 2;
-constexpr size_t kSm70Tp4PushAllreduceQwen38WideMaxRows = 32;
+// A deliberate 100-KiB ceiling (20 rows of 5 KiB): 105..160 KiB stay on the
+// pull path. The 160-KiB point is still admitted for the regular collective by
+// the CONCURRENCY branch of sm70_tp4_push_allreduce_blocks below, which is
+// independent of this window; the sum2 collective has no such branch, so
+// 160 KiB falls back to pull there.
+constexpr size_t kSm70Tp4PushAllreduceQwen38WideMaxRows = 20;
 constexpr size_t kSm70Tp4PushAllreducePackBytesPerBlock =
     static_cast<size_t>(kSm70Tp4PushAllreduceThreads) * 16;
 static_assert(kSm70Tp4PushAllreduceQwen38WideMaxRows *
@@ -278,12 +283,13 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
     }
     return static_cast<int>(bytes / (kSm70Tp4PushAllreduceThreads * 16));
   }
-  // [SX_OPT_PUSH_AR_WIDE] Every other Qwen3.8 row multiple in 10..160 KiB.
+  // [SX_OPT_PUSH_AR_WIDE] Every other Qwen3.8 row multiple in 10..100 KiB.
   // The branches above keep their established grids (5 KiB: 3, 20/40 KiB:
   // 10/20, 80 KiB: 80, 160 KiB with CONCURRENCY: 80; with SMALL_MESSAGES the
   // regular collective already takes ceil(bytes / 2048) up to 80 KiB), so
   // this adds the remaining 10/15/25/30/35/45..75 KiB (sum2, and regular
-  // without SMALL_MESSAGES) and 85..155 KiB (both).
+  // without SMALL_MESSAGES) and 85/90/95/100 KiB (both). 105..160 KiB are
+  // deliberately left on the pull path.
   if (batch_enabled && sm70_tp4_push_allreduce_wide_enabled() &&
       sm70_tp4_push_allreduce_wide_bytes(bytes)) {
     return sm70_tp4_push_allreduce_wide_blocks(bytes);
@@ -2332,7 +2338,7 @@ class CustomAllreduce {
       const char* batch =
           std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH");
       // [SX_OPT_PUSH_AR_WIDE] also admits every Qwen3.8 row multiple in
-      // 10..160 KiB. Both kernels upcast the four ranks' FP16 (a + b) in rank
+      // 10..100 KiB. Both kernels upcast the four ranks' FP16 (a + b) in rank
       // order 0..3 into FP32, so finite results stay bitwise equal to the
       // pull cross_device_reduce_sum2_1stage used below 512 KiB at TP4.
       const bool qwen38_batch =

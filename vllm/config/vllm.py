@@ -1829,6 +1829,17 @@ class VllmConfig:
             "Asynchronous scheduling is %s.",
             "enabled" if self.scheduler_config.async_scheduling else "disabled",
         )
+        # [2026-10-11] Do not enable async scheduling together with the DFlash2
+        # prompt-lookup assist (speculative_config ngram_assist). That pair
+        # deadlocks at max_num_seqs=16: about one round in nine freezes with all
+        # four GPUs at 100%, no CUDA error, and the engine ends on "RPC call to
+        # sample_tokens timed out". Every worker's stack sits in
+        # dflash2/speculator.py:_prepare_ngram_assist on
+        # `output_copy_event.synchronize()`, which only runs when the speculator
+        # exposes host token state -- i.e. only for ngram_assist. Measured, 60
+        # rounds of 16x1024 each: async+ngram hangs, async without ngram is
+        # clean but 30% slower, sync with ngram stays clean and loses only 3.6%.
+        # Root cause is still open, so keep async off rather than guess.
         if envs.VLLM_ENABLE_MAMBA_PREFIX_ASYNC:
             logger.warning_once(
                 "VLLM_ENABLE_MAMBA_PREFIX_ASYNC is upstream-replaced in "

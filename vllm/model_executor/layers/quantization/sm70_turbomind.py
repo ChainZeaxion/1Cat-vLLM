@@ -77,6 +77,28 @@ def use_batched_gemm_layouts() -> bool:
     return envs.VLLM_SM70_BATCH_GEMM_LAYOUTS and is_exact_sm70_cuda_platform()
 
 
+def use_native_qpn_layouts() -> bool:
+    """Use one native layout for the qualified TP4, at-most-M32 verifier.
+
+    Larger batch capacities retain their existing prepared batch GEMMs until
+    the packed-only fallback is admitted at those decode shapes.
+    """
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if config is None or config.speculative_config is None:
+        return False
+    text = config.model_config.hf_text_config
+    return bool(
+        is_exact_sm70_cuda_platform()
+        and config.parallel_config.tensor_parallel_size == 4
+        and config.scheduler_config.max_num_seqs <= 4
+        and config.speculative_config.num_speculative_tokens == 7
+        and getattr(text, "hidden_size", None) == 5120
+        and getattr(text, "model_type", None) == "qwen3_5_text"
+    )
+
+
 def forces_marlin() -> bool:
     return envs.force_sm70_marlin()
 
@@ -495,7 +517,9 @@ def pad_qpn2_output_rows(
     return padded_weight, padded_scales, physical_n
 
 
-def prepare_nvfp4_qpn2_dense_linear(layer: torch.nn.Module) -> None:
+def prepare_nvfp4_qpn2_dense_linear(
+    layer: torch.nn.Module, *, bundle_scales: bool = False
+) -> None:
     """Prepare the QPN2 prepack as the only resident layout of an NVFP4 linear.
 
     Decode (M <= ``QPN2_DISPATCH_MAX_ROWS``) runs the QPN2 kernels on it;
@@ -519,6 +543,8 @@ def prepare_nvfp4_qpn2_dense_linear(layer: torch.nn.Module) -> None:
         layer.weight.data, layer.weight_scale.data
     )
     codes, qpn2_scales = sm70_ops.nvfp4_qpn2_prepare_sm70(weight, scales)
+    if bundle_scales and hasattr(torch.ops._C, "nvfp4_qpn2_bundle_sm70"):
+        codes, qpn2_scales = sm70_ops.nvfp4_qpn2_bundle_sm70(codes, qpn2_scales)
     output_size = int(layer.weight.shape[0])
     input_size = int(layer.weight.shape[1]) * 2
     split_k, accumulator_chains = qpn2_launch_config(input_size, padded_output_size)
