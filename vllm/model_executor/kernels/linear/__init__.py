@@ -122,6 +122,20 @@ from vllm.model_executor.kernels.linear.nvfp4.sm70 import (
     Sm70NvFp4LinearLayerConfig,
     TurboMindNvFp4LinearKernel,
 )
+# [gguf-lineb] 上游 #819/#869 线 B TurboMind GGUF 内核导出（本地布局保留 scaled_mm/nvfp4 原样，
+# 仅追加 gguf 系导出；上游 qpn/ 子包重组未整体跟进）
+from vllm.model_executor.kernels.linear.mixed_precision.sm70_gguf import (
+    Sm70GgufAffineConfig,
+    TurboMindGgufAffineKernel,
+)
+from vllm.model_executor.kernels.linear.mixed_precision.sm70_gguf_lattice import (
+    Sm70GgufLatticeConfig,
+    TurboMindGgufLatticeKernel,
+)
+from vllm.model_executor.kernels.linear.mixed_precision.sm70_gguf_lut4 import (
+    Sm70GgufLut4Config,
+    TurboMindGgufLut4Kernel,
+)
 from vllm.model_executor.kernels.linear.pre_ampere_qpn import (
     TuringNvFp4LinearLayerConfig,
     TuringQpn2NvFp4LinearKernel,
