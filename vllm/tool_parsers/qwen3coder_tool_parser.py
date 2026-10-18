@@ -809,6 +809,51 @@ class Qwen3CoderToolParser(ToolParser):
         # 已**真正下发**的增量（按 tool index）——flush 只补缺失部分，避免重复
         self._opt22e_streamed: dict = {}
         self._opt22e_name_sent: dict = {}
+        # opt22e 流式对等（2026-10-18）：force_all 时正文按「原文展示形」增量下发。
+        # _forced_sent = 已下发字符数；_forced_prev_full = 上一帧的最终展示形。
+        self._forced_sent: int = 0
+        self._forced_prev_full: str = ""
+
+    # opt22e 流式对等（2026-10-18）：请求侧明确禁止调用（`tool_choice=none` /
+    # prompt 明示「不要真的调用」/ 无工具上下文）⇒ 整轮降级为文本。
+    # 非流式在 `extract_tool_calls` 的 force_all 分支用 `_to_display(model_output)`
+    # 一次性把原文（含转义后的示例标签）下发；流式此前**没有对等实现**——形似调用
+    # 全被 `_opt22d_filter_delta` 吞掉，客户端只收到开头空白（verify_r9/E1）。
+    # 本实现逐帧应用同一确定性变换，并保证已发字符**永不被后续分片改写**：
+    #   ① 只发与上一帧展示形的公共前缀（标签补全后转义形态会变）；
+    #   ② 非 EOS 帧再扣留尾部 `_FORCED_TEXT_HOLD` 字符——`<tool`（匹配 `tool`）
+    #      在分片成 `<tool_` 时会**退回不转义**，这类翻转窗口必须留在未发区；
+    # ③ EOS 帧一次性补齐剩余。
+    _FORCED_TEXT_HOLD: int = 32
+
+    def _stream_forced_text(self, current_text: str, is_eos: bool):
+        """opt22e 流式对等：force_all 时按「原文展示形」增量下发正文。
+
+        与非流式 force_all 分支的 `_to_display(model_output)` 逐字节等价
+        （EOS 帧下发完毕后，客户端拼接结果 == 非流式 content）。
+        """
+        full = _to_display(current_text)
+        prev_full = self._forced_prev_full
+        if prev_full:
+            n = 0
+            m = min(len(prev_full), len(full))
+            while n < m and prev_full[n] == full[n]:
+                n += 1
+            stable = n
+        else:
+            stable = len(full)
+        self._forced_prev_full = full
+        # 已发内容不可回改（理论上不会回退，真回退时宁可少发）
+        stable = max(stable, self._forced_sent)
+        if is_eos:
+            limit = len(full)
+        else:
+            limit = min(stable, len(full) - self._FORCED_TEXT_HOLD)
+        if limit <= self._forced_sent:
+            return None
+        emit = full[self._forced_sent:limit]
+        self._forced_sent = limit
+        return DeltaMessage(content=emit) if emit else None
 
     def _compute_json_diff(self, current_json: str, prev_streamed: str) -> str:
         """Safe-prefix diff on JSON strings for incremental tool args.
@@ -2196,6 +2241,17 @@ class Qwen3CoderToolParser(ToolParser):
         _is_eos = not delta_text and bool(delta_token_ids)
         # [本地 2026-10-13] 记账本次带来的 token 数，供 partial 的计数节流使用。
         self._delta_tok = max(1, len(delta_token_ids))
+        # opt22e 流式对等（2026-10-18）：请求侧明确禁止调用 ⇒ 整轮降级为文本。
+        # 走与非流式 force_all 分支等价的「原文转义下发」，**不进工具状态机**
+        # （否则形似调用被 `_opt22d_filter_delta` 全吞，正文丢失）。
+        # ⚠️ 必须在遮罩/归一化之前返回：本路径不需要任何结构解析。
+        if self._opt22d_should_force_all(request):
+            self._opt22d_force_all = True
+            if not previous_text:
+                # 新请求首帧：`_reset_streaming_state` 在本分支不会执行
+                self._forced_sent = 0
+                self._forced_prev_full = ""
+            return self._stream_forced_text(current_text, _is_eos)
         # opt22e：**先遮罩、后归一化**（顺序很关键）。
         # `_normalize_qwen3_tag_names` 会把方言标签改名（`<toolcall>` → `<tool_call>`，
         # 长度还 +1）。若先归一化，**文档正文里**写的 `<toolcall>` 也会被改名

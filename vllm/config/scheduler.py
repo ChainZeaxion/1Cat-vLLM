@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 from pydantic import Field, field_validator
 from typing_extensions import Self
 
+from vllm.config.legacy_inputs import LegacyInputs
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.utils.hashing import safe_hash
@@ -79,7 +80,16 @@ class SchedulerConfig:
 
     long_prefill_token_threshold: int = 0
     """For chunked prefill, a request is considered long if the prompt is
-    longer than this number of tokens."""
+    longer than this number of tokens.
+
+    The cap is not applied when the request is the only one in the batch,
+    since there is no other request for it to starve."""
+
+    long_prefill_token_threshold_adaptive: bool = False
+    """Floor the effective long prefill token threshold at a fair share of
+    the per-step token budget: the budget divided by the number of queued
+    and running requests. Only applies when long_prefill_token_threshold is
+    nonzero."""
 
     mixed_prefill_step_latency_ms: float = Field(default=250.0, ge=0)
     """GPU step latency target when prefill shares a batch with resident decode.
@@ -152,6 +162,22 @@ class SchedulerConfig:
     fits in the KV cache before admitting a new request, rather than only
     checking the first chunk. Prevents over-admission and KV cache thrashing
     with chunked prefill."""
+
+    sm70_async_queue_depth: int | None = Field(default=None, ge=0)
+    """Override no-PP asynchronous queue depth; zero preserves the old default."""
+    sm70_inputs: LegacyInputs = Field(default_factory=LegacyInputs, init=False)
+    """Initialization snapshot for deferred scheduler override errors."""
+    sm70_aliases: ClassVar[dict[str, str]] = {
+        "sm70_async_queue_depth": "VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH",
+    }
+
+    def capture_sm70_inputs(self) -> None:
+        self.sm70_inputs.capture(self.sm70_aliases.values())
+
+    def sm70_queue_depth(self) -> int:
+        if self.sm70_async_queue_depth is not None:
+            return self.sm70_async_queue_depth
+        return self.sm70_inputs.value(self.sm70_aliases["sm70_async_queue_depth"])
 
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
@@ -236,6 +262,7 @@ class SchedulerConfig:
         return None if value is None else handler(value)
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
+        self.capture_sm70_inputs()
         if is_encoder_decoder:
             # Chunked prefill should be disabled for encoder-decoder models.
             self.disable_chunked_mm_input = True

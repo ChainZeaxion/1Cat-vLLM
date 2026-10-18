@@ -3,7 +3,6 @@
 
 import copy
 import math
-import os
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import Field, SkipValidation, field_validator, model_validator
@@ -15,6 +14,7 @@ from vllm.config.kernel import MoEBackend
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.sm70_dflash2 import Sm70DFlash2Config
+from vllm.config.speculative_sampling import SpeculativeSamplingPolicy
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
@@ -109,41 +109,18 @@ def get_dflash_model_draft_tokens(speculative_config: Any) -> int:
     draft_model_config = getattr(speculative_config, "draft_model_config", None)
     hf_config = getattr(draft_model_config, "hf_config", None)
     trained_tokens = _get_dflash2_checkpoint_draft_tokens(hf_config)
-    resolved = verify_tokens
     if trained_tokens is not None and trained_tokens < verify_tokens:
-        resolved = trained_tokens
-    # Experimental (2026-09-30): allow forcing a narrower model draft width so
-    # that lookup regains a tail window even when NST <= the trained block.
-    # Unset by default -> byte-identical to the upstream code path.
-    forced = os.getenv("VLLM_DFLASH2_DRAFT_BLOCK")
-    if forced:
-        draft_block = int(forced)
-        if not 0 < draft_block <= resolved:
-            raise ValueError(
-                "VLLM_DFLASH2_DRAFT_BLOCK must be within [1, %d], got %d"
-                % (resolved, draft_block)
-            )
-        return draft_block
-    return resolved
+        return trained_tokens
+    return verify_tokens
 
 
 def uses_adaptive_dflash_lookup(speculative_config: Any) -> bool:
-    """Whether DFlash2 can switch between model and augmented widths.
-
-    opt-2b: widen the activation gate. The audited route required the verifier
-    to be strictly wider than the trained block (``draft < verify_tokens``),
-    which silently skipped lookup-augmented drafting whenever the configured
-    ``num_speculative_tokens`` did not exceed the checkpoint's trained width.
-    The gate is now simply ``num_speculative_tokens > 2`` (the method and
-    ngram_assist preconditions are unchanged); when the verifier is not wider
-    than the trained block the fusion region is empty and the lookup path is a
-    no-op, so no width arithmetic changes.
-    """
+    """Whether DFlash2 can switch between model and augmented widths."""
     verify_tokens = int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
     return (
         getattr(speculative_config, "method", None) == "dflash"
         and bool(getattr(speculative_config, "ngram_assist", False))
-        and verify_tokens > 2
+        and 0 < get_dflash_model_draft_tokens(speculative_config) < verify_tokens
     )
 
 
@@ -154,7 +131,7 @@ class SpeculativeConfig:
     enforce_eager: bool | None = None
     """Override the default enforce_eager from model_config"""
     # General speculative decoding control
-    num_speculative_tokens: int = Field(default=None, ge=0)  # type: ignore[assignment]
+    num_speculative_tokens: int = Field(default=None, gt=0)  # type: ignore[assignment]
     """The number of speculative tokens, if provided. It will default to the
     number in the draft model config if present; selector-based DFlash2 uses
     checkpoint ``block_size - 1``. Otherwise, it is required."""
@@ -221,11 +198,13 @@ class SpeculativeConfig:
     speculative input batches can contain sequences of different lengths,
     which may only be supported by certain attention backends. This currently
     only affects the EAGLE method of speculation."""
-    use_local_argmax_reduction: bool = False
+    use_local_argmax_reduction: bool | None = None
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to
     O(2 * tp_size) per token. Only applies to greedy draft selection in
-    non-tree speculation."""
+    non-tree speculation. ``None`` automatically enables the SM70
+    FP16 Qwen4Exp TP4 MTP route with greedy drafts. Explicit booleans override
+    automatic selection; other routes retain full-logits selection."""
 
     # Ngram proposer configuration
     prompt_lookup_max: int | None = Field(default=None, ge=1)
@@ -391,8 +370,30 @@ class SpeculativeConfig:
     DSpark still generates the checkpoint's complete block; only a prefix is
     scheduled, so values below the checkpoint block size remain lossless."""
 
+    sampling_policy: SpeculativeSamplingPolicy = Field(
+        default_factory=SpeculativeSamplingPolicy
+    )
+    """Per-engine proposal/rejection policy captured before worker transfer."""
+
     sm70_dflash2: Sm70DFlash2Config = Field(default_factory=Sm70DFlash2Config)
     """Per-engine SM70 DFlash2 verifier policy; automatic when not specified."""
+
+    def resolve_execution_policy(self) -> None:
+        """Bind sampling and enabled assistance before worker serialization."""
+        self.sampling_policy.resolve(
+            draft=self.draft_sample_method == "probabilistic",
+            vocab=True,
+            vocab_default=self.method == "mtp",
+        )
+        self.sm70_dflash2.resolve_lookup(self)
+
+    diagnostic_confidence_logits: bool = Field(default=False, init=False)
+    """Bound extra confidence output contract; only affects DSpark compilation."""
+
+    def bind_diagnostic_output(self, alignment: bool | None) -> None:
+        self.diagnostic_confidence_logits = self.method == "dspark" and bool(
+            self.dspark_confidence_threshold > 0.0 or alignment
+        )
 
     def compute_hash(self) -> str:
         """
@@ -406,11 +407,28 @@ class SpeculativeConfig:
         excluding anything before input ids/embeddings and after
         the final hidden states.
         """
-        factors: list[Any] = []
+        factors: list[Any] = [
+            ("use_local_argmax_reduction", self.use_local_argmax_reduction)
+        ]
+        if self.method == "dspark":
+            factors.append(
+                ("diagnostic_confidence_logits", self.diagnostic_confidence_logits)
+            )
         if self.sm70_dflash2.resolved and (
             self.use_dflash_family() or self.sm70_dflash2.explicit_fields
         ):
             factors.append(("sm70_dflash2", self.sm70_dflash2.graph_options()))
+        if self.sampling_policy.sources:
+            factors.append(
+                (
+                    "sampling_policy",
+                    self.sampling_policy.compute_hash(
+                        draft=self.draft_sample_method == "probabilistic",
+                        vocab=self.method == "mtp",
+                        aux_hidden=self.use_dflash_family(),
+                    ),
+                )
+            )
         # Eagle3 and extract_hidden_states affect the computation graph because
         # they return intermediate hidden states in addition to the final hidden state.
         uses_aux_hidden_states = (
@@ -472,6 +490,10 @@ class SpeculativeConfig:
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
+        # Configs that define their own MTP draft form rewrite themselves.
+        get_mtp_draft_config = getattr(hf_config, "get_mtp_draft_config", None)
+        if callable(get_mtp_draft_config):
+            return get_mtp_draft_config()
         initial_architecture = hf_config.architectures[0]
         if hf_config.model_type in (
             "deepseek_v3",
@@ -716,15 +738,6 @@ class SpeculativeConfig:
         return hf_config
 
     def __post_init__(self):
-        # opt23: MTP=0 disables speculative decoding (equivalent to not
-        # passing a speculative config at all).
-        if self.num_speculative_tokens is not None and self.num_speculative_tokens == 0:
-            logger.info("num_speculative_tokens=0, disabling speculative decoding.")
-            self.method = None
-            self.model = None
-            self.num_speculative_tokens = None
-            return self
-
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
         # will be used to set the draft model, eagle head, or additional weight
@@ -754,25 +767,6 @@ class SpeculativeConfig:
                 "method `%s` is deprecated and replaced with mtp.", self.method
             )
             self.method = "mtp"
-
-        # MTP safety detection: if the model has no MTP layers, disable speculation
-        if self.method == "mtp" and self.target_model_config is not None:
-            hf_config = self.target_model_config.hf_text_config
-            n_predict = getattr(hf_config, "n_predict", 0) or 0
-            mtp_layers = getattr(hf_config, "mtp_num_hidden_layers", 0) or 0
-            nextn_layers = getattr(hf_config, "num_nextn_predict_layers", 0) or 0
-            if n_predict <= 0 and mtp_layers <= 0 and nextn_layers <= 0:
-                logger.warning(
-                    "Model does not have MTP layers "
-                    "(n_predict=%s, mtp_num_hidden_layers=%s, "
-                    "num_nextn_predict_layers=%s). "
-                    "Disabling speculative decoding.",
-                    n_predict, mtp_layers, nextn_layers,
-                )
-                self.method = None
-                self.model = None
-                self.num_speculative_tokens = None
-                return self
 
         if self.model is None and self.num_speculative_tokens is not None:
             if self.method == "mtp":
@@ -960,7 +954,7 @@ class SpeculativeConfig:
                     self.method = "mlp_speculator"
                 elif self.draft_model_config.hf_config.model_type in get_args(
                     MTPModelTypes
-                ):
+                ) or getattr(self.draft_model_config.hf_config, "is_mtp_draft", False):
                     self.method = "mtp"
                     self._inherit_target_rope_for_extended_native_mtp()
                     if (
@@ -1117,48 +1111,6 @@ class SpeculativeConfig:
                     )
                 )
 
-                # opt24 (opt26): Auto-extend drafter max_position_embeddings
-                # to match target model max_model_len.
-                hf_config = self.draft_model_config.hf_config
-                target_len = self.target_model_config.max_model_len
-                if hf_config is not None:
-                    for pos_attr in ("max_position_embeddings", "max_position"):
-                        current_pos = getattr(hf_config, pos_attr, None)
-                        if (current_pos is not None
-                                and target_len is not None
-                                and current_pos < target_len):
-                            setattr(hf_config, pos_attr, target_len)
-                            logger.info_once(
-                                "Extended Drafter %s from %d to %d "
-                                "to match target model max_model_len=%d.",
-                                pos_attr,
-                                current_pos,
-                                target_len,
-                                target_len,
-                            )
-
-                # opt24: also extend draft_model_config.max_model_len so the
-                # worker's effective_drafter_max_model_len tracks the target
-                # model. v130 keeps min(draft, target) = max_position_embeddings
-                # (262144), which forces "Skipping speculative drafts" once the
-                # context exceeds 262K; the scheduler still schedules draft
-                # slots on that step and the worker raises
-                # "draft tokens are list instead of a tensor" — engine crash
-                # (NTK long-context > 262K scenario).
-                if (
-                    self.draft_model_config.max_model_len is not None
-                    and target_len is not None
-                    and self.draft_model_config.max_model_len < target_len
-                ):
-                    self.draft_model_config.max_model_len = target_len
-                    logger.info_once(
-                        "Extended Drafter max_model_len from %d to %d "
-                        "to match target model max_model_len=%d.",
-                        self.draft_model_config.max_model_len,
-                        target_len,
-                        target_len,
-                    )
-
                 self.draft_parallel_config = (
                     SpeculativeConfig.create_draft_parallel_config(
                         self.target_parallel_config,
@@ -1180,7 +1132,28 @@ class SpeculativeConfig:
             self.draft_model_config.hf_config.index_share_for_mtp_iteration = (
                 self.index_share_for_mtp_iteration
             )
+        self._resolve_local_argmax_reduction()
         return self
+
+    def _resolve_local_argmax_reduction(self) -> None:
+        if self.use_local_argmax_reduction is not None:
+            return
+        import torch
+
+        from vllm.platforms import current_platform
+
+        draft_config = self.draft_model_config
+        self.use_local_argmax_reduction = bool(
+            self.method == "mtp"
+            and self.draft_sample_method == "greedy"
+            and not self.parallel_drafting
+            and draft_config is not None
+            and draft_config.hf_config.architectures == ["Qwen4ExpMTP"]
+            and draft_config.dtype == torch.float16
+            and self.draft_parallel_config.tensor_parallel_size == 4
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+        )
 
     def _verify_dspark_final_stage_ownership(self) -> None:
         """Validate the layer contract for a final-stage-local drafter."""
@@ -1188,7 +1161,12 @@ class SpeculativeConfig:
 
         pp_size = self.target_parallel_config.pipeline_parallel_size
         num_layers = self.target_model_config.get_total_num_hidden_layers()
-        last_start, last_end = get_pp_indices(num_layers, pp_size - 1, pp_size)
+        last_start, last_end = get_pp_indices(
+            num_layers,
+            pp_size - 1,
+            pp_size,
+            partition=self.target_parallel_config.communication.pp_layer_partition,
+        )
         layer_ids = tuple(
             getattr(
                 self.draft_model_config.hf_config,
@@ -1469,8 +1447,6 @@ class SpeculativeConfig:
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
-        if self.method is None and self.model is None:
-            return self
         if self.tensor_parallel_size is not None:
             raise ValueError(
                 "'tensor_parallel_size' is not a valid argument in the "
@@ -1484,7 +1460,7 @@ class SpeculativeConfig:
                 "n_predict parameter."
             )
 
-        if self.num_speculative_tokens < 0:
+        if self.num_speculative_tokens <= 0:
             raise ValueError(
                 "Expected num_speculative_tokens to be greater "
                 f"than zero ({self.num_speculative_tokens})."

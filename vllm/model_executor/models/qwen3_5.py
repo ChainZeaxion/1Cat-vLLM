@@ -30,7 +30,6 @@ from collections.abc import Callable, Iterable
 import torch
 from torch import nn
 
-import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -67,6 +66,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_5 import (
@@ -89,6 +89,7 @@ from .interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
     _require_is_multimodal,
 )
@@ -229,8 +230,11 @@ def _sm70_materialize_qwen35_gdn_splits(
     return z, b, a
 
 
-def _parse_sm70_moe_dense_allowlist() -> set[str] | None:
-    raw = envs.VLLM_SM70_MOE_DENSE_ALLOWLIST
+def _parse_sm70_moe_dense_allowlist(policy=None) -> set[str] | None:
+    from vllm.config.execution_policy import layer_policy
+
+    policy = layer_policy() if policy is None else policy
+    raw = policy.moe_dense_allowlist
     if raw is None:
         return None
     suffixes = {item.strip() for item in raw.split(",") if item.strip()}
@@ -421,7 +425,20 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             "gdn_hidden_states", layer_name, hidden_states
         )
 
-        if _sm70_gdn_qpn8_ba_dispatch_eligible(
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            _sm70_gdn_projection_dump_requested,
+        )
+        from vllm.model_executor.layers.quantization.sm70_gdn_ba_verify import (
+            apply_gdn_ba_verify,
+        )
+
+        fused_verify_projection = None
+        if not _sm70_gdn_projection_dump_requested(layer_name):
+            fused_verify_projection = apply_gdn_ba_verify(self, hidden_states)
+        if fused_verify_projection is not None:
+            mixed_qkv, z, b, a = fused_verify_projection
+            z = z.reshape(num_tokens, -1, self.head_v_dim)
+        elif _sm70_gdn_qpn8_ba_dispatch_eligible(
             self,
             hidden_states,
             layer_name,
@@ -525,7 +542,7 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
         mixed_qkv = _sm70_dump_gdn_projection_tensor(
             "split_mixed_qkv", layer_name, mixed_qkv
         )
-        if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
+        if self.gdn_policy.projection.mixed_qkv_contiguous:
             mixed_qkv = mixed_qkv.contiguous()
         z = _sm70_dump_gdn_projection_tensor("split_z", layer_name, z)
         z = z.contiguous().reshape(z.size(0), -1, self.head_v_dim)
@@ -567,11 +584,11 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
         self.sm70_dflash2_direct_attention_output = bool(
-            envs.VLLM_SM70_DFLASH2_DIRECT_ATTENTION_OUTPUT
-            and current_platform.is_device_capability(70)
+            current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
-            and vllm_config.parallel_config.tensor_parallel_size == 4
+            and vllm_config.parallel_config.tensor_parallel_size in (2, 4)
             and model_config.dtype == torch.float16
+            and model_config.quantization in ("compressed-tensors", "gguf")
             and config.hidden_size == 5120
             and config.model_type == "qwen3_5_text"
         )
@@ -583,6 +600,15 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
             )
+            # Make the collective visible beside the following Gemma norm.
+            # The full GDN operator returns the local output projection; KV
+            # cache mutations remain within that same operator boundary.
+            self.sm70_gdn_outer_allreduce = bool(
+                self.sm70_dflash2_direct_attention_output
+                and self.linear_attn.out_proj.bias is None
+            )
+            if self.sm70_gdn_outer_allreduce:
+                self.linear_attn.out_proj.reduce_results = False
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(
                 config,
@@ -663,9 +689,18 @@ class Qwen3_5Model(Qwen3NextModel):
 
         self.vocab_size = config.vocab_size
 
+        quant_config = vllm_config.quant_config
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            quant_config=(
+                quant_config
+                if quant_config is not None
+                and quant_config.get_name() == "gguf"
+                and not config.tie_word_embeddings
+                else None
+            ),
+            prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
         def get_layer(prefix: str):
@@ -891,9 +926,50 @@ class Qwen3_5Model(Qwen3NextModel):
         return loaded_params
 
 
+class Qwen3_5HybridState(IsHybrid):
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls,
+        vllm_config: "VllmConfig",
+    ) -> tuple[torch.dtype, torch.dtype]:
+        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls, vllm_config: "VllmConfig"
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        parallel_config = vllm_config.parallel_config
+        hf_config = vllm_config.model_config.hf_text_config
+        tp_size = parallel_config.tensor_parallel_size
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+            tp_size,
+            hf_config.linear_num_key_heads,
+            hf_config.linear_num_value_heads,
+            hf_config.linear_key_head_dim,
+            hf_config.linear_value_head_dim,
+            hf_config.linear_conv_kernel_dim,
+            num_spec,
+        )
+
+    @classmethod
+    def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+
+
 class Qwen3_5ForCausalLMBase(
     nn.Module,
     HasInnerState,
+    Qwen3_5HybridState,
+    SupportsMRoPE,
     SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
@@ -983,6 +1059,16 @@ class Qwen3_5ForCausalLMBase(
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list[MultiModalFeatureSpec],
+    ) -> tuple[torch.Tensor, int]:
+        if mm_features:
+            raise ValueError("The Qwen3.5 text model does not accept multimodal inputs")
+        positions = torch.arange(len(input_tokens), dtype=torch.long, device="cpu")
+        return positions.unsqueeze(0).expand(3, -1), 0
+
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
@@ -1003,6 +1089,15 @@ class Qwen3_5ForCausalLMBase(
         top_k: int,
     ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
         return self.logits_processor.get_topk_tokens_and_logits_with_fallback(
+            self.lm_head, hidden_states, top_k
+        )
+
+    def get_compact_target_probe_with_fallback(
+        self,
+        hidden_states: torch.Tensor,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
+        return self.logits_processor.get_compact_target_probe_with_fallback(
             self.lm_head, hidden_states, top_k
         )
 
@@ -1029,14 +1124,16 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
         # Qwen3.5 MoE variants have not accepted the generic dense FP16
         # TurboMind path for all projections. Keep the 0.0.3 safety default:
         # forbid it unless an explicit MoE-only suffix allowlist is provided.
-        allowlist = _parse_sm70_moe_dense_allowlist()
+        allowlist = _parse_sm70_moe_dense_allowlist(
+            vllm_config.kernel_config.layer_execution
+        )
         for module in self.modules():
             module._sm70_f16_forbidden = True
             if allowlist:
                 module_prefix = getattr(module, "prefix", "")
                 if module_prefix and module_prefix.rsplit(".", 1)[-1] in allowlist:
                     module._sm70_f16_forbidden = False
-        if envs.VLLM_SM70_ENABLE_DENSE_F16_FASTPATH or allowlist is not None:
+        if vllm_config.kernel_config.layer_execution.dense_f16 or allowlist is not None:
             logger.info_once(
                 "SM70 dense fp16 fast path is disabled for Qwen3.5 MoE "
                 "modules except VLLM_SM70_MOE_DENSE_ALLOWLIST=%s.",
@@ -1061,7 +1158,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
     info=Qwen3_5ProcessingInfo,
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
-class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid):
+class Qwen3_5ForConditionalGeneration(
+    Qwen3VLForConditionalGeneration, Qwen3_5HybridState
+):
     # Qwen3.5 does not support multimodal pruning (EVS).
     supports_multimodal_pruning = False
 
@@ -1200,49 +1299,21 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             hidden_states, top_k
         )
 
+    def get_compact_target_probe_with_fallback(
+        self,
+        hidden_states: torch.Tensor,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
+        return self.language_model.get_compact_target_probe_with_fallback(
+            hidden_states, top_k
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=["mtp."],
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
-    @classmethod
-    def get_mamba_state_dtype_from_config(
-        cls,
-        vllm_config: "VllmConfig",
-    ) -> tuple[torch.dtype, torch.dtype]:
-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
-            vllm_config.model_config.dtype,
-            vllm_config.cache_config.mamba_cache_dtype,
-            vllm_config.cache_config.mamba_ssm_cache_dtype,
-        )
-
-    @classmethod
-    def get_mamba_state_shape_from_config(
-        cls, vllm_config: "VllmConfig"
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
-        parallel_config = vllm_config.parallel_config
-        hf_config = vllm_config.model_config.hf_text_config
-        tp_size = parallel_config.tensor_parallel_size
-        num_spec = (
-            vllm_config.speculative_config.num_speculative_tokens
-            if vllm_config.speculative_config
-            else 0
-        )
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
-            tp_size,
-            hf_config.linear_num_key_heads,
-            hf_config.linear_num_value_heads,
-            hf_config.linear_key_head_dim,
-            hf_config.linear_value_head_dim,
-            hf_config.linear_conv_kernel_dim,
-            num_spec,
-        )
-
-    @classmethod
-    def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
-        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
 
 
 ########################################################

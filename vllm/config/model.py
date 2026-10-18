@@ -1322,7 +1322,12 @@ class ModelConfig:
             parallel_config.rank // parallel_config.tensor_parallel_size
         ) % parallel_config.pipeline_parallel_size
         pp_size = parallel_config.pipeline_parallel_size
-        start, end = get_pp_indices(total_num_hidden_layers, pp_rank, pp_size)
+        start, end = get_pp_indices(
+            total_num_hidden_layers,
+            pp_rank,
+            pp_size,
+            partition=parallel_config.communication.pp_layer_partition,
+        )
         return start, end
 
     def get_num_layers(self, parallel_config: ParallelConfig) -> int:
@@ -2245,51 +2250,11 @@ def _get_and_verify_max_len(
                 "derived_max_model_len will cause a CUDA array out-of-bounds "
                 "error."
             )
-            # opt21: Auto Dynamic NTK 默认启用（无论是否设置 VLLM_ALLOW_LONG_MAX_MODEL_LEN）
-            # 1) Hard reject beyond 524288
-            if max_model_len > 524288:
+            if envs.VLLM_ALLOW_LONG_MAX_MODEL_LEN:
+                logger.warning_once("%s %s", msg, warning)
+            else:
                 raise ValueError(
-                    f"max_model_len ({max_model_len}) exceeds the maximum "
-                    f"supported length (524288)."
+                    f"{msg} To allow overriding this maximum, set "
+                    f"the env var VLLM_ALLOW_LONG_MAX_MODEL_LEN=1. {warning}"
                 )
-
-            # 2) Auto-dynamic NTK RoPE scaling
-            if rope_parameters is not None:
-                for _rp_key, rp in rope_parameters.items():
-                    rope_type = rp.get("rope_type", "default")
-                    if rope_type == "default":
-                        from math import ceil
-
-                        if "mrope_section" in rp:
-                            new_rope_type = "yarn"
-                        else:
-                            new_rope_type = "dynamic"
-                        rp["rope_type"] = new_rope_type
-
-                        max_pos_emb = getattr(
-                            hf_config, "max_position_embeddings", None
-                        )
-                        if max_pos_emb is None or max_pos_emb <= 0:
-                            max_pos_emb = getattr(
-                                hf_config,
-                                "original_max_position_embeddings",
-                                2048,
-                            )
-                        factor = ceil(max_model_len / max_pos_emb)
-                        rp["factor"] = float(factor)
-                        if new_rope_type == "yarn":
-                            rp["original_max_position_embeddings"] = max_pos_emb
-
-                        logger.warning_once(
-                            "Auto-upgraded rope_type from 'default' to '%s' "
-                            "with factor=%.1f (max_model_len=%d, "
-                            "max_position_embeddings=%d)",
-                            new_rope_type,
-                            rp["factor"],
-                            max_model_len,
-                            max_pos_emb,
-                        )
-                    break
-
-            logger.warning_once("%s %s", msg, warning)
     return int(max_model_len)

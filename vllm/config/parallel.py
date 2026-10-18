@@ -13,6 +13,7 @@ from torch.distributed import ProcessGroup, ReduceOp, Store
 from typing_extensions import Self
 
 import vllm.envs as envs
+from vllm.config.execution_policy import CommunicationPolicy
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -108,6 +109,9 @@ class EPLBConfig:
 @config
 class ParallelConfig:
     """Configuration for the distributed execution."""
+
+    communication: CommunicationPolicy = Field(default_factory=CommunicationPolicy)
+    """Per-engine execution decisions and initialization provenance."""
 
     pipeline_parallel_size: int = 1
     """Number of pipeline parallel groups."""
@@ -333,12 +337,15 @@ class ParallelConfig:
     and will be deprecated when PCP is fully supported.
 
     """
-    dcp_comm_backend: DCPCommBackend = "ag_rs"
+    dcp_comm_backend: DCPCommBackend | None = None
     """Communication backend for Decode Context Parallel (DCP).
-    - "ag_rs": AllGather + ReduceScatter (default, existing behavior)
+    - "ag_rs": AllGather + ReduceScatter (existing behavior)
     - "a2a": All-to-All exchange of partial outputs + LSE, then
       combine with Triton kernel. Reduces NCCL calls from 3 to 2
       per layer for MLA models.
+
+    `None` selects the model default, which is "ag_rs" unless the model
+    overrides it via [`set_dcp_defaults`][vllm.config.ParallelConfig.set_dcp_defaults].
     """
 
     cp_kv_cache_interleave_size: int = 1
@@ -505,6 +512,15 @@ class ParallelConfig:
         """Initialize the shared PLE endpoint after late config defaults."""
         if not self._ple_offload_ipc_path:
             self._ple_offload_ipc_path = get_open_zmq_ipc_path()
+
+    def set_dcp_defaults(self, comm_backend: DCPCommBackend = "ag_rs") -> None:
+        """Fill in the DCP options the user left unset.
+
+        Models can set their preferred DCP settings by calling this from their
+        `verify_and_update_config` hook; an explicit user setting always wins.
+        """
+        if self.dcp_comm_backend is None:
+            self.dcp_comm_backend = comm_backend
 
     @property
     def world_size_across_dp(self) -> int:
@@ -779,9 +795,18 @@ class ParallelConfig:
         from vllm.config.utils import get_hash_factors, hash_factors
 
         factors = get_hash_factors(self, ignored_factors)
+        factors["communication"] = self.communication.compute_hash()
         return hash_factors(factors)
 
     def __post_init__(self) -> None:
+        from vllm.config.sm70_runtime import resolve_legacy_fields
+
+        resolve_legacy_fields(
+            self.communication,
+            {
+                "pp_layer_partition": "VLLM_PP_LAYER_PARTITION",
+            },
+        )
         # Continue with the rest of the initialization
         self.world_size = (
             self.pipeline_parallel_size
