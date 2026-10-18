@@ -5,6 +5,7 @@ import asyncio
 import io
 import json
 import os
+import re
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Iterable
 from collections.abc import Sequence as GenericSequence
@@ -80,6 +81,43 @@ from vllm.tool_parsers.utils import (
     escape_tool_like_tags,
     escape_tool_like_tags_outside_examples,
 )
+
+
+# [2026-10-18] 伪调用文本清洗：模型偶尔把**打算并行发起的工具**输出成纯文本
+# 清单（`[Called: Bash]` 每行一条），该条 assistant 消息**没有** tool_calls。
+# 这段文本回传后模型会模仿该格式 → 后续轮次全部退化成文本，且 `/compact`
+# 摘要会把它抄进新上下文导致无法自愈（实测连续 8 轮失效）。
+# 真实调用不会以这种纯文本形式出现，故只对「无 tool_calls 的 assistant 消息」
+# 删除这些行是安全的。
+_PSEUDO_CALL_LINE_RE = re.compile(r"^[ \t]*\[Called:[^\]\n]*\][ \t]*$", re.M)
+
+
+def sanitize_pseudo_tool_calls(messages: list) -> list:
+    """删除 assistant 历史中无 tool_calls 消息里的 `[Called: X]` 伪调用行。
+
+    返回**新列表**（未变化时原样返回入参）。整条消息只有伪调用时丢弃该消息。
+    """
+    changed = False
+    out: list = []
+    for m in messages:
+        if (
+            isinstance(m, dict)
+            and m.get("role") == "assistant"
+            and not m.get("tool_calls")
+            and not m.get("function_call")
+        ):
+            content = m.get("content")
+            if isinstance(content, str) and "[Called:" in content:
+                cleaned = _PSEUDO_CALL_LINE_RE.sub("", content)
+                cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip("\n")
+                if cleaned != content:
+                    changed = True
+                    if not cleaned:
+                        continue
+                    m = {**m, "content": cleaned}
+        out.append(m)
+    return out if changed else messages
+
 from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
 
@@ -296,6 +334,10 @@ class OpenAIServingChat(OpenAIServing):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
+        # [2026-10-18] 回传前清洗伪调用清单（见 sanitize_pseudo_tool_calls）
+        _clean = sanitize_pseudo_tool_calls(request.messages)
+        if _clean is not request.messages:
+            request = request.model_copy(update={"messages": _clean})
         return await self.openai_serving_render.render_chat(request)
 
     async def create_chat_completion(
