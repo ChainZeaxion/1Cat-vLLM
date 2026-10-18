@@ -240,70 +240,6 @@ def request_forbids_tool_calls(request) -> bool:
     return False
 
 
-# [opt22 去重 2026-10-14] 以下三个判据在 coder / xml 两 parser 中逐字（去注释）重复，
-# 按「≥2 parser 共用 ⇒ utils」规范上提为模块级纯函数；parser 保留薄方法委托
-# （传 self.tools / self._opt22d_force_all），调用点签名不变。
-
-
-def registered_tool_names(tools: list[Tool] | None) -> set:
-    """已注册工具名集合。``tools`` 未提供时为空集。"""
-    names = set()
-    for tool in (tools or []):
-        fn = getattr(tool, "function", None)
-        nm = getattr(fn, "name", None) if fn is not None else None
-        if not nm:
-            nm = getattr(tool, "name", None)
-        if nm:
-            names.add(nm)
-    return names
-
-
-def missing_required_args(
-    tools: list[Tool] | None, tc
-) -> bool:
-    """opt22e B：该调用的参数是否**缺少 schema 的必填字段**。
-
-    参数无法解析（非法 JSON / 空）时也视为缺失 —— 真实调用的参数总能解析。
-    ``tools`` 未提供或该工具无 ``required`` 声明时返回 False（**宽松兜底、不误伤**）。
-    """
-    try:
-        fn = tc.function
-    except Exception:
-        return False
-    if fn is None:
-        return False
-    req = find_tool_required(tools, fn.name)
-    if not req:
-        return False
-    args = fn.arguments
-    if isinstance(args, str):
-        try:
-            args = json.loads(args) if args.strip() else {}
-        except Exception:
-            return True          # 参数非法 ⇒ 必填必然缺失
-    if not isinstance(args, dict):
-        return True
-    return any(k not in args or args[k] in (None, "") for k in req)
-
-
-def opt22d_should_force_all(request, parser_tools: list[Tool] | None) -> bool:
-    """opt22d A/B/C：依“请求侧信号”判断是否整轮降级为文本。
-
-    A ``tool_choice == "none"``：客户端显式禁止调用 → 形似调用必为示例
-    B 请求无工具且解析器无工具：无对象可调 → 形似调用必为示例
-    （C ``request_forbids_tool_calls`` 在本函数内部复用。）
-    """
-    if request is None:
-        return False
-    if getattr(request, "tool_choice", None) == "none":
-        return True
-    if request_forbids_tool_calls(request):
-        return True
-    if not getattr(request, "tools", None) and not parser_tools:
-        return True
-    return False
-
-
 def find_tool_required(
     tools: list[Tool] | None,
     tool_name: str,
@@ -879,3 +815,15 @@ def mask_tool_like_tags_holding_tail(text: str) -> str:
     """
     head, _held = split_incomplete_tool_tag_tail(text)
     return escape_tool_like_tags(head)
+
+
+# [opt22 去重 2026-10-14 → 抽分 2026-10-14晚] 三判据本体移至 qwen3_opt22_core
+# （qwen 双 parser 专用核心；发版 wheel 中该模块编译为二进制，见 patches/release-gated/）。
+# 此处 re-export 保持既有 import 路径兼容（coder/xml 及任何调用方零改动）。
+from vllm.tool_parsers.qwen3_opt22_core import (  # noqa: E402
+    missing_required_args,
+    opt22d_should_force_all,
+    registered_tool_names,
+)
+
+
