@@ -804,7 +804,8 @@ class StreamingXMLToolCallParser:
         """
         head, held = split_incomplete_tool_tag_tail(self.text_content_buffer)
         self.text_content_buffer = held
-        return self._escape_tool_like_tags(head) if head else ""
+        # [example 区间 2026-10-18] 示例容器内原样，只转义区间外
+        return self._escape_tool_like_tags_outside_examples(head) if head else ""
 
     def _flush_text_buffer_forced(self) -> str:
         """opt22d（L-E）：消息结束时强制刷出缓冲（含未闭合尾部），转义后返回。
@@ -815,7 +816,7 @@ class StreamingXMLToolCallParser:
             return ""
         buf = self.text_content_buffer
         self.text_content_buffer = ""
-        return self._escape_tool_like_tags(buf)
+        return self._escape_tool_like_tags_outside_examples(buf)
 
     def _should_skip_element(self, element: str) -> bool:
         """
@@ -1288,6 +1289,12 @@ class StreamingXMLToolCallParser:
         if not names:
             return True
         return name in names
+
+    def _escape_tool_like_tags_outside_examples(self, text: str) -> str:
+        """[example 区间 2026-10-18] 示例容器内原样，只转义区间外。"""
+        from vllm.tool_parsers.utils import escape_tool_like_tags_outside_examples as _f
+
+        return _f(text)
 
     def _escape_tool_like_tags(self, text: str) -> str:
         """opt22d L-B: 把顶层文本里“形似工具调用”的裸标签换成显示安全的形式，

@@ -94,6 +94,29 @@ _TOOL_LIKE_TAG_RE = TOOL_LIKE_TAG_RE
 _SENT_LT = "\ue000"
 _SENT_GT = "\ue001"
 
+# [example 区间 2026-10-18] **原样呈现**哨兵。`<example>…</example>` 与
+# `<etool_call>…</etool_call>` 之间是模型要展示给用户看的**示例**：标签必须保持
+# `<` / `>` 原样（用户会复制粘贴），因此既不转义成 `⟨'…'⟩`，也不能被工具状态机
+# 当成真实调用。用第三组等长哨兵，由 `_to_display` 在**最后一步**还原成原文。
+# ⚠️ 与 `_SENT_*` 严格区分：`_SENT_*` 展示为转义形，`_EX_*` 展示为原文。
+# ⚠️ 还原必须放在 `_TOOL_LIKE_TAG_RE` 转义**之后**，否则还原出来的 `<tool_call>`
+#    又会被转义一遍。
+_EX_LT = "\ue002"
+_EX_GT = "\ue003"
+# [2026-10-18] 模型在示例里会**自发**把标签写成转义形 `⟨'tool_call'⟩`
+# （实测三种提示变体全部如此，明确禁止也无效）。示例区间内这种形态的语义
+# 就是「标签本身」，故在遮罩阶段一并标记、输出阶段还原成 `<…>`：
+# `⟨'`（2 字符）→ 删除标记 + `_EX_LT`；`'⟩`（2 字符）→ `_EX_GT` + 删除标记。
+# 等长替换（2→2），不破坏流式偏移；删除只发生在最终输出阶段。
+_EX_ESC_QUOTE = "\ue004"   # 属于 `⟨'` 的引号，输出时丢弃
+_EX_ESC_CLOSE = "\ue005"   # 属于 `'⟩` 的引号，输出时丢弃
+
+# example 容器标签（`etool_call` = example tool call，首字母 e 与 `tool_call` 区分）。
+# 两者都是**同名闭合**；可嵌套（`<example>` 内放多个 `<etool_call>`）。
+_EX_TAG_SPAN_RE = re.compile(r"</?(?:example|etool_call)>")
+# 流式下用来判断末尾 `<…` 是否只是某个完整标签的**前缀**（不完整则整段延迟）。
+_EX_TAGS = ("<example>", "</example>", "<etool_call>", "</etool_call>")
+
 
 # opt22d 第七轮：抓取“已闭合”的函数名标签（归一化后形如 <function=NAME>）。
 # 用于判断本轮出现的工具是否落在需要流式增量显示的白名单内。
@@ -348,8 +371,17 @@ def _to_display(text: str) -> str:
     if not text:
         return text
     t = text.replace(_SENT_LT, "⟨'").replace(_SENT_GT, "'⟩")
-    return _TOOL_LIKE_TAG_RE.sub(
+    t = _TOOL_LIKE_TAG_RE.sub(
         lambda m: m.group(0).replace("<", "⟨'").replace(">", "'⟩"), t
+    )
+    # [example 区间 2026-10-18] **最后**还原为原文——必须在标签转义之后，
+    # 否则还原出的 `<tool_call>` 会再次被转义。引号标记在此丢弃（长度变化只
+    # 发生在输出阶段，不影响遮罩/偏移）。
+    return (
+        t.replace(_EX_ESC_QUOTE, "")
+        .replace(_EX_ESC_CLOSE, "")
+        .replace(_EX_LT, "<")
+        .replace(_EX_GT, ">")
     )
 
 
@@ -360,9 +392,23 @@ def _to_original(text: str) -> str:
     参数值必须是数据本身：实测若把展示形当值，Write 写出的文件内容会变成
     `⟨'tool_call'⟩`（模型原文是 `<tool_call>`）；xml 侧同场景保留原文。
     """
-    if not text or _SENT_LT not in text and _SENT_GT not in text:
+    if not text:
         return text
-    return text.replace(_SENT_LT, "<").replace(_SENT_GT, ">")
+    if (
+        _SENT_LT not in text
+        and _SENT_GT not in text
+        and _EX_LT not in text
+        and _EX_GT not in text
+    ):
+        return text
+    return (
+        text.replace(_SENT_LT, "<")
+        .replace(_SENT_GT, ">")
+        .replace(_EX_ESC_QUOTE, "")
+        .replace(_EX_ESC_CLOSE, "")
+        .replace(_EX_LT, "<")
+        .replace(_EX_GT, ">")
+    )
 
 
 # opt22e: **真收尾三元组** —— `</parameter></function></tool_call>`（三方言）。
@@ -483,6 +529,82 @@ def _mask_fenced_tags(text: str, *, streaming: bool = True) -> str:
     return _escape_non_linestart_tool_calls(
         _escape_fenced_tags(head, streaming=streaming), streaming=streaming
     )
+
+
+def _mask_example_tags(text: str, *, streaming: bool = True) -> str:
+    """[example 区间 2026-10-18] 把 `<example>`/`<etool_call>` 区间内的尖括号
+    换成**原样呈现**哨兵（``_EX_LT`` / ``_EX_GT``）。
+
+    区间内是待展示的示例 ⇒ 必须原样呈现，且**不得**进入工具状态机（否则文档里
+    的合法调用会被当成真实调用执行）。等长替换保证流式增量前缀关系与 partial
+    偏移都不错位。
+
+    区间**包含**开闭标签本身（一并遮罩、最后由 `_to_display` 还原），这样开闭
+    标签也不会被其它规则改写。支持嵌套：`<example>` 内可放多个 `<etool_call>`。
+
+    ⚠️ **流式下的未闭合区间整块延迟**（`streaming=True` 时**摘掉**，不输出）：
+    区间内容含 `⟨'…'⟩` 这类**两字符**转义形，逐帧替换时「`⟨` 单独出现」与
+    「`⟨'` 配对出现」的遮罩结果不同 ⇒ 破坏 `mask(prev)` 是 `mask(cur)` 前缀的
+    前提（实测会导致 `⟨'` 拆帧后还原失败）。整块摘掉后，区间在**闭合那一帧**
+    一次性下发，`_to_display` 拿到的是完整片段，还原必定成功。
+    非流式 / EOS 帧（`streaming=False`）仍按「未闭合延伸到末尾」处理，
+    最终结果与非流式逐字节相同。
+    """
+    if not text or ("<" not in text and _EX_LT not in text):
+        return text
+    if streaming:
+        # 末尾「尚未长成完整 example 标签」的前缀先摘掉：否则 `<e`、`<ex` …
+        # 会逐字符先发出去，等标签完整时整块再发一遍 ⇒ 重复（实测 `<example>`
+        # 被发两次）。对任意 `<` 最多延迟一帧，代价可忽略。
+        cut = text.rfind("<")
+        if cut != -1:
+            tail = text[cut:]
+            if any(tag.startswith(tail) for tag in _EX_TAGS):
+                text = text[:cut]
+    if "<example" not in text and "<etool_call" not in text:
+        return text
+    spans: list[tuple[int, int]] = []
+    stack: list[int] = []
+    for m in _EX_TAG_SPAN_RE.finditer(text):
+        if m.group(0).startswith("</"):
+            if stack:
+                start = stack.pop()
+                if not stack:  # 最外层容器闭合
+                    spans.append((start, m.end()))
+        else:
+            stack.append(m.start())
+    if stack:  # 存在未闭合区间
+        if streaming:
+            # 整块摘掉（不输出），等闭合那一帧一次性下发——保证前缀单调。
+            # 嵌套在未闭合父区间内的已闭合子区间同样不输出。
+            cut = stack[0]
+            spans = [(s, e) for s, e in spans if e <= cut]
+            text = text[:cut]
+        else:
+            spans.append((stack[0], len(text)))
+    if not spans:
+        return text
+    spans.sort()
+    merged: list[tuple[int, int]] = []
+    for s, e in spans:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    out: list[str] = []
+    last = 0
+    for s, e in merged:
+        out.append(text[last:s])
+        seg = text[s:e]
+        # 模型自发写的转义形 `⟨'…'⟩` 还原成 `<…>`（等长 2→2，引号留待输出阶段丢弃）
+        seg = seg.replace("⟨'", _EX_ESC_QUOTE + _EX_LT).replace(
+            "'⟩", _EX_GT + _EX_ESC_CLOSE
+        )
+        seg = seg.replace("<", _EX_LT).replace(">", _EX_GT)
+        out.append(seg)
+        last = e
+    out.append(text[last:])
+    return "".join(out)
 
 
 def _log(msg: str, *args: Any) -> None:
@@ -662,7 +784,8 @@ class Qwen3CoderToolParser(ToolParser):
             if getattr(tc, "function", None) and tc.function.name
         }
         # 仅遮罩围栏（不转义非行首标签）——否则被 L-B 转义的相邻调用切不出来
-        masked = _escape_fenced_tags(raw_model)
+        # [example 区间 2026-10-18] example 内的调用是**示例**，不得被补捞成真调用
+        masked = _escape_fenced_tags(_mask_example_tags(raw_model, streaming=False))
         for blk in re.findall(r"<tool_call>.*?</tool_call>", masked, re.S):
             m = re.search(r"<function=([\w.\-]+)\s*>", blk)
             if not m:
@@ -832,7 +955,9 @@ class Qwen3CoderToolParser(ToolParser):
         与非流式 force_all 分支的 `_to_display(model_output)` 逐字节等价
         （EOS 帧下发完毕后，客户端拼接结果 == 非流式 content）。
         """
-        full = _to_display(current_text)
+        # [example 区间 2026-10-18] 与非流式一致：先遮 example 再转义，
+        # 否则 `<example>` 内的标签同样会被转成 `⟨'…'⟩`。
+        full = _to_display(_mask_example_tags(current_text, streaming=False))
         prev_full = self._forced_prev_full
         if prev_full:
             n = 0
@@ -2072,8 +2197,10 @@ class Qwen3CoderToolParser(ToolParser):
         # opt22d（L-C）：代码围栏内的标签先遮罩，使其不被当成真实调用，
         # 同时以（转义后的）文本形式留在 content 里，用户仍能看到示例
         self._opt22d_force_all = self._opt22d_should_force_all(request, model_output)
+        # [example 区间 2026-10-18] **先**遮 example 再遮围栏：example 内的标签
+        # 必须先变成 `_EX_*` 哨兵，否则会被围栏/行首规则转义成 `⟨'…'⟩`。
         _esc_model = _escape_non_linestart_tool_calls(
-            _escape_fenced_tags(model_output), streaming=False
+            _escape_fenced_tags(_mask_example_tags(model_output, streaming=False)), streaming=False
         )
         info = self._extract_tool_calls_impl(_esc_model, request)
         kept = []
@@ -2094,7 +2221,9 @@ class Qwen3CoderToolParser(ToolParser):
         if len(kept) != len(info.tool_calls or []):
             # 有未注册调用被降级 → 其原文并入内容（已转义），不向下游暴露假调用
             if not kept:
-                content = _to_display(model_output)
+                # [example 区间 2026-10-18] 整轮降级时同样先遮 example：
+                # 区间内的示例必须原样呈现，不能被 `⟨'…'⟩` 转义。
+                content = _to_display(_mask_example_tags(model_output, streaming=False))
             self.prev_tool_call_arr = [
                 {"name": tc.function.name, "arguments": tc.function.arguments}
                 for tc in kept
@@ -2260,13 +2389,19 @@ class Qwen3CoderToolParser(ToolParser):
         # 分歧（sent 是 `<tool_call>`、full 是 `<toolcall>`）⇒ 补发错位、JSON 非法。
         # 先遮罩后：参数体/围栏内的标签已被换成哨兵（私有区字符），归一化正则
         # 匹配不到 ⇒ 文档内容原样保留；只有**结构标签**（未被遮罩）才被归一化。
-        prev_m = _normalize_qwen3_tag_names(_mask_fenced_tags(previous_text))
+        # [example 区间 2026-10-18] 先遮 example 再遮围栏（顺序同非流式）。
+        # 等长遮罩 ⇒ `cur_m[len(prev_m):]` 的前缀关系与 partial 偏移都不变。
+        prev_m = _normalize_qwen3_tag_names(
+            _mask_fenced_tags(_mask_example_tags(previous_text, streaming=True))
+        )
         cur_m = _normalize_qwen3_tag_names(
-            _mask_fenced_tags(current_text, streaming=not _is_eos)
+            _mask_fenced_tags(_mask_example_tags(current_text, streaming=not _is_eos), streaming=not _is_eos)
         )
         if _is_eos:
             prev_f = _normalize_qwen3_tag_names(
-                _mask_fenced_tags(previous_text, streaming=False)
+                _mask_fenced_tags(
+                    _mask_example_tags(previous_text, streaming=False), streaming=False
+                )
             )
             if cur_m.startswith(prev_f) and len(cur_m) > len(prev_f):
                 return self._opt22d_filter_delta(
@@ -2275,7 +2410,9 @@ class Qwen3CoderToolParser(ToolParser):
         if cur_m.startswith(prev_m):
             delta_m = cur_m[len(prev_m):]
         else:
-            delta_m = _normalize_qwen3_tag_names(_mask_fenced_tags(delta_text))
+            delta_m = _normalize_qwen3_tag_names(
+                _mask_fenced_tags(_mask_example_tags(delta_text, streaming=True))
+            )
         # opt22d 第七轮：开启思考时，非 _STREAMING_TOOLS 的工具不在流式阶段产出，
         # 推迟到 finish 用完整文本解析。拦截点放在 impl 之前——impl 的状态机
         # 不被推进，因而不会与 opt23 的 partial streaming（_partial_*）状态错位。

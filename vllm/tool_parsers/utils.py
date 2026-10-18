@@ -758,6 +758,36 @@ def escape_tool_like_tags(text: str) -> str:
     )
 
 
+# [example 区间 2026-10-18] `example` 容器（`etool_call` = example tool call）。
+# 区间内是模型**展示给用户**的示例，必须原样呈现（用户会复制粘贴），
+# 既不转义、也不得被下游当成真实调用。未闭合区间延伸到文本末尾。
+EXAMPLE_SPAN_RE = _re.compile(
+    r"<example>.*?</example>|<etool_call>.*?</etool_call>"
+    r"|<example>.*$|<etool_call>.*$",
+    _re.S,
+)
+
+
+def escape_tool_like_tags_outside_examples(text: str) -> str:
+    """对 `<example>` / `<etool_call>` 区间**之外**的形似工具标签做展示转义。
+
+    serving 层统一收口用：区间内的裸标签是**示例正文**，必须原样下发；
+    区间外仍按原规则转义（防止下游 harness 把文档里的标签当真实调用执行）。
+    """
+    if not text:
+        return text
+    if "<example" not in text and "<etool_call" not in text:
+        return escape_tool_like_tags(text)
+    out: list[str] = []
+    last = 0
+    for m in EXAMPLE_SPAN_RE.finditer(text):
+        out.append(escape_tool_like_tags(text[last : m.start()]))
+        out.append(m.group(0))
+        last = m.end()
+    out.append(escape_tool_like_tags(text[last:]))
+    return "".join(out)
+
+
 # opt22d（L-E）：工具类标签名（含别名），用于判断“残缺前缀”是否还可能是工具标签
 _TOOL_TAG_NAMES = ("tool_call", "toolcall", "tool", "function", "parameter", "param")
 

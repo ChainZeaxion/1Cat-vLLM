@@ -8,6 +8,7 @@ from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
 from vllm.tool_parsers.utils import (
     escape_tool_like_tags,
+    escape_tool_like_tags_outside_examples,
     split_incomplete_tool_tag_tail,
 )
 
@@ -145,7 +146,8 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         if not text:
             return text
         head, self._esc_hold = split_incomplete_tool_tag_tail(self._esc_hold + text)
-        return escape_tool_like_tags(head)
+        # [example 区间 2026-10-18] 示例容器内原样，只转义区间外
+        return escape_tool_like_tags_outside_examples(head)
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
         """

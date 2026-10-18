@@ -32,6 +32,9 @@ _RELOAD_ORDER = (
     "vllm.tool_parsers.utils",
     "vllm.tool_parsers.qwen3coder_tool_parser",
     "vllm.tool_parsers.qwen3xml_tool_parser",
+    # [example 区间 2026-10-18] reasoning 文本也做区间转义，纳入热重载：
+    # 推理侧改动此前必须重启引擎（~5 分钟）才能验证。
+    "vllm.reasoning.qwen3_reasoning_parser",
     # [本地 2026-10-12] 纳入 openai chat_completion serving —— 收尾补发口径、
     # 参数越界/分歧守卫等修复都落在该模块**类的方法**上。reload 后由
     # api_router._refresh_serving_classes 把新方法覆盖到运行实例所属的旧类，

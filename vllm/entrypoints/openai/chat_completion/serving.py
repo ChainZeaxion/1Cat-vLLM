@@ -76,7 +76,10 @@ from vllm.reasoning import ReasoningParser
 from vllm.renderers import ChatParams
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
-from vllm.tool_parsers.utils import escape_tool_like_tags
+from vllm.tool_parsers.utils import (
+    escape_tool_like_tags,
+    escape_tool_like_tags_outside_examples,
+)
 from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
 
@@ -1520,7 +1523,8 @@ class OpenAIServingChat(OpenAIServing):
                 # 本处一并覆盖 Anthropic 协议——anthropic/serving.py:505 复用本
                 # generator，其 thinking block 取的正是这里产出的 message.reasoning。
                 if reasoning:
-                    reasoning = escape_tool_like_tags(reasoning)
+                    # [example 区间 2026-10-18] 示例容器内原样，只转义区间外
+                    reasoning = escape_tool_like_tags_outside_examples(reasoning)
             else:
                 reasoning = None
                 content = output.text
@@ -1716,7 +1720,11 @@ class OpenAIServingChat(OpenAIServing):
             # 该转义是幂等的（已转义的 &lt;... 不再匹配），故对"已由 parser 处理过"
             # 的分支重复施加无害，可安全地在此单点收口。
             if message.content:
-                message.content = escape_tool_like_tags(message.content)
+                # [example 区间 2026-10-18] `<example>`/`<etool_call>` 内是
+                # 模型展示的示例，必须原样下发；只转义区间外的形似标签。
+                message.content = escape_tool_like_tags_outside_examples(
+                    message.content
+                )
             # In OpenAI's API, when a tool is called, the finish_reason is:
             # "tool_calls" for "auto" or "required" tool calls,
             # and "stop" for named tool calls.
