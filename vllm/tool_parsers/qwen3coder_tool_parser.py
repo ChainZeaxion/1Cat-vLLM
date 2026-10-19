@@ -531,6 +531,35 @@ def _mask_fenced_tags(text: str, *, streaming: bool = True) -> str:
     )
 
 
+def _has_open_tool_tag_tail(text: str) -> bool:
+    """文本末尾是否还有一个「尚未闭合、仍可能长成标签」的 `<…` 片段。
+
+    仅用于 `_stream_forced_text` 决定是否扣留尾部：末尾是 `</example>` 这种
+    已闭合标签时不必延迟，末尾是 `<tool` 时才可能继续变化。
+    """
+    i = text.rfind("<")
+    if i == -1:
+        return False
+    return ">" not in text[i:]
+
+
+def _has_open_example_span(text: str) -> bool:
+    """[example 区间 2026-10-18] 是否还有**未闭合**的 `<example>`/`<etool_call>`。
+
+    流式下这类区间必须整块延迟下发（见 `_stream_forced_text`）：区间内逐字符
+    的展示形会随分片变化，先发出去的字符无法回改。
+    """
+    if not text or ("<example" not in text and "<etool_call" not in text):
+        return False
+    depth = 0
+    for m in _EX_TAG_SPAN_RE.finditer(text):
+        if m.group(0).startswith("</"):
+            depth = max(0, depth - 1)
+        else:
+            depth += 1
+    return depth > 0
+
+
 def _mask_example_tags(text: str, *, streaming: bool = True) -> str:
     """[example 区间 2026-10-18] 把 `<example>`/`<etool_call>` 区间内的尖括号
     换成**原样呈现**哨兵（``_EX_LT`` / ``_EX_GT``）。
@@ -556,10 +585,13 @@ def _mask_example_tags(text: str, *, streaming: bool = True) -> str:
         # 末尾「尚未长成完整 example 标签」的前缀先摘掉：否则 `<e`、`<ex` …
         # 会逐字符先发出去，等标签完整时整块再发一遍 ⇒ 重复（实测 `<example>`
         # 被发两次）。对任意 `<` 最多延迟一帧，代价可忽略。
+        # ⚠️ 只对**未闭合**的前缀生效：`tail` 已含 `>` 说明这是一个完整标签
+        # （如 `</example>`），若仍当"前缀"截断，会把整个已闭合区间从遮罩输入
+        # 里切掉 ⇒ 示例内容整块丢失（实测流式示例输出被截断在 `</too`）。
         cut = text.rfind("<")
         if cut != -1:
             tail = text[cut:]
-            if any(tag.startswith(tail) for tag in _EX_TAGS):
+            if ">" not in tail and any(tag.startswith(tail) for tag in _EX_TAGS):
                 text = text[:cut]
     if "<example" not in text and "<etool_call" not in text:
         return text
@@ -957,6 +989,27 @@ class Qwen3CoderToolParser(ToolParser):
         """
         # [example 区间 2026-10-18] 与非流式一致：先遮 example 再转义，
         # 否则 `<example>` 内的标签同样会被转成 `⟨'…'⟩`。
+        #
+        # ⚠️ 区间**未闭合**时必须整块延迟（`streaming=True` 语义），不能按
+        # 「未闭合延伸到末尾」直接遮罩后逐帧发：区间内逐字符的展示形会随分片
+        # 变化（`</too` 不转义 → `</tool_call>` 转义成 `⟨'…'⟩`），而尾部
+        # `_FORCED_TEXT_HOLD` 只有 32 字符窗口——区间比窗口长时，前半段已发出、
+        # 闭合后无法回改 ⇒ 实测正文被截断在 `</too`（verify：E1 之外的
+        # 「代码块展示样例」场景）。故非 EOS 帧先摘掉未闭合区间，EOS 帧再收口。
+        # 未闭合期间**什么都不发**（连区间前的正文也不发）：区间前的内容
+        # 一旦属于「公共前缀」就会先发出去，而区间闭合后整体展示形仍可能
+        # 因区间内转义而改变坐标 ⇒ 只能整体延迟到闭合。
+        #
+        # 同理，末尾**未闭合的标签片段**也必须整体延迟：第 1 帧只到 `\n\n<`
+        # 时，`<` 会先以原文发出；等到 `<example>` 完整后该区间被遮罩，
+        # 展示形在 `<` 处就分叉 ⇒ `stable` 恒等于已发长度，后续内容再也发不出去
+        # （实测客户端只收到 `\n\n<`）。故只要有未闭合区间或未闭合标签尾部，
+        # 本轮都不推进 `_forced_sent`；等它们补齐（通常在 1~2 帧内）再一次性下发。
+        if not is_eos and (
+            _has_open_example_span(current_text)
+            or _has_open_tool_tag_tail(_to_display(current_text))
+        ):
+            return None
         full = _to_display(_mask_example_tags(current_text, streaming=False))
         prev_full = self._forced_prev_full
         if prev_full:
@@ -970,10 +1023,14 @@ class Qwen3CoderToolParser(ToolParser):
         self._forced_prev_full = full
         # 已发内容不可回改（理论上不会回退，真回退时宁可少发）
         stable = max(stable, self._forced_sent)
+        # 尾部扣留只为等「可能还在长的标签」补全；标签已无未闭合前缀时无需扣留
+        # （实测最后一帧 `'>'` 到齐后正文已完整，若仍扣 32 字符且随后没有 EOS 帧，
+        # 剩余内容永远发不出去 ⇒ 客户端只收到 `\n\n<`）。
+        hold = self._FORCED_TEXT_HOLD if _has_open_tool_tag_tail(full) else 0
         if is_eos:
             limit = len(full)
         else:
-            limit = min(stable, len(full) - self._FORCED_TEXT_HOLD)
+            limit = min(stable, len(full) - hold)
         if limit <= self._forced_sent:
             return None
         emit = full[self._forced_sent:limit]
