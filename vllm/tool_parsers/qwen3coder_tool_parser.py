@@ -308,6 +308,15 @@ def _escape_non_linestart_tool_calls_impl(text: str, *, streaming: bool = True) 
                     wrapper = True
                     _seen_call = True
                     continue  # 双重条件满足 → 真实调用起点
+                # [2026-10-19] **JSON 形态**同样满足结构特征：模板 json 分支渲染为
+                # `<tool_call>\n{"name": …, "arguments": …}\n</tool_call>`（见
+                # chat_template-fix.jinja「_tool_format == 'json'」）。此前只认
+                # `<function=` ⇒ 真实 JSON 调用被当示例转义 ⇒ 解析不出调用。
+                # ⚠️ 不置 `wrapper`：那只用于让**其后**的裸 `<function=` 继承真实
+                # 调用身份；JSON 体里不会有该标签，置位反而会放行正文里的示例。
+                if rest.lstrip().startswith("{"):
+                    _seen_call = True
+                    continue  # 行首 + JSON 体 → 真实调用起点
                 wrapper = False
             else:
                 wrapper = False
@@ -536,6 +545,25 @@ def _mask_fenced_tags(text: str, *, streaming: bool = True) -> str:
     )
 
 
+_EXAMPLE_CONTAINER_RE = re.compile(
+    r"<example>.*?</example>|<etool_call>.*?</etool_call>"
+    r"|<example>.*$|<etool_call>.*$"
+    r"|^[ \t]*(?:`{3,}|~{3,})[^\n]*\n.*?(?:^[ \t]*(?:`{3,}|~{3,})[^\n]*|\Z)"
+    # 已遮罩形态（`<example>` 等已被换成哨兵，见 `_mask_example_tags`）
+    r"|\ue002example\ue003.*?(\ue002/example\ue003|\Z)"
+    r"|\ue002etool_call\ue003.*?(\ue002/etool_call\ue003|\Z)",
+    re.S | re.M,
+)
+
+
+def _strip_example_containers(text: str) -> str:
+    """剔除示例容器（`<example>`/`<etool_call>` + markdown 代码块）后的文本。
+
+    用于**格式判定**等「只看真实调用形态」的场合：容器内是示例，不参与判断。
+    """
+    return _EXAMPLE_CONTAINER_RE.sub("", text)
+
+
 def _has_open_tool_tag_tail(text: str) -> bool:
     """文本末尾是否还有一个「尚未闭合、仍可能长成标签」的 `<…` 片段。
 
@@ -628,7 +656,9 @@ def _mask_example_tags(text: str, *, streaming: bool = True) -> str:
             stack.append(m.start())
     if stack:  # 存在未闭合区间
         if streaming:
-            # 整块摘掉（不输出），等闭合那一帧一次性下发——保证前缀单调。
+            # 整块摘掉（不输出），等闭合那一帧一次性下发——保证前缀单调，
+            # 并让模型自发转义形 `⟨'…'⟩` 在闭合帧被**整体**还原（逐帧处理会
+            # 因 `⟨` 与 `⟨'` 拆帧而产生不同的遮罩结果）。
             # 嵌套在未闭合父区间内的已闭合子区间同样不输出。
             cut = stack[0]
             spans = [(s, e) for s, e in spans if e <= cut]
@@ -2142,6 +2172,9 @@ class Qwen3CoderToolParser(ToolParser):
         partial display: downstream agents must never observe malformed JSON
         arguments and then persist that broken call into the next turn.
         """
+        # [2026-10-19] 只看**示例容器之外**的文本：`<example>`/`<etool_call>`/
+        # markdown 代码块里的 JSON 样例形如真实调用，不剔除会被当原子增量下发。
+        current_text = _strip_example_containers(current_text)
         matches = list(self.tool_call_complete_regex.finditer(current_text))
         if self.json_tool_calls_streamed >= len(matches):
             return None
@@ -2236,7 +2269,15 @@ class Qwen3CoderToolParser(ToolParser):
 
     @staticmethod
     def _detect_tool_format(text: str) -> str:
-        """Auto-detect tool-call format from generated text."""
+        """Auto-detect tool-call format from generated text.
+
+        [2026-10-19] 检测前先剔除**示例容器**（`<example>`/`<etool_call>` +
+        markdown 代码块）：容器里的 JSON 样例（`{"name":…,"arguments":…}`）
+        与真实 JSON 调用**字节同形**，不剔除会被误判为 json 格式，进而让
+        JSON 解析分支把示例当真实调用、吞掉正文（实测代码块内 JSON 样例
+        只下发 42/90 字符）。
+        """
+        text = _strip_example_containers(text)
         if text.find("<function=") != -1:
             return "xml"
         if '"name"' in text and '"arguments"' in text:
@@ -2246,6 +2287,7 @@ class Qwen3CoderToolParser(ToolParser):
     @staticmethod
     def _detect_tool_format_if_present(text: str) -> str | None:
         """Detect an explicit tool-call format; None when absent."""
+        text = _strip_example_containers(text)
         if text.find("<function=") != -1:
             return "xml"
         if '"name"' in text and '"arguments"' in text:
@@ -2497,6 +2539,20 @@ class Qwen3CoderToolParser(ToolParser):
             delta_m = _normalize_qwen3_tag_names(
                 _mask_fenced_tags(_mask_example_tags(delta_text, streaming=True))
             )
+        # [2026-10-19] 示例区间**闭合帧**：`mask(prev)` 因区间未闭合而只到容器
+        # 起点，`mask(cur)` 则是整段遮罩 ⇒ 二者不再有前缀关系。此时**不能**把
+        # 遮罩文本整段当新增内容投给解析器——区间内是示例（含 JSON 样例），
+        # 投入会被当成真实调用并吞掉正文（实测 example 内 JSON：流式 0 字符
+        # 却多出 Write 调用）。
+        # 只在本帧的全部新增内容都来自示例区间时拦截：把区间外的新增部分
+        # （`cur_m` 去掉容器后的尾巴）与 `prev_m` 比较，无新内容即跳过本帧。
+        if prev_m and not cur_m.startswith(prev_m):
+            _prev_outer = _strip_example_containers(prev_m)
+            _cur_outer = _strip_example_containers(cur_m)
+            if _cur_outer == _prev_outer:
+                self._opt22e_last_text = current_text
+                self._opt22e_last_request = request
+                return None
         # opt22d 第七轮：开启思考时，非 _STREAMING_TOOLS 的工具不在流式阶段产出，
         # 推迟到 finish 用完整文本解析。拦截点放在 impl 之前——impl 的状态机
         # 不被推进，因而不会与 opt23 的 partial streaming（_partial_*）状态错位。
@@ -2754,13 +2810,18 @@ class Qwen3CoderToolParser(ToolParser):
             # a JSON-looking substring inside XML content could trigger).
             # 优化 C: 从已处理 JSON 工具调用的结束位置之后搜索，
             # 避免重新检测到同一个已完成的工具调用。
+            # [2026-10-19] 探测前剔除**示例容器**（`<example>`/`<etool_call>` +
+            # markdown 代码块）：容器里的 JSON 样例与真实 JSON 调用字节同形，
+            # 不剔除会让示例劫持正文——实测代码块内 JSON 样例被吞成
+            # `{"name": "Write", "arguments` + 尾部围栏（42/90 字符）。
+            _strip_text = _strip_example_containers(current_text)
             _json_search = max(self._json_processed_end, 0)
-            _json_name = current_text.find('"name"', _json_search)
-            _json_args = current_text.find('"arguments"', _json_search)
+            _json_name = _strip_text.find('"name"', _json_search)
+            _json_args = _strip_text.find('"arguments"', _json_search)
             if (_json_name != -1
                     and _json_args != -1
                     and _json_name < _json_args
-                    and current_text.find(self.tool_call_prefix) == -1):
+                    and _strip_text.find(self.tool_call_prefix) == -1):
                 self._json_tool_active = True
                 self.is_tool_call_started = True
                 return None  # routing takes effect on next call
