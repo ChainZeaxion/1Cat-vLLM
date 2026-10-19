@@ -488,17 +488,22 @@ def _escape_fenced_tags(text: str, *, streaming: bool = True) -> str:
     文本末尾、与真收尾**字节同形**（XML 语义上也确实成立），无法区分 ⇒ 此时
     照常转义（内容继续按参数体处理），待 EOS 判据完整后再放行真收尾。
     """
+    # [2026-10-19] 代码块内的工具调用样例改为**原样输出**（用户定稿）：
+    # 代码块是模型展示写法的标准容器，块内标签属于示例而非可执行调用。
+    # 处理方式与 `<example>` 区间一致——换成「原样呈现」哨兵，既绕开所有
+    # 转义/结构扫描（不会被解析成真实调用），又由 `_to_display` 还原原文。
+    # 真调用的收尾三元组仍按原逻辑豁免（流式/EOS 判据不变）。
     if not text:
         return text
     for start, end in reversed(_fenced_ranges(text)):
         seg = text[start:end]
         cut = None if streaming else _trailing_close_start(seg)
         if cut is None:
-            text = text[:start] + _escape_tool_like_tags(seg) + text[end:]
+            text = text[:start] + _mask_verbatim_span(seg) + text[end:]
         else:
             text = (
                 text[:start]
-                + _escape_tool_like_tags(seg[:cut])
+                + _mask_verbatim_span(seg[:cut])
                 + seg[cut:]
                 + text[end:]
             )
@@ -558,6 +563,22 @@ def _has_open_example_span(text: str) -> bool:
         else:
             depth += 1
     return depth > 0
+
+
+def _mask_verbatim_span(seg: str) -> str:
+    """把一个「**示例区间**」的尖括号换成原样呈现哨兵。
+
+    用于 `<example>`/`<etool_call>` 区间**和** markdown 代码块：两者都是模型
+    展示写法的容器，内容必须原样呈现，且不得进入工具状态机。
+
+    - 等长替换（1→1）⇒ 流式前缀关系与 partial 偏移都不错位；
+    - 模型自发写的转义形 `⟨'…'⟩` 先还原成 `<…>`（等长 2→2，引号留待输出阶段丢弃），
+      避免已经展示成 `⟨'…'⟩` 的内容被二次转义。
+    """
+    seg = seg.replace("⟨'", _EX_ESC_QUOTE + _EX_LT).replace(
+        "'⟩", _EX_GT + _EX_ESC_CLOSE
+    )
+    return seg.replace("<", _EX_LT).replace(">", _EX_GT)
 
 
 def _mask_example_tags(text: str, *, streaming: bool = True) -> str:
@@ -627,13 +648,7 @@ def _mask_example_tags(text: str, *, streaming: bool = True) -> str:
     last = 0
     for s, e in merged:
         out.append(text[last:s])
-        seg = text[s:e]
-        # 模型自发写的转义形 `⟨'…'⟩` 还原成 `<…>`（等长 2→2，引号留待输出阶段丢弃）
-        seg = seg.replace("⟨'", _EX_ESC_QUOTE + _EX_LT).replace(
-            "'⟩", _EX_GT + _EX_ESC_CLOSE
-        )
-        seg = seg.replace("<", _EX_LT).replace(">", _EX_GT)
-        out.append(seg)
+        out.append(_mask_verbatim_span(text[s:e]))
         last = e
     out.append(text[last:])
     return "".join(out)
@@ -1010,7 +1025,13 @@ class Qwen3CoderToolParser(ToolParser):
             or _has_open_tool_tag_tail(_to_display(current_text))
         ):
             return None
-        full = _to_display(_mask_example_tags(current_text, streaming=False))
+        # 代码块同样视为示例区间（块内原样输出），与非流式 `extract_tool_calls`
+        # 的遮罩顺序一致：先 example、再围栏。
+        full = _to_display(
+            _escape_fenced_tags(
+                _mask_example_tags(current_text, streaming=False), streaming=False
+            )
+        )
         prev_full = self._forced_prev_full
         if prev_full:
             n = 0
@@ -2280,7 +2301,13 @@ class Qwen3CoderToolParser(ToolParser):
             if not kept:
                 # [example 区间 2026-10-18] 整轮降级时同样先遮 example：
                 # 区间内的示例必须原样呈现，不能被 `⟨'…'⟩` 转义。
-                content = _to_display(_mask_example_tags(model_output, streaming=False))
+                # [2026-10-19] 代码块也是示例容器，同样原样呈现（顺序与流式一致）。
+                content = _to_display(
+                    _escape_fenced_tags(
+                        _mask_example_tags(model_output, streaming=False),
+                        streaming=False,
+                    )
+                )
             self.prev_tool_call_arr = [
                 {"name": tc.function.name, "arguments": tc.function.arguments}
                 for tc in kept

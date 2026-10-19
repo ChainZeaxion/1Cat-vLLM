@@ -768,22 +768,57 @@ EXAMPLE_SPAN_RE = _re.compile(
 )
 
 
-def escape_tool_like_tags_outside_examples(text: str) -> str:
-    """对 `<example>` / `<etool_call>` 区间**之外**的形似工具标签做展示转义。
+# markdown 代码围栏的**行首**标记（``` 或 ~~~，允许缩进）。
+_FENCE_LINE_RE = _re.compile(r"(?m)^[ \t]*(?:`{3,}|~{3,})[^\n]*")
 
-    serving 层统一收口用：区间内的裸标签是**示例正文**，必须原样下发；
+
+def _verbatim_spans(text: str) -> list[tuple[int, int]]:
+    """示例区间：`<example>`/`<etool_call>` 块 + markdown 代码块，按位置合并。
+
+    未闭合的一律延伸到文本末尾（此处是**展示收口**，内容已完整，不需延迟）。
+    """
+    raw: list[tuple[int, int]] = [
+        (m.start(), m.end()) for m in EXAMPLE_SPAN_RE.finditer(text)
+    ]
+    marks = [(m.start(), m.end()) for m in _FENCE_LINE_RE.finditer(text)]
+    for i in range(0, len(marks) - 1, 2):
+        raw.append((marks[i][0], marks[i + 1][1]))
+    if len(marks) % 2:
+        raw.append((marks[-1][0], len(text)))
+    raw.sort()
+    merged: list[tuple[int, int]] = []
+    for s, e in raw:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def escape_tool_like_tags_outside_examples(text: str) -> str:
+    """对示例区间**之外**的形似工具标签做展示转义。
+
+    serving 层统一收口用：示例区间内的裸标签是**示例正文**，必须原样下发；
     区间外仍按原规则转义（防止下游 harness 把文档里的标签当真实调用执行）。
+
+    示例区间 = `<example>` / `<etool_call>` **以及 markdown 代码块**（2026-10-19）：
+    代码块是模型展示工具调用写法的标准容器，块内标签属于示例而非可执行调用。
     """
     if not text:
         return text
-    if "<example" not in text and "<etool_call" not in text:
+    if (
+        "<example" not in text
+        and "<etool_call" not in text
+        and "```" not in text
+        and "~~~" not in text
+    ):
         return escape_tool_like_tags(text)
     out: list[str] = []
     last = 0
-    for m in EXAMPLE_SPAN_RE.finditer(text):
-        out.append(escape_tool_like_tags(text[last : m.start()]))
-        out.append(m.group(0))
-        last = m.end()
+    for start, end in _verbatim_spans(text):
+        out.append(escape_tool_like_tags(text[last:start]))
+        out.append(text[start:end])
+        last = end
     out.append(escape_tool_like_tags(text[last:]))
     return "".join(out)
 
