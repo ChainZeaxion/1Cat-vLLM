@@ -127,6 +127,56 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _merge_double_think_close(reasoning, content, reasoning_parser):
+    """[2026-10-20] 把**第二个 `</think>`** 之前的分析段落并回 reasoning。
+
+    成因：模板在开思考时预填「好的，」（`思考首词必须中文` 钩子），模型有时
+    把它当成「已想过一句」⇒ 立刻闭合思考块，在块外继续写完整分析，最后再补
+    一个 `</think>` 才发调用。实测 T=1 发生率 4/40 = 10%，集中在「先分析再执行」
+    的提示词上。
+
+    修前危害：第二次 `</think>` 之前的整段分析被当作 **content** 下发给用户，
+    末尾还带着字面的 `</think>` 标签，而它本质是思考内容。
+
+    判据只用结构不变量（不猜语义）：`content` 里若**再次出现** `</think>`，
+    则第二次闭合之前的内容全部是思考 ⇒ 并回 reasoning 并丢弃多余闭合标签；
+    第二次闭合之后若有内容，那才是真 content。
+    """
+    if content is None:
+        return reasoning, content
+    end_token = getattr(reasoning_parser, "end_token", None) or "</think>"
+    if end_token not in content:
+        return reasoning, content
+    more_reasoning, _, real_content = content.partition(end_token)
+    merged = (reasoning or "") + more_reasoning
+    return merged or None, real_content or None
+
+
+_THINK_END_TOKEN = "</think>"
+
+
+def _fix_stream_double_think(delta_message):
+    """[2026-10-20] 流式帧里的**第二个 `</think>`**：并回 reasoning，丢弃标签。
+
+    成因见 `_merge_double_think_close`（模板预填「好的，」使模型提前闭合）。
+    流式下第二次闭合会落在 content 帧里、以字面形式下发给用户，
+    实测并发 16 路中 7 路出现，且多在该路倒数几帧。
+
+    ⚠️ 只处理**本帧内**出现 `</think>` 的情况：跨帧的标签残片由
+    reasoning parser 的暂存逻辑负责，本函数不持有跨帧状态。
+    """
+    if delta_message is None:
+        return delta_message
+    content = getattr(delta_message, "content", None)
+    if not content or _THINK_END_TOKEN not in content:
+        return delta_message
+    head, _, tail = content.partition(_THINK_END_TOKEN)
+    prev_reasoning = getattr(delta_message, "reasoning", None) or ""
+    delta_message.reasoning = (prev_reasoning + head) or None
+    delta_message.content = tail or None
+    return delta_message
+
+
 def _sx_skip_tool_parser_without_tools() -> bool:
     """SX_OPT_SKIP_TOOL_PARSER_WITHOUT_TOOLS (default "1"; "0" = old behaviour).
 
@@ -338,6 +388,26 @@ class OpenAIServingChat(OpenAIServing):
         _clean = sanitize_pseudo_tool_calls(request.messages)
         if _clean is not request.messages:
             request = request.model_copy(update={"messages": _clean})
+
+        # [2026-10-20] `tool_choice="none"` ⇒ 渲染时**不把 tools 交给模板**。
+        #
+        # 动机（实测）：模型完全看不到 `tool_choice`——`auto` 与 `none` 下生成的
+        # token_ids 前 12 位**逐位相同**（同为 `[760, 1156, 6587, …]`，总长同为 50）。
+        # 模型只会照模板教的格式调用；`none` 目前全靠引擎**事后**把调用体转义成
+        # `⟨'toolcall'⟩⟨'function=Bash'⟩…` 下发，结果是既不是调用、也不是回答的垃圾。
+        #
+        # 改为从源头不给工具：实测「完全不传 tools」时，同一提示词模型会给出
+        # ```bash ls /tmp``` 这种**有用的命令示例**，而非调用体。
+        #
+        # **双重保险**：
+        #   ① 官方开关 `--exclude-tools-when-tool-choice-none`（cli_args.py:114）
+        #      已在渲染层接线（`serve/render/serving.py:228`）。开启后同样是
+        #      把 `tool_dicts` 置 None，**不依赖**这段代码。
+        #   ② 本段是**请求侧兜底**：不读启动参数，引擎换部署/忘开开关时仍成立，
+        #      保证 `tool_choice="none"` 的语义不会因启动配置退化。
+        # 两层语义相同，重复执行幂等（`tools` 已为 None 时条件不成立）。
+        if getattr(request, "tool_choice", None) == "none" and request.tools:
+            request = request.model_copy(update={"tools": None})
         return await self.openai_serving_render.render_chat(request)
 
     async def create_chat_completion(
@@ -876,12 +946,37 @@ class OpenAIServingChat(OpenAIServing):
                             tools_streamed[i] = True
 
                     elif parser is not None:
+                        # [2026-10-20] 把「思考域已结束」这一**权威事实**下发
+                        # 给 tool parser。动机：qwen3coder 的
+                        # `_should_defer_parsing` 过去只看「工具是否在流式白名单
+                        # 里」——思考开启时会把 Bash / Grep 等推出到 finish，首
+                        # 工具帧 = 整轮生成时间。推迟的原始动机是「思考域不参与
+                        # 工具解析」，思考域结束后动机即消失。G29/G27 的模板把
+                        # `<think>` 放在 prompt 里、生成侧从不输出 `</think>`
+                        # ⇒ 文本层判据永远不成立，只有协调器的状态可靠。
                         delta_message = parser.parse_delta(
                             delta_text=delta_text,
                             delta_token_ids=as_list(output.token_ids),
                             request=request,
                             prompt_token_ids=res.prompt_token_ids,
                         )
+                        # 必须在 parse_delta **之后**取：`reasoning_ended` 正是在
+                        # parse_delta 内部由 `is_reasoning_end_streaming` 置位的。
+                        _coord_state = getattr(parser, "_stream_state", None)
+                        if (
+                            getattr(_coord_state, "reasoning_ended", False)
+                            and tool_parser is not None
+                            and hasattr(tool_parser, "note_thinking_ended")
+                        ):
+                            tool_parser.note_thinking_ended()
+                        # [2026-10-20] 流式侧的双 `</think>` 还原。
+                        # 非流式在 `chat_completion_full_generator` 里已接
+                        # `_merge_double_think_close()`；流式此前漏网 —— 实测并发
+                        # 16 路中 7 路在 content 帧里出现字面 `</think>`（多在该路
+                        # 的倒数几帧），即模型第二个闭合标签直接下发给用户。
+                        # 处理：content 帧出现 `</think>` 时把该标签之前的部分并到
+                        # reasoning，标签本身丢弃；之后若还有内容才是真 content。
+                        delta_message = _fix_stream_double_think(delta_message)
                         if delta_message and delta_message.tool_calls:
                             tools_streamed[i] = True
                     # handle streaming just a content delta (no parsers)
@@ -1555,6 +1650,9 @@ class OpenAIServingChat(OpenAIServing):
                 # tool calls are extracted exclusively from the content.
                 reasoning, content = reasoning_parser.extract_reasoning(
                     output.text, request=request
+                )
+                reasoning, content = _merge_double_think_close(
+                    reasoning, content, reasoning_parser
                 )
                 if not request.include_reasoning:
                     reasoning = None

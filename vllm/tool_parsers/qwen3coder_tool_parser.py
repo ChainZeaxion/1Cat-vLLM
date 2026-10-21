@@ -123,6 +123,10 @@ _EX_TAGS = ("<example>", "</example>", "<etool_call>", "</etool_call>")
 # 要求右尖括号：分片中的 <function=Wri 不算已确名的工具，避免误判。
 _FN_TAG_RE = re.compile(r"<function=([A-Za-z0-9_.\-]+)>")
 
+# [2026-10-20] 思考域结束标记。Qwen3.5+ 的模板把 `<think>` 放在 prompt 里，
+# 生成侧只会出现 `</think>`；两种风格都用这一个判据即可。
+_THINK_CLOSE = "</think>"
+
 # opt22d 第八轮（L-D for coder）：裸标签的行首约束。
 # 同时匹配 <tool_call> 与 <function=（`>?` 兼容分片中的未闭合形式；
 # 闭合与否都要整块纳入匹配，否则 `>` 会被留在原文里、产出 `⟨'function=X>` 畸形）。
@@ -140,10 +144,21 @@ _LD_TAG_RE = re.compile(r"<tool_call>|<toolcall>|<function=[A-Za-z0-9_.\-]*>?")
 # `\n</function>\n` 被误判为正文 ⇒ 同轮多调用被误伤）。
 _STRUCT_TAG_RE = re.compile(r"</?(?:function|tool_?call|parameter)\b[^<>]*>")
 
+# [2026-10-20] **完整调用块**（`<tool_call>…</tool_call>`）同样是结构而非正文。
+# 为何需要：`_has_toplevel_prose` 用 `_strip_struct_tags` 剥标签后看剩余文本是否为
+# 正文，但它只剥**标签本身**、不剥标签之间的**调用体** ⇒ 前一个调用的
+# `{"name": …}` 被当成正文 ⇒ 置位 `_seen_prose` ⇒ 同轮后续真实调用被 L-B 转义，
+# 丢失真实调用（实测：JSON(W)+JSON(Bash) 只出 Write；JSON(W)+XML(Bash) 同样）。
+# 判据只认**成对闭合**的块：未闭合的 `<tool_call>` 后面的内容仍可能是正文，
+# 不能整段吞掉。
+_CALL_BLOCK_RE = re.compile(
+    r"<tool_?call>.*?</tool_?call>", re.S
+)
+
 
 def _strip_struct_tags(text: str) -> str:
-    """剔除结构标签，仅保留可能的正文。"""
-    return _STRUCT_TAG_RE.sub("", text)
+    """剔除结构标签与**完整调用块**，仅保留可能的正文。"""
+    return _STRUCT_TAG_RE.sub("", _CALL_BLOCK_RE.sub("", text))
 
 
 def _has_toplevel_prose(seg: str, depth: int) -> bool:
@@ -564,6 +579,61 @@ def _strip_example_containers(text: str) -> str:
     return _EXAMPLE_CONTAINER_RE.sub("", text)
 
 
+# [2026-10-20] 零参 JSON 调用体：`{"name": "ping"}` / `{"name":"ping", …}` 的前半段。
+# 旧的格式判定要求 `"name"` 与 `"arguments"` **同时**出现，零参调用（无 arguments
+# 键）因此被判成 xml，非流式走转义路径后把调用当正文下发（实测）。
+_JSON_CALL_HEAD_RE = re.compile(r'\{\s*"name"\s*:\s*"([^"\\]*)"')
+
+
+def _has_json_call_body(text: str) -> bool:
+    """文本里是否出现 JSON 工具调用体（含**零参**形态）。
+
+    只有带 `"arguments"` 的旧判据在没有它时把零参调用误判成 xml；这里把
+    「`{"name": "<非空函数名>"` 的紧邻起始」也算作 JSON 调用体。
+    """
+    if '"name"' in text and '"arguments"' in text:
+        return True
+    return any(m.group(1) for m in _JSON_CALL_HEAD_RE.finditer(text))
+
+
+# [2026-10-20] 行内码 span：单反引号包裹（`` `…` ``）。三连反引号围栏由
+# `_fenced_ranges` 负责（行首语义），这里只补 CommonMark 的行内码。
+_INLINE_TICK_RE = re.compile(r"`([^`\n]+)`")
+
+
+def _inline_code_spans(text: str) -> list[tuple[int, int]]:
+    """返回行内码（单反引号对）的**闭区间**列表，右端不含收尾反引号。"""
+    return [(m.start(1), m.end(1)) for m in _INLINE_TICK_RE.finditer(text)]
+
+
+def _span_containing(spans: list[tuple[int, int]], lo: int, hi: int) -> bool:
+    """[lo, hi) 是否被某个 span **完整**包含。"""
+    return any(s <= lo and hi <= e for s, e in spans)
+
+
+def _in_inline_code_prefix(text: str, pos: int) -> bool:
+    """流式判定：pos 之前是否有一个**尚未闭合**的行内码反引号。
+
+    流式逐帧时行内码的收尾反引号往往还没生成，`_inline_code_spans` 拿不到
+    完整 span ⇒ 用「上一个反引号在 pos 之前且其后没有收尾」判为仍在行内码内。
+    按 CommonMark，单反引号只在**同一行**内成对，这里同样只在本行内配对。
+    """
+    line_start = text.rfind("\n", 0, pos) + 1
+    ticks = text.count("`", line_start, pos)
+    # 三连反引号（围栏）不参与行内码配对
+    return (ticks - 3 * text.count("```", line_start, pos)) % 2 == 1
+
+
+def _in_table_row(text: str, pos: int) -> bool:
+    """pos 是否落在 markdown 表格行内（行首 `|`）。
+
+    ⚠️ 流式下该行收尾的 `|` 往往还没生成，故**只要求行首**有 `|`；这也是
+    非流式同口径（L-B 只看行首）——两边判据一致才能保证流式/非流式等价。
+    """
+    start = text.rfind("\n", 0, pos) + 1
+    return text[start:].lstrip(" \t").startswith("|")
+
+
 def _has_open_tool_tag_tail(text: str) -> bool:
     """文本末尾是否还有一个「尚未闭合、仍可能长成标签」的 `<…` 片段。
 
@@ -915,11 +985,33 @@ class Qwen3CoderToolParser(ToolParser):
         之外的工具时返回 True。函数名尚未闭合（仍处分片）时返回 False——
         此时 impl 不会产出工具增量，不推迟无副作用；且可避免 Write/Edit
         因分片被误判为“非白名单”而丢掉流式增量显示。
+
+        [2026-10-20] 退回条件：**思考域一旦闭合，就不再推迟**。
+        第七轮推迟解析的动机是「思考域不参与工具解析」——避免模型在 thinking
+        里复述的标签被当成真调用。但 `</think>` 之后已经是正文，此动机不再
+        成立；无条件推迟会让 Bash/Grep 等非白名单工具在**整个流式过程**都
+        不出增量（实测：`<function=Bash>` 首工具帧为 None，只能等 finish
+        一次性吐出），首帧延迟 = 整轮生成时间。
+        故 `</think>` 已出现 ⇒ 直接返回 False，走正常流式增量路径。
         """
         names = set(_FN_TAG_RE.findall(text))
         if not names:
             return False
+        if _THINK_CLOSE in text or self._thinking_ended:
+            # 思考域已结束：之后的标签属正文，按普通调用流式解析。
+            return False
         return bool(names - self._STREAMING_TOOLS)
+
+    def note_thinking_ended(self) -> None:
+        """由 ``ParseCoordinator.parse_delta`` 在思考域结束时回调。
+
+        [2026-10-20] 为什么需要它：G29/G27 的模板把 `<think>` 放在 **prompt**
+        里（`chat_template.jinja` 的 `{{- '<think>\\n' }}`），生成侧**从不出现**
+        `</think>` ⇒ `_should_defer_parsing` 里基于文本的判断永远不成立，Bash /
+        Grep 等非白名单工具在思考开启时会被推迟到 finish，首工具帧 = 整轮生成
+        时间。组合 parser 的 `state.reasoning_ended` 是权威事实，经此回调下发。
+        """
+        self._thinking_ended = True
 
     def _opt22d_filter_delta(self, delta):
         """opt22d 流式过滤：吞掉未注册调用的结构化增量；内容里的形似标签转义。"""
@@ -970,6 +1062,8 @@ class Qwen3CoderToolParser(ToolParser):
         self.accumulated_params = {}
         self.streaming_request = None
         self.json_tool_calls_streamed = 0
+        # [2026-10-20] 思考域是否已结束（由 ParseCoordinator 回调置位）。
+        self._thinking_ended: bool = False
         # opt23: partial streaming for long string params (write/edit content)
         self._partial_emit_offset: int = 0
         self._partial_param_start: int = -1
@@ -2183,6 +2277,15 @@ class Qwen3CoderToolParser(ToolParser):
         first_new_match = None
         for match_index in range(self.json_tool_calls_streamed, len(matches)):
             match = matches[match_index]
+            # [2026-10-20] 展示形态守卫：行内码 / 表格单元格里的 JSON 是**示例**，
+            # 非流式已被 L-B 转义救下，流式此处若不拦就会产出真调用（实测
+            # 表格内 `| {"name":…} |` 触发 Write 调用、正文只剩 39B）。
+            # 判据用「完整包含」——真实调用前若有未闭合反引号不会被误判。
+            if _span_containing(_inline_code_spans(current_text), match.start(), match.end()) \
+                    or _in_table_row(current_text, match.start()):
+                # 只跳过、不推进计数：末尾的 `= len(matches)` 统一收口，
+                # 中途改计数会让循环索引错位、漏掉后续真实调用。
+                continue
             parsed = self._parse_json_function_call(match.group(1))
             if parsed is None:
                 continue
@@ -2258,7 +2361,9 @@ class Qwen3CoderToolParser(ToolParser):
             if _name is None:
                 continue
             if not isinstance(_args, str):
-                _args = json.dumps(_args, ensure_ascii=False)
+                # [2026-10-20] 零参调用没有 `arguments` 键 ⇒ 缺省当 `{}`，
+                # 否则会下发字符串 "null"（下游 json.loads 得到 None）。
+                _args = json.dumps({} if _args is None else _args, ensure_ascii=False)
             tcs.append(
                 ToolCall(
                     type="function",
@@ -2280,7 +2385,7 @@ class Qwen3CoderToolParser(ToolParser):
         text = _strip_example_containers(text)
         if text.find("<function=") != -1:
             return "xml"
-        if '"name"' in text and '"arguments"' in text:
+        if _has_json_call_body(text):
             return "json"
         return "xml"
 
@@ -2290,7 +2395,7 @@ class Qwen3CoderToolParser(ToolParser):
         text = _strip_example_containers(text)
         if text.find("<function=") != -1:
             return "xml"
-        if '"name"' in text and '"arguments"' in text:
+        if _has_json_call_body(text):
             return "json"
         return None
 
@@ -2818,6 +2923,17 @@ class Qwen3CoderToolParser(ToolParser):
             _json_search = max(self._json_processed_end, 0)
             _json_name = _strip_text.find('"name"', _json_search)
             _json_args = _strip_text.find('"arguments"', _json_search)
+            # [2026-10-20] 展示形态守卫：行内码 / 表格单元格里的 JSON 是**示例**。
+            # 非流式由 L-B（非行首标签转义）救下，流式若不在此处拦，Path C 会把
+            # 它当真实调用激活（实测表格内 `| {"name":…} |` 产出 Write 调用、
+            # 正文只剩 39B）。判据用「完整包含」——真实调用前若出现未闭合
+            # 反引号不会被误拦。
+            if _json_name != -1 and (
+                _span_containing(_inline_code_spans(_strip_text), _json_name, len(_strip_text))
+                or _in_inline_code_prefix(_strip_text, _json_name)
+                or _in_table_row(_strip_text, _json_name)
+            ):
+                _json_name = -1
             if (_json_name != -1
                     and _json_args != -1
                     and _json_name < _json_args
