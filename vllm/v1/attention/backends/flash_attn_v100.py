@@ -535,7 +535,8 @@ _paged_kv_utils = None
 # driven by the served model's mamba state size, so the same --max-model-len
 # yields different pages for different models (1728 vs 864 both at 233000), and
 # the same model yields different pages for fp16 vs fp8 (448 vs 864/1728).
-#   fp16 / auto -> unquantized interleaved layout   (448 observed locally)
+#   fp16 / auto -> unquantized interleaved layout   (448 与 1024 observed locally;
+#                                                    1024 = block_size 1024 的部署)
 #   fp8         -> 1-byte packed layout             (864 and 1728 observed; the
 #                                                    aligned common page is a
 #                                                    fixed byte budget and fp8
@@ -548,7 +549,12 @@ _paged_kv_utils = None
 # NOTE: only fp16 / fp8_e5m2 consult this set.  E4M3 is deliberately excluded --
 # it must use the repaired FP32-partial route instead (see the kv_cache_dtype
 # guard in the grouped-verifier gate and its comment).
-_DEFAULT_GROUPED_VERIFY_FP16_PAGES = (448,)
+# [2026-10-25] 加入生产 page=1024：本机 block_size=1024 时 paged KV 页宽就是
+# 1024（gate 日志 k=(1892, 1024, 1, 256)），原先只在白名单里的 448 是另一套
+# 配置观测值，导致 fp16 KV 下 grouped verify 恒被拒、退回 per-request loop。
+# 算子经张量 stride 访问分页 KV（grouped_verify_paged_fwd），page 宽度不进入
+# 内核逻辑，native 侧无页宽硬校验，故只需在此放行。
+_DEFAULT_GROUPED_VERIFY_FP16_PAGES = (448, 1024)
 _DEFAULT_GROUPED_VERIFY_FP8_PAGES = (864, 896, 1648, 1728, 3296, 3456)
 _GROUPED_VERIFY_PAGES_CACHE: dict[tuple[int, ...], tuple[int, ...]] = {}
 

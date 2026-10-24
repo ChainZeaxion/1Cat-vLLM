@@ -4641,8 +4641,15 @@ at::Tensor flash_attention_grouped_verify_paged(
   TORCH_CHECK(partial_out.is_cuda() && partial_lse.is_cuda(),
               "grouped verify workspaces must be CUDA tensors");
   TORCH_CHECK(q.dtype() == torch::kFloat16, "grouped verify q must be fp16");
-  TORCH_CHECK(kv_cache_dtype == "fp8_e5m2" || kv_cache_dtype == "fp8_e4m3",
-              "grouped verify requires E5M2 or E4M3 KV");
+  // [2026-10-25] FP16 KV 放行。内核侧早已支持 KV_CACHE_DTYPE_FP16
+  // （load_xqa_tc_kv_vector 的 FP16 分支直接 __ldg，无需 fp8 转换），
+  // 此前只是 host 侧白名单与存储类型检查把 fp16 挡住，导致 fp16 KV 部署
+  // 下 grouped verifier 恒被拒、退回 per-request loop。
+  const bool fp16_kv = kv_cache_dtype == "auto" || kv_cache_dtype == "float16" ||
+                       kv_cache_dtype == "fp16";
+  TORCH_CHECK(fp16_kv || kv_cache_dtype == "fp8_e5m2" ||
+                  kv_cache_dtype == "fp8_e4m3",
+              "grouped verify requires FP16, E5M2 or E4M3 KV");
   TORCH_CHECK(kv_cache_dtype != "fp8_e4m3" || (q.size(0) == 8 && one_pass),
               "E4M3 grouped verify requires q=8 and one_pass=true");
   TORCH_CHECK(kv_cache_dtype != "fp8_e4m3" ||
@@ -4650,8 +4657,12 @@ at::Tensor flash_attention_grouped_verify_paged(
                    v_cache.stride(0) % 16 == 0 && v_cache.stride(1) % 16 == 0),
               "E4M3 grouped verify requires 16-byte-aligned KV strides");
   TORCH_CHECK(
-      k_cache.dtype() == torch::kUInt8 && v_cache.dtype() == torch::kUInt8,
-      "grouped verify FP8 cache must use uint8 storage");
+      fp16_kv ? (k_cache.dtype() == torch::kFloat16 &&
+                 v_cache.dtype() == torch::kFloat16)
+              : (k_cache.dtype() == torch::kUInt8 &&
+                 v_cache.dtype() == torch::kUInt8),
+      fp16_kv ? "grouped verify FP16 cache must use float16 storage"
+              : "grouped verify FP8 cache must use uint8 storage");
   TORCH_CHECK(
       block_table.dtype() == torch::kInt32 && seq_lens.dtype() == torch::kInt32,
       "grouped verify block_table/seq_lens must be int32");
@@ -4753,6 +4764,11 @@ at::Tensor flash_attention_grouped_verify_paged(
                                       SINGLE_QUERY, CONTIGUOUS_LAYOUT,         \
                                       STAGE_PAGE_IDS, KV_TYPE)                 \
   do {                                                                         \
+    /* [2026-10-25] FP16 KV 是未量化存储，QK 只用 softmax_scale；FP8 需要再乘 */ \
+    /* 标定 k_scale。与 load_kv_cache_float_unscaled 的 FP16 分支语义一致。   */ \
+    const float k_qk_scale =                                                   \
+        (KV_TYPE == flash_v100::KV_CACHE_DTYPE_FP16) ? softmax_scale           \
+                                                     : softmax_scale * k_scale;\
     auto partial_kernel =                                                      \
         (void*)flash_attention_grouped_verify_e5m2_partial_kernel<             \
             MAX_QUERY_TOKENS, TWO_PASS, PAGE_SIZE, SINGLE_QUERY,               \
@@ -4780,12 +4796,15 @@ at::Tensor flash_attention_grouped_verify_paged(
             static_cast<int>(block_table.size(1)),                             \
             static_cast<int>(k_cache.size(1)), k_cache.stride(0),              \
             k_cache.stride(1), k_cache.stride(2), v_cache.stride(0),           \
-            v_cache.stride(1), v_cache.stride(2), softmax_scale * k_scale,     \
-            v_scale, nullptr, static_cast<int>(batch_size));                   \
+            v_cache.stride(1), v_cache.stride(2), k_qk_scale,                  \
+            (KV_TYPE == flash_v100::KV_CACHE_DTYPE_FP16) ? 1.0f : v_scale,     \
+            nullptr, static_cast<int>(batch_size));                            \
   } while (0)
 
-#define DISPATCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS,           \
-                                        SINGLE_QUERY)                         \
+// [2026-10-25] KV_TYPE 参数化：原实现把所有 LAUNCH 都写死成 FP8_E5M2，
+// 故 fp16 KV 无法走本分发。默认仍为 E5M2，仅 FP16 调用点显式传 FP16。
+#define DISPATCH_GROUPED_VERIFY_PARTIAL_T(MAX_QUERY_TOKENS, TWO_PASS,         \
+                                          SINGLE_QUERY, KV_TYPE)              \
   do {                                                                        \
     const int64_t page_size = k_cache.size(1);                                \
     const int64_t fixed_block_stride = 2 * page_size * kGroupedVerifyHeadDim; \
@@ -4802,37 +4821,57 @@ at::Tensor flash_attention_grouped_verify_paged(
         fixed_interleaved_layout && dflash2_grouped_stage_page_ids_enabled(); \
     if (stage_page_ids && page_size == 1648) {                                \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 1648,         \
-                                    SINGLE_QUERY, true, true,                 \
-                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
+                                    SINGLE_QUERY, true, true, KV_TYPE);       \
     } else if (stage_page_ids) {                                              \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 3296,         \
-                                    SINGLE_QUERY, true, true,                 \
-                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
+                                    SINGLE_QUERY, true, true, KV_TYPE);       \
     } else if (fixed_interleaved_layout && page_size == 1648) {               \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 1648,         \
-                                    SINGLE_QUERY, true, false,                \
-                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
+                                    SINGLE_QUERY, true, false, KV_TYPE);      \
     } else if (fixed_interleaved_layout) {                                    \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 3296,         \
-                                    SINGLE_QUERY, true, false,                \
-                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
+                                    SINGLE_QUERY, true, false, KV_TYPE);      \
     } else if (page_size == 1648) {                                           \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 1648,         \
-                                    SINGLE_QUERY, false, false,               \
-                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
+                                    SINGLE_QUERY, false, false, KV_TYPE);     \
     } else if (page_size == 3296) {                                           \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 3296,         \
-                                    SINGLE_QUERY, false, false,               \
-                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
+                                    SINGLE_QUERY, false, false, KV_TYPE);     \
     } else {                                                                  \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 0,            \
-                                    SINGLE_QUERY, false, false,               \
-                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
+                                    SINGLE_QUERY, false, false, KV_TYPE);     \
     }                                                                         \
   } while (0)
 
+  // 原签名保持不变：仍按 E5M2 分发，供既有调用点零改动使用。
+#define DISPATCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS,           \
+                                        SINGLE_QUERY)                         \
+  DISPATCH_GROUPED_VERIFY_PARTIAL_T(MAX_QUERY_TOKENS, TWO_PASS, SINGLE_QUERY, \
+                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2)
+
   const bool single_query = query_len == 1;
-  if (kv_cache_dtype == "fp8_e4m3") {
+  // [2026-10-25] FP16 KV：独立分发，KV_TYPE 传 FP16，让 load_xqa_tc_kv_vector
+  // 走 uint4 直读分支（不做 fp8 转换），QK/V scale 均按未量化处理。
+  constexpr int kFp16KV = flash_v100::KV_CACHE_DTYPE_FP16;
+#define DISPATCH_GROUPED_VERIFY_PARTIAL_FP16(MAX_QUERY_TOKENS, TWO_PASS,       \
+                                             SINGLE_QUERY)                    \
+  DISPATCH_GROUPED_VERIFY_PARTIAL_T(MAX_QUERY_TOKENS, TWO_PASS, SINGLE_QUERY, \
+                                    kFp16KV)
+  if (fp16_kv) {
+    if (wide_query && one_pass) {
+      DISPATCH_GROUPED_VERIFY_PARTIAL_FP16(kGroupedVerifyQ16MaxQ, false, false);
+    } else if (wide_query) {
+      DISPATCH_GROUPED_VERIFY_PARTIAL_FP16(kGroupedVerifyQ16MaxQ, true, false);
+    } else if (one_pass && single_query) {
+      DISPATCH_GROUPED_VERIFY_PARTIAL_FP16(kGroupedVerifyQ8MaxQ, false, true);
+    } else if (one_pass) {
+      DISPATCH_GROUPED_VERIFY_PARTIAL_FP16(kGroupedVerifyQ8MaxQ, false, false);
+    } else if (single_query) {
+      DISPATCH_GROUPED_VERIFY_PARTIAL_FP16(kGroupedVerifyQ8MaxQ, true, true);
+    } else {
+      DISPATCH_GROUPED_VERIFY_PARTIAL_FP16(kGroupedVerifyQ8MaxQ, true, false);
+    }
+  } else if (kv_cache_dtype == "fp8_e4m3") {
     // Reuse the grouped q8 schedule and existing E4M3 vector conversion.
     // Runtime strides cover both separate and interleaved hybrid KV pages.
     LAUNCH_GROUPED_VERIFY_PARTIAL(kGroupedVerifyQ8MaxQ, false, 0, false, false,
@@ -4851,6 +4890,8 @@ at::Tensor flash_attention_grouped_verify_paged(
     DISPATCH_GROUPED_VERIFY_PARTIAL(kGroupedVerifyQ8MaxQ, true, false);
   }
 #undef DISPATCH_GROUPED_VERIFY_PARTIAL
+#undef DISPATCH_GROUPED_VERIFY_PARTIAL_T
+#undef DISPATCH_GROUPED_VERIFY_PARTIAL_FP16
 #undef LAUNCH_GROUPED_VERIFY_PARTIAL
   const dim3 combine_grid(static_cast<unsigned>(query_len), kGroupedVerifyHeads,
                           static_cast<unsigned>(batch_size));
