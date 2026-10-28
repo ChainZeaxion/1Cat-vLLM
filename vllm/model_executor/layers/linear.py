@@ -358,7 +358,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if maybe_prepare_online_qpn8(layer):
             return
 
-        if layer_policy().dsv4_fp13_gemv and getattr(
+        # [共存门控 2026-10-16] 原为 `layer_policy().dsv4_fp13_gemv`；该字段由
+        # 另一会话新增的 execution-policy 层提供。此处回读既有 env（默认 "1"，
+        # 与 HEAD 一致），使默认路径不依赖新 policy 层。
+        if envs.VLLM_SM70_DSV4_FP13_GEMV and getattr(
             layer, "_sm70_dsv4_fp13_gemv", False
         ):
             from vllm.models.deepseek_v4.sm70.gemv import (
@@ -366,6 +369,23 @@ class UnquantizedLinearMethod(LinearMethodBase):
             )
 
             prepare_sm70_dsv4_fp13_gemv(layer)
+
+        # [共存门控 2026-10-16] ↓↓ 另一会话（GGUF / execution-policy 线）新增的
+        # SM70 dense provider 接入**默认不进入**，保持 HEAD 行为：
+        #   ① 该段读取 `layer._layer_execution_policy` / `layer._layer_trace`，而
+        #      `ParallelLMHead`（`modelopt.py` 的 `get_quant_method` **显式**把
+        #      `(LinearBase, ParallelLMHead)` 一起归入 `UnquantizedLinearMethod`）
+        #      不继承 `LinearBase` ⇒ 无这两个属性 ⇒ 引擎启动即崩（4 个 TP worker
+        #      全部 AttributeError: 'ParallelLMHead' object has no attribute
+        #      '_layer_execution_policy'）。
+        #   ② HEAD 原本在此处有 env 门控 + 一串前置守卫（forbidden / prefix /
+        #      input_is_parallel / dtype / device_capability …）；新实现把守卫
+        #      挪进了 `prepare_dense` 内部，但 `DenseLinearState(...)` 的**构造
+        #      参数求值发生在守卫之前**，所以守卫拦不住。
+        # 恢复既有门控变量（默认 "0" = 不进入，等价 HEAD 默认行为）。
+        # 置 1 即启用新实现 —— 供另一会话继续推进时使用。
+        if not envs.VLLM_SM70_ENABLE_DENSE_F16_FASTPATH:
+            return
 
         from vllm.model_executor.kernels.linear import sm70_dense as dense_provider
 
@@ -421,11 +441,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return sm70_out
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
-        if layer._layer_trace.unquant_debug and x.dim() >= 2:
+        # [共存门控 2026-10-16] 原为 `layer._layer_trace.unquant_debug` /
+        # `layer._layer_execution_policy.dense_max_m`（另一会话新增的
+        # execution-policy 层）。二者同样是 `ParallelLMHead` 上不存在的实例属性
+        # ⇒ 一旦走到这里必崩。回读既有 env，默认路径即为 HEAD 行为。
+        if envs.VLLM_SM70_UNQUANT_DEBUG and x.dim() >= 2:
             x_2d = x.reshape(-1, x.shape[-1])
             log_fn = (
                 logger.info
-                if x_2d.size(0) <= layer._layer_execution_policy.dense_max_m
+                if x_2d.size(0) <= envs.VLLM_SM70_F16_DENSE_MAX_M
                 else logger.info_once
             )
             log_fn(

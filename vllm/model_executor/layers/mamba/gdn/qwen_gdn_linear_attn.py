@@ -24,8 +24,14 @@ from vllm.config.sm70_dflash2 import (
 from vllm.distributed import (
     divide,
 )
+from vllm.config.execution_policy import graph_policy  # [gguf-lineb]
+from vllm.config.gdn import resolve_gdn_config  # [gguf-lineb]
+from vllm.config.gdn_state import resolve_state_trace  # [gguf-lineb]
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fla.ops.gdn_profiling import (
+    bind_gdn_profiler,  # [gguf-lineb]
+)
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
 from vllm.model_executor.layers.fla.ops import (
     chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
@@ -2311,6 +2317,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         gqa_interleaved_layout=False,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
+        # [gguf-lineb] graft 上游 6f3557c97：GDN 执行策略与探针绑定（qwen3_5 forward 依赖
+        # self.gdn_policy.projection.mixed_qkv_contiguous 等字段）
+        self._execution_graph_policy = graph_policy(vllm_config)
+        self.gdn_policy = resolve_gdn_config(vllm_config)
+        self.gdn_state_trace = resolve_state_trace(vllm_config)
+        self._gdn_profiler = bind_gdn_profiler(vllm_config)
+        from vllm.runtime_resources import runtime_resources_for
+
+        self._prefill_warmup_keys = runtime_resources_for(vllm_config).setdefault(
+            "gdn_prefill_warmup_keys", set()
+        )
 
         self.num_k_heads = config.linear_num_key_heads
         self.num_v_heads = config.linear_num_value_heads

@@ -70,10 +70,19 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         from vllm.compilation.backends import set_model_tag
 
         draft_vllm_config = self._create_draft_vllm_config()
+        # [gguf-lineb] 主模型走 GGUF loader 时 load_format=gguf 会继承到草稿；
+        # 草稿是 safetensors 时显式回退 auto（与 dflash/utils.load_dflash_model 同理）。
+        load_config = draft_vllm_config.load_config
+        if (
+            load_config.load_format == "gguf"
+            and not self.speculative_config.draft_model_config.model.endswith(".gguf")
+        ):
+            load_config = replace(load_config, load_format="auto")
         with set_model_tag("draft_model"):
             model = get_model(
                 vllm_config=draft_vllm_config,
                 prefix="draft_model",
+                load_config=load_config,
             )
         return model
 

@@ -401,6 +401,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY: bool = False
     VLLM_SM70_DFLASH2_TP2_GDN_BV2: bool = False
+    VLLM_SM70_DFLASH2_TP2_GDN_BV2: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_NORM: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT: bool = False
@@ -826,7 +827,9 @@ if TYPE_CHECKING:
     # of os.environ precisely so that out-of-tree switches (which this module
     # never sees) still land in the cache key. Being registered is not enough
     # to keep them out -- they must be listed in ignored_factors.
-    VLLM_SM70_PHASE_SEPARATION: bool = False
+    # [2026-10-21] 相位分离改为**常驻默认开启**：不传任何 env 也生效。
+    # 显式设 "0" 可关闭（A/B 对照用）。读取点见 scheduler.py 与下方 env_var 注册。
+    VLLM_SM70_PHASE_SEPARATION: bool = True
     VLLM_SM70_PHASE_DECODE_SHARE: float = 0.4766
     VLLM_SM70_PHASE_MAX_WAIT_MS: float = 300.0
     # 0 disables the periodic phase-pattern log (1 line per N engine steps).
@@ -949,6 +952,15 @@ if TYPE_CHECKING:
     VLLM_DBO_COMM_SMS: int = 20
     VLLM_PATTERN_MATCH_DEBUG: str | None = None
     VLLM_DEBUG_DUMP_PATH: str | None = None
+    # [gguf-lineb] 上游 6f3557c97：GGUF 加载线程 50ms 采样诊断（仅诊断，不改编译面）
+    VLLM_GGUF_LOAD_PROFILE: bool = False
+    # [gguf-lineb] 上游 6f3557c97 诊断/tuning 环境变量（GGUF expert cache 与 prefill 均衡）
+    VLLM_EXPERT_CACHE_MEMLOG: bool = False
+    VLLM_EXPERT_CACHE_STACKS: bool = False
+    VLLM_TM_COLD_DMA: bool = True
+    VLLM_TM_COLD_CTAS: int | None = None
+    VLLM_QSA_DUMP_DIR: str | None = None
+    VLLM_BALANCED_PREFILL_CHUNKS: bool = False
     VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE: bool = True
     VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING: bool = True
     VLLM_USE_NCCL_SYMM_MEM: bool = False
@@ -2038,6 +2050,81 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
+    ),
+    # [gguf-lineb] 上游 6f3557c97：GGUF 加载线程 50ms 采样诊断（仅诊断，不改编译面）
+    "VLLM_GGUF_LOAD_PROFILE": env_var(
+        lambda: bool(os.getenv("VLLM_GGUF_LOAD_PROFILE")),
+        description=(
+            "Diagnostic: sample the GGUF loading thread every 50 ms and log "
+            "where time goes during weight loading."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    # [gguf-lineb] 上游 6f3557c97：GGUF routed-expert cache 与 prefill 分块诊断/调优
+    "VLLM_EXPERT_CACHE_MEMLOG": env_var(
+        lambda: bool(os.getenv("VLLM_EXPERT_CACHE_MEMLOG")),
+        description=(
+            "Diagnostic: log CUDA memory around the first and last TurboMind "
+            "prefill MoE layer of the GGUF routed-expert cache."
+        ),
+        category="debug", declared_default="False", effective_default="False",
+        automatic_conditions=(), acceleration_paths=(), user_visible=False,
+    ),
+    "VLLM_EXPERT_CACHE_STACKS": env_var(
+        lambda: bool(os.getenv("VLLM_EXPERT_CACHE_STACKS")),
+        description=(
+            "Diagnostic: dump all thread stacks when a GGUF routed-expert cache "
+            "miss waits on the host lane for too long."
+        ),
+        category="debug", declared_default="False", effective_default="False",
+        automatic_conditions=(), acceleration_paths=(), user_visible=False,
+    ),
+    "VLLM_TM_COLD_DMA": env_var(
+        lambda: os.getenv("VLLM_TM_COLD_DMA", "1") == "1",
+        description=(
+            "GGUF routed-expert cache TurboMind prefill: stage host-resident "
+            "(cold) experts on the device with copy-engine DMA before "
+            "transcoding. 0 transcodes them straight from mapped host memory."
+        ),
+        category="tuning", declared_default="True", effective_default="True",
+        automatic_conditions=(), acceleration_paths=(), user_visible=False,
+    ),
+    "VLLM_TM_COLD_CTAS": env_var(
+        lambda: (
+            int(os.environ["VLLM_TM_COLD_CTAS"])
+            if "VLLM_TM_COLD_CTAS" in os.environ
+            else None
+        ),
+        description=(
+            "CTAs of the cold-expert transcode in the GGUF routed-expert cache "
+            "TurboMind prefill. Unset: 64 with DMA staging, 8 otherwise."
+        ),
+        category="tuning", declared_default="None",
+        effective_default="Computed when unset: 64 with VLLM_TM_COLD_DMA, else 8",
+        automatic_conditions=(), acceleration_paths=(), user_visible=False,
+    ),
+    "VLLM_QSA_DUMP_DIR": env_var(
+        lambda: os.getenv("VLLM_QSA_DUMP_DIR"),
+        description=(
+            "Diagnostic: directory where TP rank 0 saves the inputs and output "
+            "of a few long-context QSA prefill attention calls."
+        ),
+        category="debug", declared_default="None", effective_default="None",
+        automatic_conditions=(), acceleration_paths=(), user_visible=False,
+    ),
+    "VLLM_BALANCED_PREFILL_CHUNKS": env_var(
+        lambda: os.getenv("VLLM_BALANCED_PREFILL_CHUNKS", "0") == "1",
+        description=(
+            "Split a prompt that needs n prefill chunks into n near-equal "
+            "block-aligned chunks instead of full chunks and a short tail."
+        ),
+        category="tuning", declared_default="False", effective_default="False",
+        automatic_conditions=(), acceleration_paths=(), user_visible=True,
     ),
     # Feature flag to enable/disable AOT compilation. This will ensure
     # compilation is done in warmup phase and the compilation will be
@@ -12615,15 +12702,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # change compiled kernels, so tuning them must not invalidate the
     # torch.compile cache.
     "VLLM_SM70_PHASE_SEPARATION": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_PHASE_SEPARATION", "0"))),
+        # [2026-10-21] 默认 "1"：常驻默认优化项，不传 env 也启用；设 "0" 可关。
+        lambda: bool(int(os.getenv("VLLM_SM70_PHASE_SEPARATION", "1"))),
         description=(
             "Run whole scheduler steps as either pure-decode or pure-prefill "
-            "phases so the decode phase can replay a FULL CUDA graph. Default "
-            "off (mixed batching)."
+            "phases so the decode phase can replay a FULL CUDA graph. "
+            "Default ON (2026-10-21 turned on as a resident optimization); "
+            "set 0 to fall back to mixed batching for A/B comparison."
         ),
         category="performance",
-        declared_default="False",
-        effective_default="False",
+        declared_default="True",
+        effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
@@ -18738,6 +18827,13 @@ def compile_factors() -> dict[str, object]:
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
         "VLLM_DEBUG_DUMP_PATH",
+        "VLLM_GGUF_LOAD_PROFILE",  # [gguf-lineb] 纯诊断采样
+        "VLLM_EXPERT_CACHE_MEMLOG",  # [gguf-lineb] 纯诊断
+        "VLLM_EXPERT_CACHE_STACKS",  # 纯诊断
+        "VLLM_QSA_DUMP_DIR",  # 纯诊断
+        "VLLM_TM_COLD_DMA",  # 调度/传输策略，不改编译面
+        "VLLM_TM_COLD_CTAS",  # 同上
+        "VLLM_BALANCED_PREFILL_CHUNKS",  # 调度分块，不改编译面
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
         "LD_LIBRARY_PATH",

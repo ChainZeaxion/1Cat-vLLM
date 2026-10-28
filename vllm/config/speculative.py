@@ -18,6 +18,7 @@ from vllm.config.speculative_sampling import SpeculativeSamplingPolicy
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
+from vllm.transformers_utils.gguf_utils import is_gguf
 from vllm.utils.hashing import safe_hash
 from vllm.utils.import_utils import LazyLoader, has_arctic_inference
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -930,6 +931,15 @@ class SpeculativeConfig:
                     hf_overrides=SpeculativeConfig.hf_config_override,
                     config_format=self.target_model_config.config_format,
                 )
+
+                # [gguf-lineb] 主模型是 GGUF 时 quantization/load_format 会被设为
+                # "gguf"（arg_utils.create_model_config）。草稿若是普通
+                # safetensors 目录（如 Dflash2/nvfp4），不能继承该判定，否则
+                # 草稿也被 GGUF loader 加载并触发 "Unrecognised GGUF reference"。
+                if self.quantization == "gguf" and not is_gguf(
+                    self.draft_model_config.model
+                ):
+                    self.draft_model_config.quantization = None
 
                 # Automatically detect the method
                 if (

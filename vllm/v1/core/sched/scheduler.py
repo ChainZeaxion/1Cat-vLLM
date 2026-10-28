@@ -136,8 +136,11 @@ class Scheduler(SchedulerInterface):
         # phase_separation.py 头部论证）。None = 关闭 = 现状行为。
         # ⚠️ 与 VLLM_SM70_MAMBA_SPARSE_MODE 同样的投递限制：EngineCore 收不到
         #    unit 的 Environment=VLLM_*，开关只能经 worker_env.conf 注入。
+        # [2026-10-21] **改为常驻默认开启**：默认值 "0" → "1"。不传任何 env 也启用；
+        #    显式设 "0"/"false"/"" 才关闭（供 A/B 对照）。因此不再依赖
+        #    worker_env.conf 注入，EngineCore 收不到 VLLM_* 也不再影响本开关。
         self.phase_separation: PhaseCreditAllocator | None = None
-        if os.environ.get("VLLM_SM70_PHASE_SEPARATION", "0") not in (
+        if os.environ.get("VLLM_SM70_PHASE_SEPARATION", "1") not in (
             "",
             "0",
             "false",
@@ -145,8 +148,11 @@ class Scheduler(SchedulerInterface):
         ):
             self.phase_separation = PhaseCreditAllocator(
                 PhaseConfig(
+                    # [2026-10-21] 与 envs.py 注册值对齐（原此处 0.3333，
+                    # 与 envs.py 的 0.4766 不一致；开关默认开启后此差异会直接
+                    # 影响实跑行为，故统一为 0.4766）。
                     decode_time_share=float(
-                        os.environ.get("VLLM_SM70_PHASE_DECODE_SHARE", "0.3333")
+                        os.environ.get("VLLM_SM70_PHASE_DECODE_SHARE", "0.4766")
                     ),
                     max_decode_wait_ms=float(
                         os.environ.get("VLLM_SM70_PHASE_MAX_WAIT_MS", "300")

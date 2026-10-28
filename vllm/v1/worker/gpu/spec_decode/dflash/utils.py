@@ -102,8 +102,23 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         ),
     )
     with set_model_tag("dflash_head"):
+        # [gguf-lineb] 主模型走 GGUF loader 时 load_format=gguf 会随 vllm_config
+        # 继承到草稿；草稿是 safetensors 时必须显式回退 auto，否则 GGUF loader
+        # 把草稿路径当 GGUF 引用校验而失败。
+        from vllm.config.load import LoadConfig
+
+        draft_load_config = vllm_config.load_config
+        if (
+            draft_load_config.load_format == "gguf"
+            and not draft_model_config.model.endswith(".gguf")
+        ):
+            draft_load_config = replace(
+                draft_load_config, load_format="auto"
+            )
         dflash_model = get_model(
-            vllm_config=draft_vllm_config, model_config=draft_model_config
+            vllm_config=draft_vllm_config,
+            model_config=draft_model_config,
+            load_config=draft_load_config,
         )
 
     target_language_model = (

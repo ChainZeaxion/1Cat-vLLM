@@ -567,6 +567,10 @@ _MULTIMODAL_MODELS = {
         "qwen3_vl_moe",
         "Qwen3VLMoeForConditionalGeneration",
     ),
+    # [gguf-lineb] 上游 6f3557c97 同款：qwen35 GGUF config 生成 ForCausalLM（文本态），
+    # 多模态外壳走 ForConditionalGeneration——两者都要可解析（Qwen3_5ForCausalLM 定义在 qwen3_5.py:1017）
+    "Qwen3_5ForCausalLM": ("qwen3_5", "Qwen3_5ForCausalLM"),
+    "Qwen3_5MoeForCausalLM": ("qwen3_5", "Qwen3_5MoeForCausalLM"),
     "Qwen3_5ForConditionalGeneration": ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
     "Qwen3_5MoeForConditionalGeneration": (
         "qwen3_5",

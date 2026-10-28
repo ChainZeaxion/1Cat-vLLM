@@ -529,11 +529,14 @@ class GGUFModelLoader(BaseModelLoader):
         # filter out unquantized modules to skip
         adapter = getattr(self, "_native_adapter", None)
         if adapter is not None:
+            # [gguf-lineb] 量化 embedding 走 qweight（GGUFEmbeddingMethod 按行反量化）。
+            # 上游判定 (storage=="original") 对 IQ 系量化 embed 产 dense 名与 GGUFEmbeddingMethod
+            # 的 qweight 参数冲突（qwen3_5.py load 时 skip → forward 未初始化）。
+            # 语义对齐：dense/original 都让 adapter 保持类默认 packed_embeddings=True；
+            # 仅显式选择"全表预反量化"（embedding_storage=="dequant"）才关 packed。
             adapter.packed_embeddings = (
-                getattr(
-                    vllm_config.kernel_config.sm70_gguf, "embedding_storage", "dense"
-                )
-                == "original"
+                getattr(vllm_config.kernel_config.sm70_gguf, "embedding_storage", "dense")
+                != "dequant"
             )
         unquant_names = [
             name.removesuffix(".weight")

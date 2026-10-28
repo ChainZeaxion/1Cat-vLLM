@@ -12,6 +12,7 @@ from pydantic import Field, TypeAdapter, field_validator
 
 import vllm.envs as envs
 from vllm.compilation.passes.inductor_pass import CallableInductorPass, InductorPass
+from vllm.config.execution_policy import GraphPolicy
 from vllm.config.utils import (
     Range,
     config,
@@ -434,6 +435,10 @@ class CompilationConfig:
         sufficient for most cases. It might be beneficial to compile for
         certain small batchsizes, where inductor is good at optimizing.
     """
+
+    # [gguf-lineb] 上游 6f3557c97：per-engine 执行策略与初始化来源（GGUF PLE pinned 表依赖）
+    runtime: GraphPolicy = Field(default_factory=GraphPolicy)
+    """Per-engine execution decisions and initialization provenance."""
 
     # Top-level Compilation control
     mode: CompilationMode = None  # type: ignore[assignment]

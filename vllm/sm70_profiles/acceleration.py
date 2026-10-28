@@ -446,6 +446,8 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
             )
 
             policy = capture_sm70_dflash2_config(cfg)
+            if policy is None or not policy.resolved:
+                reason = reason or "policy_unresolved"
             values = {
                 alias: sm70_dflash2_enabled(field, policy)
                 for alias, field in SM70_DFLASH2_LEGACY_FIELDS.items()
@@ -453,7 +455,14 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         else:
             values = _switches(defaults)
         paths[name] = _row(
-            reason or (None if _switches_match(values, defaults) else "user_override"),
+            reason
+            or (
+                None
+                if _switches_match(
+                    {k: v for k, v in values.items() if k in defaults}, defaults
+                )
+                else "user_override"
+            ),
             switches=values,
         )
 

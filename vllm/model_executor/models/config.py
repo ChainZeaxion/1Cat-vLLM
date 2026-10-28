@@ -819,6 +819,10 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Qwen2ForRewardModel": Qwen2ForRewardModelConfig,
     "Qwen3ForSequenceClassification": Qwen3ForSequenceClassificationConfig,
     "Qwen3VLForSequenceClassification": Qwen3VLForSequenceClassificationConfig,
+    # [gguf-lineb] qwen35 GGUF 生成文本态 architectures（上游原生 HF 走 transformers 路径）；
+    # 文本态同为 hybrid GDN 模型，须进同一 config 校验（mamba_block_size 派生等）
+    "Qwen3_5ForCausalLM": Qwen3_5ForConditionalGenerationConfig,
+    "Qwen3_5MoeForCausalLM": Qwen3_5ForConditionalGenerationConfig,
     "Qwen3_5ForConditionalGeneration": Qwen3_5ForConditionalGenerationConfig,
     "Qwen3_5MoeForConditionalGeneration": Qwen3_5ForConditionalGenerationConfig,
     "Qwen4ExpForCausalLM": Qwen4ExpForCausalLMConfig,
