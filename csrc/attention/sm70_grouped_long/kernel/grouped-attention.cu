@@ -1847,8 +1847,8 @@ constexpr int kGroupedVerifyRows = 48;
 constexpr int kGroupedVerifyBlockN = 32;
 constexpr int kGroupedVerifyQStride = 264;
 constexpr int kGroupedVerifyKVStride = 264;
-constexpr int kGroupedVerifyScoreStride = 32;
-constexpr int kGroupedVerifyProbStride = 32;
+constexpr int kGroupedVerifyScoreStride = 40;
+constexpr int kGroupedVerifyProbStride = 40;
 constexpr int kGroupedVerifyPageIdsCapacity = 16;
 // One packed head group times eighty context splits maps one 512-thread CTA to
 // each of V100's eighty SMs. Short sequences still reduce active_splits using
@@ -2451,7 +2451,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
                               smem.row_max[row],
                           -80.0f))
                     : 0.0f;
-        shared_probs[grouped_a_offset(row, col, 32)] =
+        shared_probs[grouped_a_offset(row, col, kGroupedVerifyProbStride)] =
             __float2half_rn(probability);
       }
       __syncthreads();
@@ -2481,11 +2481,11 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
         const float new_max = fmaxf(old_max, tile_max);
         const float probability =
             visible ? __expf(fmaxf(score - new_max, -80.0f)) : 0.0f;
-        shared_probs[grouped_a_offset(row, lane_id, 32)] =
+        shared_probs[grouped_a_offset(row, lane_id, kGroupedVerifyProbStride)] =
             __float2half_rn(probability);
         if constexpr (COMPENSATE_P) {
           const float rounded = __half2float(__float2half_rn(probability));
-          shared_prob_residual[grouped_a_offset(row, lane_id, 32)] =
+          shared_prob_residual[grouped_a_offset(row, lane_id, kGroupedVerifyProbStride)] =
               __float2half_rn((probability - rounded) * 2048.0f);
         }
         const float tile_sum_lane = warp_reduce_sum(probability);
@@ -3074,7 +3074,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
                               smem.row_max[row],
                           -80.0f))
                     : 0.0f;
-        shared_probs[grouped_a_offset(row, col, 32)] =
+        shared_probs[grouped_a_offset(row, col, kGroupedVerifyProbStride)] =
             __float2half_rn(probability);
       }
       __syncthreads();
@@ -3131,8 +3131,8 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
                 ? __expf(fmaxf(scores[j] - new_max, -80.f)) : 0.f;
             probabilities[j] = probability;
             const half rounded = __float2half_rn(probability);
-            shared_probs[grouped_a_offset(row, col, 32)] = rounded;
-            shared_prob_residual[grouped_a_offset(row, col, 32)] =
+            shared_probs[grouped_a_offset(row, col, kGroupedVerifyProbStride)] = rounded;
+            shared_prob_residual[grouped_a_offset(row, col, kGroupedVerifyProbStride)] =
                 __float2half_rn((probability - __half2float(rounded)) * 2048.f);
           }
 #pragma unroll
