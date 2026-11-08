@@ -1118,7 +1118,7 @@ def get_moe_configs(
     """
 
     # Avoid optimizing for the batch invariant case. Use default config
-    if envs.VLLM_BATCH_INVARIANT:
+    if envs.VLLM_BATCH_INVARIANT or envs.VLLM_SPECULATIVE_TOKEN_PARITY:
         return None
 
     # First look up if an optimized configuration is available in the configs
@@ -1338,7 +1338,7 @@ def get_default_config(
     dtype: str | None,
     block_shape: list[int] | None = None,
 ) -> dict[str, int]:
-    if envs.VLLM_BATCH_INVARIANT:
+    if envs.VLLM_BATCH_INVARIANT or envs.VLLM_SPECULATIVE_TOKEN_PARITY:
         return {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": 64,

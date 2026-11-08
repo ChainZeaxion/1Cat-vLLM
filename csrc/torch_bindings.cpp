@@ -181,6 +181,293 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor[]");
   ops.impl("awq_sm70_prepare_compact", torch::kCUDA, &awq_sm70_prepare_compact);
 
+  // GGUF native GEMM families (ported from v153, see v153移植计划-20261027.md).
+  // v153 wraps these in sm70::with_policy; base has no policy layer, so bind
+  // the functions directly and keep the `native_policy` argument optional-null.
+  ops.def(
+      "gguf_affine_sm70_prepare(Tensor codes, Tensor scales, Tensor mins, "
+      "int bits, int group_size) -> Tensor[]");
+  ops.impl("gguf_affine_sm70_prepare", torch::kCUDA, &gguf_affine_sm70_prepare);
+  ops.def(
+      "gguf_affine_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor weight, "
+      "Tensor stats, int bits, int k_ld, int q_ld, int group_size=32) -> ()");
+  ops.impl("gguf_affine_gemm_sm70_out", torch::kCUDA,
+           &gguf_affine_gemm_sm70_out);
+  ops.def(
+      "gguf_affine_grouped_gemm_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor offsets, Tensor weight_ptrs, Tensor stats_ptrs, "
+      "int bits, int num_experts, int group_size=32) -> ()");
+  ops.impl("gguf_affine_grouped_gemm_sm70_out", torch::kCUDA,
+           &gguf_affine_grouped_gemm_sm70_out);
+
+  ops.def(
+      "gguf_lut4_sm70_prepare(Tensor codes, Tensor scales, int lut_id, "
+      "int group_size) -> Tensor[]");
+  ops.impl("gguf_lut4_sm70_prepare", torch::kCUDA, &gguf_lut4_sm70_prepare);
+  ops.def(
+      "gguf_lut4_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor weight, "
+      "Tensor stats, int lut_id, int k_ld, int q_ld, int group_size) -> ()");
+  ops.impl("gguf_lut4_gemm_sm70_out", torch::kCUDA, &gguf_lut4_gemm_sm70_out);
+  ops.def(
+      "gguf_lut4_grouped_gemm_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor offsets, Tensor weight_ptrs, Tensor stats_ptrs, int lut_id, "
+      "int num_experts, int group_size) -> ()");
+  ops.impl("gguf_lut4_grouped_gemm_sm70_out", torch::kCUDA,
+           &gguf_lut4_grouped_gemm_sm70_out);
+
+  ops.def(
+      "gguf_lattice_sm70_prepare(Tensor codes, Tensor scales, int source_type, "
+      "int group_size) -> Tensor[]");
+  ops.impl("gguf_lattice_sm70_prepare", torch::kCUDA,
+           &gguf_lattice_sm70_prepare);
+  ops.def(
+      "gguf_lattice_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor weight, "
+      "Tensor stats, int source_type, int k_ld, int q_ld, int group_size) "
+      "-> ()");
+  ops.impl("gguf_lattice_gemm_sm70_out", torch::kCUDA,
+           &gguf_lattice_gemm_sm70_out);
+  ops.def(
+      "gguf_lattice_grouped_gemm_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor offsets, Tensor weight_ptrs, Tensor stats_ptrs, int source_type, "
+      "int num_experts, int group_size) -> ()");
+  ops.impl("gguf_lattice_grouped_gemm_sm70_out", torch::kCUDA,
+           &gguf_lattice_grouped_gemm_sm70_out);
+
+  ops.def(
+      "gguf_grouped_prefill_gemm_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor offsets, Tensor weight_ptrs, Tensor stats_ptrs, int family, "
+      "int decoder, int n, int num_experts, int group_size, bool gated, "
+      "bool tune, Tensor? a_indices=None) -> ()");
+  ops.impl("gguf_grouped_prefill_gemm_sm70_out", torch::kCUDA,
+           &gguf_grouped_prefill_gemm_sm70_out);
+
+  // GGUF MoE-side kernels: already compiled in base csrc, registrations were
+  // missing. See v153移植计划-20261027.md P2c supplement.
+  ops.def(
+      "gguf_dp4a_down_unroute_sm70_out(Tensor(a!) out, Tensor input, Tensor "
+      "ids, Tensor route_weights, Tensor weight_ptrs, Tensor stats_ptrs, int "
+      "source_type, int num_experts) -> ()");
+  ops.impl("gguf_dp4a_down_unroute_sm70_out", torch::kCUDA,
+           &gguf_dp4a_down_unroute_sm70_out);
+  ops.def(
+      "gguf_dp4a_gate_up_sm70_out(Tensor(a!) out, Tensor activation, Tensor "
+      "ids, Tensor gate, Tensor up, int source_type, bool activated, "
+      "int lanes_per_row=16, bool bank_aware=False) -> ()");
+  ops.impl("gguf_dp4a_gate_up_sm70_out", torch::kCUDA,
+           &gguf_dp4a_gate_up_sm70_out);
+  ops.def(
+      "gguf_dp4a_lut4_gate_up_sm70_out(Tensor(a!) out, Tensor activation, "
+      "Tensor ids, Tensor gate, Tensor gate_stats, Tensor up, Tensor up_stats, "
+      "int num_experts, int lanes_per_row=16) -> ()");
+  ops.impl("gguf_dp4a_lut4_gate_up_sm70_out", torch::kCUDA,
+           &gguf_dp4a_lut4_gate_up_sm70_out);
+  ops.def(
+      "gguf_lattice_grouped_vec_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor offsets, Tensor weight_ptrs, Tensor stats_ptrs, int source_type, "
+      "int num_experts, int group_size) -> ()");
+  ops.impl("gguf_lattice_grouped_vec_sm70_out", torch::kCUDA,
+           &gguf_lattice_grouped_vec_sm70_out);
+  ops.def(
+      "gguf_lattice_raw_grouped_gate_up_sm70_out(Tensor(a!) gate, Tensor(b!) "
+      "up, Tensor input, Tensor gate_weights, Tensor up_weights, Tensor "
+      "offsets, Tensor ids, int source_type, int top_k) -> ()");
+  ops.impl("gguf_lattice_raw_grouped_gate_up_sm70_out", torch::kCUDA,
+           &gguf_lattice_raw_grouped_gate_up_sm70_out);
+  ops.def(
+      "gguf_moe_gate_up_sm70_out(Tensor(a!) hidden, Tensor input, Tensor ids, "
+      "Tensor gate_codes, Tensor gate_scale, Tensor up_codes, Tensor up_scale, "
+      "int format, Tensor table, int kw) -> ()");
+  ops.impl("gguf_moe_gate_up_sm70_out", torch::kCUDA,
+           &gguf_moe_gate_up_sm70_out);
+  ops.def("gguf_quantize_q8_1_sm70_out(Tensor(a!) out, Tensor input) -> ()");
+  ops.impl("gguf_quantize_q8_1_sm70_out", torch::kCUDA,
+           &gguf_quantize_q8_1_sm70_out);
+  ops.def(
+      "gguf_small_grouped_vec_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor offsets, Tensor weight_ptrs, Tensor stats_ptrs, int source_type, "
+      "int num_experts, int group_size) -> ()");
+  ops.impl("gguf_small_grouped_vec_sm70_out", torch::kCUDA,
+           &gguf_small_grouped_vec_sm70_out);
+
+  // GGUF remaining kernels (P2c supplement, 2026-10-29).
+  ops.def(
+      "gguf_affine_blas_sm70_out(Tensor(a!) out, Tensor input, Tensor weight, "
+      "Tensor stats, int bits, Tensor(b!) scratch, int group_size) -> ()");
+  ops.impl("gguf_affine_blas_sm70_out", torch::kCUDA,
+           &gguf_affine_blas_sm70_out);
+  ops.def(
+      "gguf_canonical_linear_n64_sm70_out(Tensor(a!) output, Tensor input, "
+      "Tensor weight, Tensor stats, Tensor(b!) partials, Tensor(c!) counters, "
+      "int bits, int group_size) -> ()");
+  ops.impl("gguf_canonical_linear_n64_sm70_out", torch::kCUDA,
+           &gguf_canonical_linear_n64_sm70_out);
+  ops.def(
+      "gguf_dense_restore_canonical_sm70_out(Tensor(a!) weight, Tensor(b!) "
+      "stats, "
+      "Tensor codes, Tensor high, Tensor scale, int fmt, int k, int n) -> ()");
+  ops.impl("gguf_dense_restore_canonical_sm70_out", torch::kCUDA,
+           &gguf_dense_restore_canonical_sm70_out);
+  ops.def(
+      "gguf_dense_segments_sm70_out(Tensor x, Tensor[] codes, Tensor[] high, "
+      "Tensor[] scale, Tensor(a!)[] out, int[] fmt, int[] n, int k, int split, "
+      "int warps, Tensor(b!) ws, Tensor(c!) cnt, Tensor? sgate=None) -> ()");
+  ops.impl("gguf_dense_segments_sm70_out", torch::kCUDA,
+           &gguf_dense_segments_sm70_out);
+  ops.def("gguf_dmvq_book_sm70_out(Tensor(a!) table, int type) -> ()");
+  ops.impl("gguf_dmvq_book_sm70_out", torch::kCUDA, &gguf_dmvq_book_sm70_out);
+  ops.def(
+      "gguf_dmvq_sm70_out(Tensor(a!) output, Tensor input, Tensor weight, "
+      "Tensor(b!) workspace, Tensor(c!) counters, Tensor table, int type, "
+      "int kw, int split) -> ()");
+  ops.impl("gguf_dmvq_sm70_out", torch::kCUDA, &gguf_dmvq_sm70_out);
+
+  // PLE host-side kernels (ported from v153, see P4).
+  ops.def(
+      "ple_disk_gather_u8(Tensor ids, Tensor pointers, int shard_size, "
+      "int num_rows, int row_bytes, Tensor(a!) out) -> ()");
+  ops.impl("ple_disk_gather_u8", torch::kCPU, &ple_disk_gather_u8);
+  ops.def(
+      "ple_disk_cached_gather_u8(Tensor ids, Tensor pointers, int shard_size, "
+      "int num_rows, int row_bytes, Tensor(a!) out, Tensor(b!) cache_ids, "
+      "Tensor(c!) cache_rows) -> ()");
+  ops.impl("ple_disk_cached_gather_u8", torch::kCPU,
+           &ple_disk_cached_gather_u8);
+  ops.def(
+      "ple_fast_lane_start(Tensor request, int max_reqs, int max_tokens, "
+      "int table_ptr, int row_bytes, int num_rows, int[] multipliers, "
+      "int[] sizes, int[] offsets, int eos, int[] result_ptrs, "
+      "int[] flag_ptrs, int cache_bytes, int idle_spin_us, "
+      "bool clamp_tokens, Tensor? draft_ring, int ring_reqs, "
+      "int ring_spec) -> int");
+  ops.impl("ple_fast_lane_start", torch::kCPU, &ple_fast_lane_start);
+  ops.def("ple_fast_lane_stats(int handle) -> Tensor");
+  ops.impl("ple_fast_lane_stats", &ple_fast_lane_stats);
+  ops.def("ple_fast_lane_stop(int handle) -> ()");
+  ops.impl("ple_fast_lane_stop", &ple_fast_lane_stop);
+  ops.def(
+      "gguf_dmv13_decode_pack(Tensor raw, int gtype, int num_threads) -> "
+      "Tensor[]");
+  ops.impl("gguf_dmv13_decode_pack", torch::kCPU, &gguf_dmv13_decode_pack);
+
+  // Flash-Next non-GGUF kernels (P3-D, 2026-10-29).
+  ops.def(
+      "sm70_hc_ll_down_out(Tensor x, Tensor wd, Tensor(a!) part, Tensor(b!) "
+      "cnt, "
+      "int[] ll, Tensor(c!) seq, int rank, int variant, bool "
+      "optimized_loads=True) -> ()");
+  ops.impl("sm70_hc_ll_down_out", torch::kCUDA, &sm70_hc_ll_down_out);
+  ops.def(
+      "sm70_hc_ll_up_out(int ll_lora, Tensor wu, Tensor x, Tensor(a!) cnt, "
+      "int[] ll, Tensor(b!) seq, Tensor down_seq, int rank, Tensor(c!) out, "
+      "Tensor(d!) lora_out, Tensor(e!) inj_out, int warps, bool "
+      "optimized_loads=True) -> ()");
+  ops.impl("sm70_hc_ll_up_out", torch::kCUDA, &sm70_hc_ll_up_out);
+  ops.def(
+      "sm70_hcx_out(Tensor p0, Tensor? p1, Tensor res, Tensor inj, Tensor nw,"
+      " float eps, Tensor wd, Tensor wu, Tensor(a!) res_out, Tensor(b!) blk_o"
+      "ut, Tensor(c!) inj_out, Tensor(d!) xn, Tensor(e!) sq, Tensor(f!) dpart"
+      ", Tensor(g!) bar, Tensor(h!) seq, int[] ar, int[] lora, int[] hb, int "
+      "rank, Tensor? dbg, int full, Tensor? ox, Tensor? ocodes, Tensor? ohigh"
+      ", Tensor? oscale, int ofmt, Tensor? gz, Tensor? gw, float geps, Tensor"
+      "(i!)? gscr, bool local_schedule=False) -> ()");
+  ops.impl("sm70_hcx_out", torch::kCUDA, &sm70_hcx_out);
+  ops.def(
+      "sm70_dmv13_out(Tensor x, Tensor[] codes, Tensor[] high, Tensor[] scale, "
+      "Tensor(a!)[] out, int[] fmt, int[] n, int K, int split, int warps, "
+      "Tensor(b!) ws, Tensor(c!) cnt, int tp, Tensor? extra_weight, "
+      "Tensor(d!)? extra_out) -> ()");
+  ops.impl("sm70_dmv13_out", torch::kCUDA, &sm70_dmv13_out);
+  ops.def(
+      "sm70_top1x_out(Tensor(a!) out, Tensor pairs, int[] buffers, "
+      "Tensor(b!) seq, int rank) -> ()");
+  ops.impl("sm70_top1x_out", torch::kCUDA, &sm70_top1x_out);
+  ops.def(
+      "sm70_gdn_verify_out(Tensor qkv, Tensor a, Tensor b, Tensor A_log, "
+      "Tensor dt_bias, Tensor(a!) state, Tensor(b!) o, Tensor cu, Tensor idx, "
+      "Tensor? nacc, int H, int HV, float scale, int cfg, Tensor? rbuf, "
+      "Tensor? rn, Tensor? ctr, int tmax) -> ()");
+  ops.impl("sm70_gdn_verify_out", torch::kCUDA, &sm70_gdn_verify_out);
+  ops.def(
+      "gguf_dmv_restore_iq2_sm70_out(Tensor(a!) weight, Tensor(b!) stats, "
+      "Tensor codes, Tensor meta, Tensor reverse, int type, int k, int n) -> "
+      "()");
+  ops.impl("gguf_dmv_restore_iq2_sm70_out", torch::kCUDA,
+           &gguf_dmv_restore_iq2_sm70_out);
+  ops.def(
+      "gguf_dmv_restore_sm70_out(Tensor(a!) weight, Tensor(b!) stats, "
+      "Tensor codes, Tensor scale, int format, int k, int n) -> ()");
+  ops.impl("gguf_dmv_restore_sm70_out", torch::kCUDA,
+           &gguf_dmv_restore_sm70_out);
+  ops.def(
+      "gguf_dmv_sm70_out(Tensor input, Tensor[] codes, Tensor[] high, "
+      "Tensor[] scale, Tensor(a!)[] outputs, int[] formats, int[] widths, "
+      "int k, int split, int kw, Tensor(b!) workspace, Tensor(c!) counters, "
+      "int tn, Tensor? sigmoid_gate, Tensor? table, Tensor? floating_weight, "
+      "Tensor(d!)? floating_output, Tensor(e!)? pair_output, bool gdn_heads) "
+      "-> ()");
+  ops.impl("gguf_dmv_sm70_out", torch::kCUDA, &gguf_dmv_sm70_out);
+  ops.def("gguf_dmv_three_formats_sm70_supported() -> bool",
+          []() { return true; });
+  ops.def(
+      "gguf_dp4a_raw_down_unroute_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor ids, Tensor probabilities, Tensor weights, int source_type, "
+      "int left=0) -> ()");
+  ops.impl("gguf_dp4a_raw_down_unroute_sm70_out", torch::kCUDA,
+           &gguf_dp4a_raw_down_unroute_sm70_out);
+  ops.def(
+      "gguf_iq3_gated_sm70_out(Tensor(a!) out, Tensor input, Tensor gate, "
+      "Tensor up) -> ()");
+  ops.impl("gguf_iq3_gated_sm70_out", torch::kCUDA, &gguf_iq3_gated_sm70_out);
+  ops.def(
+      "gguf_lattice_blas_sm70_out(Tensor(a!) out, Tensor input, Tensor weight, "
+      "Tensor stats, int source_type, Tensor(b!) scratch, int group_size) -> "
+      "()");
+  ops.impl("gguf_lattice_blas_sm70_out", torch::kCUDA,
+           &gguf_lattice_blas_sm70_out);
+  ops.def(
+      "gguf_native_linear_n64_sm70_out(Tensor(a!) out, Tensor input, Tensor "
+      "weight, "
+      "Tensor(b!) partials, Tensor(c!) counters, int source_type) -> ()");
+  ops.impl("gguf_native_linear_n64_sm70_out", torch::kCUDA,
+           &gguf_native_linear_n64_sm70_out);
+  ops.def(
+      "gguf_native_pair_sm70_out(Tensor(a!) out, Tensor input, Tensor gate, "
+      "Tensor up, int gate_type, int up_type) -> ()");
+  ops.impl("gguf_native_pair_sm70_out", torch::kCUDA,
+           &gguf_native_pair_sm70_out);
+  ops.def(
+      "gguf_prefill_transcode_sm70(Tensor(a!) dst_w, Tensor(b!) dst_s, "
+      "int w_stride, int s_stride, Tensor src0, Tensor? src1, Tensor experts, "
+      "Tensor count, int ctas, int source_type, int n_out, int k, "
+      "int k_offset, int src_stride, "
+      "Tensor(c!) error) -> ()");
+  ops.impl("gguf_prefill_transcode_sm70", torch::kCUDA,
+           &gguf_prefill_transcode_sm70);
+  ops.def(
+      "gguf_qkv_sm70_out(Tensor(a!) output, Tensor input, "
+      "Tensor[] weights, Tensor[] stats, int[] types, "
+      "Tensor(b!) partials, Tensor(c!) counters) -> ()");
+  ops.impl("gguf_qkv_sm70_out", torch::kCUDA, &gguf_qkv_sm70_out);
+  ops.def(
+      "gguf_qkvz_sm70_out(Tensor(a!) output, Tensor input, "
+      "Tensor[] weights, Tensor[] stats, int[] types, "
+      "Tensor(b!) partials, Tensor(c!) counters) -> ()");
+  ops.impl("gguf_qkvz_sm70_out", torch::kCUDA, &gguf_qkvz_sm70_out);
+  ops.def(
+      "gguf_shared_gate_up_sm70_out(Tensor x, Tensor[] gate, Tensor[] up, "
+      "int[] fmts, Tensor wg, Tensor(a!) h, Tensor(b!) sg, Tensor(c!) ws, "
+      "Tensor(d!) cnt, int split, int warps) -> ()");
+  ops.impl("gguf_shared_gate_up_sm70_out", torch::kCUDA,
+           &gguf_shared_gate_up_sm70_out);
+  ops.def(
+      "gguf_small_output_sm70_out(Tensor(a!) output, Tensor input, Tensor "
+      "weight, "
+      "Tensor(b!) partials, Tensor(c!) counters, int type, int splits, bool "
+      "gdn_head_tiling) -> ()");
+  ops.impl("gguf_small_output_sm70_out", torch::kCUDA,
+           &gguf_small_output_sm70_out);
+
+
   ops.def(
       "awq_sm70_dequantize_out(Tensor(a!) out, Tensor _kernel, "
       "Tensor _scaling_factors, int group_size) -> ()");
@@ -247,6 +534,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
       "bool gated_silu, bool preserve_default_partition=False) -> ()");
   ops.impl("fp8_gemm_sm70_out", torch::kCUDA, &fp8_gemm_sm70_out);
+
+  ops.def(
+      "sm70_dflash2_fp16_m8_out(Tensor(a!) output, Tensor input, Tensor "
+      "packed, int tile, int warps) -> ()");
+  ops.impl("sm70_dflash2_fp16_m8_out", torch::kCUDA, &sm70_dflash2_fp16_m8_out);
+  ops.def(
+      "sm70_dflash2_fp16_dispatch_out(Tensor(a!) output, Tensor input, Tensor "
+      "packed, Tensor weight, int tile, int warps) -> ()");
+  ops.impl("sm70_dflash2_fp16_dispatch_out", torch::kCUDA,
+           &sm70_dflash2_fp16_dispatch_out);
 
   ops.def("fp8_qpn8_prepare_sm70(Tensor qweight, Tensor scales) -> Tensor[]");
   ops.impl("fp8_qpn8_prepare_sm70", torch::kCUDA, &fp8_qpn8_prepare_sm70);
@@ -399,6 +696,27 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int accumulator_chains) -> ()");
   ops.impl("nvfp4_qpn2_gated_sm70_out", torch::kCUDA,
            &nvfp4_qpn2_gated_sm70_out);
+
+  // P2c: kernels referenced by base Python but previously missing from csrc.
+  ops.def(
+      "skinny_qpn_gemm_sm70(Tensor x, Tensor qcodes, Tensor qscales, "
+      "float gscale, int n) -> Tensor");
+  ops.impl("skinny_qpn_gemm_sm70", torch::kCUDA, &skinny_qpn_gemm_sm70);
+
+  ops.def(
+      "skinny_moe_qpn_sm70(Tensor x, Tensor qcodes, Tensor qscales, "
+      "Tensor gscales, Tensor perm, Tensor gids, Tensor goff, int topk, "
+      "Tensor(a!) y_slots, bool x_slot_major, int num_tokens, int splitk, "
+      "int nacc, int scale_mode) -> ()");
+  ops.impl("skinny_moe_qpn_sm70", torch::kCUDA, &skinny_moe_qpn_sm70);
+
+  ops.def(
+      "qsa_dense_decode_sm70_out(Tensor(a!) out, Tensor query, "
+      "Tensor key_cache, Tensor value_cache, Tensor block_table, "
+      "Tensor token_to_req, Tensor positions, Tensor? gate, Tensor(b!) ws_o, "
+      "Tensor(c!) ws_ml, int num_requests, int splits, int warps) -> ()");
+  ops.impl("qsa_dense_decode_sm70_out", torch::kCUDA,
+           &qsa_dense_decode_sm70_out);
 
   ops.def(
       "nvfp4_qpn2_dispatch_sm70_out(Tensor(a!) out, Tensor input, "

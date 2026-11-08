@@ -19,6 +19,7 @@ from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CircularBufferSpec,
@@ -751,12 +752,35 @@ def _check_enough_kv_cache_memory(
         )
 
 
+def _device_resident_bytes(
+    vllm_config: VllmConfig, kv_cache_specs: Iterable[KVCacheSpec]
+) -> int:
+    """Sum KV memory that must stay on the GPU.
+
+    A bounded host-KV state pool keeps its history in host memory, so charging
+    it here would make the up-front check reject a configuration the pool can
+    actually serve. Uniform groups are filtered member by member.
+    """
+    total = 0
+    for spec in kv_cache_specs:
+        members = getattr(spec, "kv_cache_specs", None)
+        if isinstance(members, dict):
+            for member in members.values():
+                if not getattr(member, "host_backed", False):
+                    total += member.max_memory_usage_bytes(vllm_config)
+        elif not getattr(spec, "host_backed", False):
+            total += spec.max_memory_usage_bytes(vllm_config)
+    return total
+
+
 def max_memory_usage_bytes(
     vllm_config: VllmConfig, kv_cache_specs: Iterable[KVCacheSpec]
 ) -> int:
     """
     Get the maximum memory usage in bytes for the given KV cache specs.
     """
+    if _host_kv_state_blocks(vllm_config):
+        return _device_resident_bytes(vllm_config, kv_cache_specs)
     return sum(spec.max_memory_usage_bytes(vllm_config) for spec in kv_cache_specs)
 
 
@@ -1040,6 +1064,76 @@ def is_kv_cache_page_size_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool
     return len(page_sizes) == 1
 
 
+def _compact_sm70_hybrid_sliding_window_pages(
+    specs: dict[str, KVCacheSpec], vllm_config: VllmConfig | None
+) -> dict[str, KVCacheSpec]:
+    """Avoid padding recurrent states to a larger draft attention page.
+
+    Flash-V100 supports kernel blocks divisible by 16. A higher-precision
+    sliding-window cache can use fewer tokens per page while preserving its
+    dtype and window, allowing it to share the target's smaller physical page.
+    Other backends keep their existing layout until validated independently.
+    """
+    attention_config = getattr(vllm_config, "attention_config", None)
+    draft_backend = getattr(
+        getattr(vllm_config, "speculative_config", None), "attention_backend", None
+    )
+    if (
+        getattr(attention_config, "backend", None)
+        != AttentionBackendEnum.FLASH_ATTN_V100
+        or draft_backend not in (None, AttentionBackendEnum.FLASH_ATTN_V100)
+        or not any(isinstance(spec, MambaSpec) for spec in specs.values())
+    ):
+        return specs
+    target_page = max(
+        spec.page_size_bytes
+        for spec in specs.values()
+        if not isinstance(spec, SlidingWindowSpec)
+    )
+    result = dict(specs)
+    for name, spec in specs.items():
+        if (
+            type(spec) is not SlidingWindowSpec
+            or spec.page_size_padded is not None
+            or spec.page_size_bytes <= target_page
+            or spec.page_size_bytes % target_page
+        ):
+            continue
+        ratio = spec.page_size_bytes // target_page
+        if spec.block_size % (16 * ratio):
+            continue
+        result[name] = replace(spec, block_size=spec.block_size // ratio)
+
+    # A 1648-token FP16 draft page cannot be halved to 824 tokens:
+    # Flash-V100 requires multiples of 16. Round the common physical page
+    # up instead (832 draft / 1664 E4M3 target tokens), without doubling
+    # every recurrent-state page. Already compact layouts stay unchanged.
+    if max(spec.page_size_bytes for spec in result.values()) <= target_page:
+        return result
+    if any(
+        type(spec) not in (FullAttentionSpec, SlidingWindowSpec, MambaSpec)
+        or (isinstance(spec, AttentionSpec) and spec.page_size_padded is not None)
+        for spec in result.values()
+    ):
+        return result
+    attention_specs = [
+        spec for spec in result.values() if isinstance(spec, AttentionSpec)
+    ]
+    alignment = math.lcm(
+        *(16 * spec.page_size_bytes // spec.block_size for spec in attention_specs)
+    )
+    common_page = cdiv(target_page, alignment) * alignment
+    if common_page >= max(spec.page_size_bytes for spec in result.values()):
+        return result
+    for name, spec in result.items():
+        if isinstance(spec, AttentionSpec):
+            bytes_per_token = spec.page_size_bytes // spec.block_size
+            result[name] = replace(spec, block_size=common_page // bytes_per_token)
+        elif isinstance(spec, MambaSpec):
+            result[name] = replace(spec, page_size_padded=common_page)
+    return result
+
+
 def unify_kv_cache_spec_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
     vllm_config: VllmConfig | None = None,
@@ -1056,6 +1150,9 @@ def unify_kv_cache_spec_page_size(
     Returns:
         The updated KVCacheSpec with the same page_size_bytes.
     """
+    kv_cache_spec = _compact_sm70_hybrid_sliding_window_pages(
+        kv_cache_spec, vllm_config
+    )
     page_sizes = {layer.page_size_bytes for layer in kv_cache_spec.values()}
     if len(page_sizes) <= 1:
         # All layers have the same page size, no need to unify.
@@ -1666,6 +1763,11 @@ def _glm5_next_tensor_layout(
     )
 
 
+def _host_kv_state_blocks(vllm_config: VllmConfig) -> int:
+    policy = cast(Any, getattr(vllm_config, "kernel_config", None))
+    return int(getattr(policy, "qsa_host_kv_state_blocks", 0))
+
+
 def _get_kv_cache_config_csa_linear(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1675,24 +1777,124 @@ def _get_kv_cache_config_csa_linear(
     if layout is None:
         return None
 
-    num_blocks = available_memory // layout.bytes_per_block
-    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
-    kv_cache_tensors = [
-        KVCacheTensor(
-            size=layout.main_kv_page_size * num_blocks,
-            shared_by=[main_kv_name]
-            + [
-                group.layer_names[index]
-                for group in layout.mamba_groups
-                if index < len(group.layer_names)
-            ],
+    state_blocks = _host_kv_state_blocks(vllm_config)
+    state_groups = tuple(
+        i for i, group in enumerate(kv_cache_groups) if group in layout.mamba_groups
+    )
+    if state_blocks:
+        if not layout.host_main_kv_names or len(layout.host_main_kv_names) != len(
+            layout.main_kv_names
+        ):
+            raise ValueError("A bounded state pool requires all main KV owners on host")
+        if getattr(vllm_config, "kv_transfer_config", None) is not None:
+            raise ValueError("Bounded host-KV state pools do not support KV connectors")
+        requests = vllm_config.scheduler_config.max_num_seqs
+
+        def demand(group):
+            # A group mixing full-attention pages with a QSA indexer's
+            # compressed pages shares one physical grid cut at the finest
+            # granularity. Convert the byte demand into that grid, otherwise
+            # the pool is sized for coarse blocks while the block table has
+            # to address fine ones.
+            spec = group.kv_cache_spec
+            members = (
+                tuple(spec.kv_cache_specs.values())
+                if type(spec).__name__ == "UniformTypeKVCacheSpecs"
+                else (spec,)
+            )
+            finest = min(
+                int(getattr(m, "storage_block_size", None) or m.block_size)
+                for m in members
+            )
+            grid = spec.page_size_bytes * finest // int(spec.block_size)
+            return (
+                cdiv(spec.max_memory_usage_bytes(vllm_config), grid)
+                + 1
+            )
+
+        active_states = 1 + requests * sum(
+            demand(group)
+            for i, group in enumerate(kv_cache_groups)
+            if i in state_groups
         )
-        for index, main_kv_name in enumerate(layout.main_kv_names)
-    ]
+        if state_blocks < active_states:
+            raise ValueError(f"State pool needs at least {active_states} blocks")
+        history_blocks = requests * sum(
+            demand(group)
+            for i, group in enumerate(kv_cache_groups)
+            if i not in state_groups
+        )
+        state_bytes = (
+            sum(layout.owner_page_size(i) for i in range(len(layout.main_kv_owners)))
+            * state_blocks
+        )
+        history_page = layout.device_compressed_page_bytes
+        num_blocks = state_blocks + history_blocks
+        required = state_bytes + history_page * num_blocks
+        if required > available_memory:
+            raise ValueError(
+                f"Host-KV fixed pools need {format_gib(required)} GiB device "
+                f"memory; {format_gib(available_memory)} GiB is available"
+            )
+        if vllm_config.cache_config.num_gpu_blocks_override is not None:
+            raise ValueError("A bounded state pool derives its logical block capacity")
+    else:
+        num_blocks = available_memory // layout.bytes_per_block
+    if (
+        layout.host_main_kv_names
+        and not state_blocks
+        and vllm_config.cache_config.num_gpu_blocks_override is None
+        and not getattr(vllm_config.cache_config, "enable_prefix_caching", False)
+    ):
+        # With authoritative host history, filling the remaining device budget
+        # with padded state pages defeats the memory saving. Bound the shared
+        # scheduler pool to all admitted requests at maximum length, including
+        # one extra page per group for lookahead/alignment and the null block.
+        per_request = sum(
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            + 1
+            for group in kv_cache_groups
+            if group.layer_names
+        )
+        num_blocks = min(
+            num_blocks, 1 + vllm_config.scheduler_config.max_num_seqs * per_request
+        )
+    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    kv_cache_tensors = []
+    for index, owner in enumerate(layout.main_kv_owners):
+        members = [layout.main_kv_names[i] for i in owner]
+        host_members = [name for name in members if name in layout.host_main_kv_names]
+        for member in host_members:
+            member_index = layout.main_kv_names.index(member)
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=layout.main_kv_page_sizes[member_index] * num_blocks,
+                    shared_by=[member],
+                    host_backed=True,
+                )
+            )
+        device_members = [name for name in members if name not in host_members] + [
+            group.layer_names[index]
+            for group in layout.mamba_groups
+            if index < len(group.layer_names)
+        ]
+        if device_members:
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=layout.owner_page_size(index) * (state_blocks or num_blocks),
+                    shared_by=device_members,
+                    packed_members=members if len(members) > 1 else None,
+                    physical_num_blocks=state_blocks or None,
+                )
+            )
     kv_cache_tensors.extend(
         KVCacheTensor(
-            size=layout.compressed_page_size * num_blocks,
+            size=layout.compressed_page_sizes[index] * num_blocks,
             shared_by=[compressed_name, layout.compressor_state_names[index]],
+            host_backed=compressed_name in layout.host_compressed_names,
         )
         for index, compressed_name in enumerate(layout.compressed_names)
     )
@@ -1988,14 +2190,74 @@ class _CSALinearTensorLayout:
     compressed_names: list[str]
     compressor_state_names: list[str]
     mamba_groups: list[KVCacheGroupSpec]
-    main_kv_page_size: int
-    compressed_page_size: int
+    main_kv_page_sizes: list[int]
+    compressed_page_sizes: list[int]
+    # Physical main-KV owners, as indices into ``main_kv_names``.
+    main_kv_owners: list[list[int]]
+    host_main_kv_names: tuple[str, ...] = ()
+    host_compressed_names: tuple[str, ...] = ()
+    device_owner_page_sizes: list[int] | None = None
+
+    @property
+    def device_compressed_page_bytes(self) -> int:
+        return sum(
+            size
+            for name, size in zip(self.compressed_names, self.compressed_page_sizes)
+            if name not in self.host_compressed_names
+        )
 
     @property
     def bytes_per_block(self) -> int:
-        return len(self.main_kv_names) * (
-            self.main_kv_page_size + self.compressed_page_size
+        pages = self.device_owner_page_sizes
+        return (
+            sum(pages if pages is not None else self.main_kv_page_sizes)
+            + self.device_compressed_page_bytes
         )
+
+    def owner_page_size(self, owner: int) -> int:
+        if self.device_owner_page_sizes is not None:
+            return self.device_owner_page_sizes[owner]
+        return sum(self.main_kv_page_sizes[i] for i in self.main_kv_owners[owner])
+
+
+def _csa_linear_state_page(mamba_specs: Iterable[KVCacheSpec]) -> int:
+    """Largest unpadded recurrent-state page among the given owners."""
+    pages = [
+        replace(spec, page_size_padded=None).page_size_bytes
+        for spec in mamba_specs
+        if isinstance(spec, MambaSpec)
+    ]
+    return max(pages, default=0)
+
+
+def _pack_csa_linear_main_kv(
+    page_sizes: Sequence[int], state_page: int
+) -> list[list[int]]:
+    """Group main-KV owners so that every physical page holds a recurrent state.
+
+    An owner whose page already holds one stays alone; that is the DCP1 layout
+    and any layout with large enough pages. Under DCP a sharded main K/V page
+    holds only ``block_size // dcp`` slots per rank, too few for a state, so
+    such owners are packed in layer order, as few per physical page as hold a
+    state; a packed page interleaves its members one kernel block at a time.
+    """
+    owners: list[list[int]] = []
+    pending: dict[int, list[int]] = {}
+    for index, page in enumerate(page_sizes):
+        if page >= state_page:
+            owners.append([index])
+            continue
+        members = pending.setdefault(page, [])
+        members.append(index)
+        if len(members) == cdiv(state_page, page):
+            owners.append(members)
+            del pending[page]
+    if pending:
+        raise ValueError(
+            "CSA+linear main-KV owners do not fill whole physical pages: "
+            f"{ {page: len(members) for page, members in pending.items()} }."
+        )
+    return owners
 
 
 class _CSALinearRoles(NamedTuple):
@@ -2260,13 +2522,62 @@ def _get_csa_linear_tensor_layout(
     if not main_kv_names or not compressed_names:
         return None
 
+    main_kv_page_sizes = [
+        compressed_sparse[name].page_size_bytes for name in main_kv_names
+    ]
+    host_owners = tuple(
+        name
+        for name in main_kv_names
+        if cast(FullAttentionSpec, compressed_sparse[name]).host_backed
+    )
+    logger.info(
+        "CSA linear layout: main_kv=%d compressed=%d host_owners=%d",
+        len(main_kv_names),
+        len(compressed_names),
+        len(host_owners),
+    )
+    device_pages = None
+    if host_owners:
+        device_pages = []
+        for index, name in enumerate(main_kv_names):
+            size = 0 if name in host_owners else main_kv_page_sizes[index]
+            for group in mamba_groups:
+                if index < len(group.layer_names):
+                    spec = group.kv_cache_spec
+                    if isinstance(spec, UniformTypeKVCacheSpecs):
+                        spec = spec.kv_cache_specs[group.layer_names[index]]
+                    size = max(size, spec.page_size_bytes)
+            device_pages.append(size)
     return _CSALinearTensorLayout(
         main_kv_names=main_kv_names,
         compressed_names=compressed_names,
         compressor_state_names=list(compressor_state),
         mamba_groups=mamba_groups,
-        main_kv_page_size=compressed_sparse[main_kv_names[0]].page_size_bytes,
-        compressed_page_size=compressed_sparse[compressed_names[0]].page_size_bytes,
+        main_kv_page_sizes=main_kv_page_sizes,
+        compressed_page_sizes=[
+            compressed_sparse[name].page_size_bytes for name in compressed_names
+        ],
+        host_main_kv_names=host_owners,
+        host_compressed_names=tuple(
+            name
+            for name in compressed_names
+            if cast(MLAAttentionSpec, compressed_sparse[name]).host_backed
+        ),
+        device_owner_page_sizes=device_pages,
+        main_kv_owners=[[i] for i in range(len(main_kv_names))]
+        if host_owners
+        else _pack_csa_linear_main_kv(
+            main_kv_page_sizes,
+            _csa_linear_state_page(
+                member
+                for group in mamba_groups
+                for member in (
+                    group.kv_cache_spec.kv_cache_specs.values()
+                    if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                    else [group.kv_cache_spec]
+                )
+            ),
+        ),
     )
 
 
@@ -2567,6 +2878,8 @@ def _max_memory_usage_bytes_from_groups(
     if not kv_cache_groups:
         return 0
 
+    print("MAXMEM-STEP n=", len(kv_cache_groups),
+          "single_unif=", len(kv_cache_groups) == 1, flush=True)
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
@@ -2577,6 +2890,16 @@ def _max_memory_usage_bytes_from_groups(
             for spec in per_layer_specs.values()
         )
     elif layout := _get_csa_linear_tensor_layout(kv_cache_groups):
+        if layout.host_main_kv_names and _host_kv_state_blocks(vllm_config):
+            # Host history is not a device budget: charge only the tensors that
+            # stay resident, mirroring the allocation the pool will perform.
+            allocation = _get_kv_cache_config_csa_linear(
+                vllm_config, kv_cache_groups, 1 << 62
+            )
+            assert allocation is not None
+            _, tensors = allocation
+            _dev = sum(t.size for t in tensors if not t.host_backed)
+            return _dev
         blocks_needed = sum(
             cdiv(
                 group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
@@ -2601,6 +2924,16 @@ def _max_memory_usage_bytes_from_groups(
             cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).get_num_layer_tuples()
             for group in kv_cache_groups
         )
+
+        if _host_kv_state_blocks(vllm_config):
+            # The bounded host-KV pool keeps its history off the GPU; only the
+            # resident state slice is charged against device memory.
+            allocation = _get_kv_cache_config_csa_linear(
+                vllm_config, kv_cache_groups, 1 << 62
+            )
+            if allocation is not None:
+                _, tensors = allocation
+                return sum(t.size for t in tensors if not t.host_backed)
 
         total_max_mem_usage_bytes = 0
         for group in kv_cache_groups:
@@ -2654,6 +2987,16 @@ def _max_memory_usage_bytes_from_groups(
             + len(idx_names) * idx_page
             + sum(page_size for _, page_size in standalone_auxiliary)
         )
+
+    if _host_kv_state_blocks(vllm_config):
+        # The bounded host-KV pool keeps history off the GPU; charge only what
+        # the pool will actually leave resident there.
+        allocation = _get_kv_cache_config_csa_linear(
+            vllm_config, kv_cache_groups, 1 << 62
+        )
+        if allocation is not None:
+            _, tensors = allocation
+            return sum(t.size for t in tensors if not t.host_backed)
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len
@@ -2956,8 +3299,11 @@ def get_kv_cache_configs(
         num_blocks_old = kv_cache_config.num_blocks
         kv_cache_config.num_blocks = min_num_blocks
 
-        # Shrink tensor size proportionally
+        # Shrink tensor size proportionally. A fixed physical pool is sized by
+        # its own block count, so rank reconciliation must leave it alone.
         for tensor in kv_cache_config.kv_cache_tensors:
+            if tensor.physical_num_blocks is not None:
+                continue
             assert tensor.size % num_blocks_old == 0
             tensor.size = tensor.size // num_blocks_old * min_num_blocks
 

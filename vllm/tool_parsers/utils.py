@@ -3,6 +3,7 @@
 
 import ast
 import json
+import math
 import re
 from json import JSONDecodeError, JSONDecoder
 from typing import Any, TypeAlias
@@ -143,6 +144,39 @@ def consume_space(i: int, s: str) -> int:
     while i < len(s) and s[i].isspace():
         i += 1
     return i
+
+
+def _is_json_finite(value: Any) -> bool:
+    """Reject non-finite floats that would serialise to non-JSON constants.
+
+    ``json.dumps`` emits ``Infinity``/``-Infinity``/``NaN`` for these, which
+    Python accepts on read-back but every strict JSON consumer rejects. The
+    usual source is a model writing ``1e999`` into a numeric argument.
+    """
+    return math.isfinite(value)
+
+
+def json_dumps_safe(obj: Any, **kwargs: Any) -> str:
+    """``json.dumps`` that never emits ``Infinity``/``NaN``.
+
+    Non-finite floats are replaced with ``None`` so the payload stays valid
+    JSON: dropping them silently keeps the tool call usable, whereas emitting
+    the Python extension would break the caller's parser.
+    """
+    kwargs.setdefault("ensure_ascii", False)
+    if not kwargs.get("allow_nan", True):
+        return json.dumps(obj, **kwargs)
+    return json.dumps(_sanitise_non_finite(obj), allow_nan=False, **kwargs)
+
+
+def _sanitise_non_finite(obj: Any) -> Any:
+    if isinstance(obj, float):
+        return obj if _is_json_finite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _sanitise_non_finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitise_non_finite(v) for v in obj]
+    return obj
 
 
 def _extract_tool_info(

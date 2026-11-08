@@ -1252,13 +1252,11 @@ class MambaManager(SingleTypeKVCacheManager):
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         if self.mamba_cache_mode == "align":
-            # Mapping from request ID to the index of the block
-            # allocated in the previous step
-            self.last_state_block_idx: dict[str, int] = {}
-            # [本地 X2 2026-10-03] Mapping from request ID to the earlier state
-            # block indices that `last_state_block_idx` moved past before they
-            # could be freed
-            self.stale_state_block_idxs: dict[str, list[int]] = {}
+            # Mapping from request ID to the indices of the state blocks that
+            # were superseded by a later allocation and still await release.
+            # Usually one entry; under async scheduling a second one can be
+            # pending because the previous step has not been processed yet.
+            self.last_state_block_idx: dict[str, list[int]] = {}
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
 
@@ -1329,49 +1327,33 @@ class MambaManager(SingleTypeKVCacheManager):
             request_id, processed_computed_tokens, num_prompt_tokens
         )
         if self.mamba_cache_mode == "align":
-            # `last_state_block_idx` refers to the block index allocated two steps ago.
-            # The block allocated in the previous step is used to copy Mamba states
-            # into the block allocated in the current step; the earlier block is
-            # no longer needed and should be freed here.
-            last_state_block_idx = self.last_state_block_idx.get(request_id)
+            # `last_state_block_idx` lists the indices of the state blocks that
+            # were superseded by a later allocation. The block allocated in the
+            # previous step is used to copy Mamba states into the block
+            # allocated in the current step; the earlier blocks are no longer
+            # needed and should be freed here.
+            pending = self.last_state_block_idx.get(request_id)
+            if not pending:
+                return
             # Blocks allocated during prefill may be non-contiguous. Use
-            # `last_state_block_idx` to free the appropriate block and replace it
-            # with a null block.
-            if (
-                last_state_block_idx is not None
-                and last_state_block_idx
-                < cdiv(processed_computed_tokens, self.block_size) - 1
-            ):
-                blocks = self.req_to_blocks[request_id]
-                if blocks[last_state_block_idx] != self._null_block:
-                    self.block_pool.free_blocks([blocks[last_state_block_idx]])
-                    blocks[last_state_block_idx] = self._null_block
-            # [本地 X2 2026-10-03] While a step is in flight, the state block it
-            # copies from cannot be freed yet, and the next allocation moves
-            # `last_state_block_idx` past it. The backward scan in the base class
-            # reaches such a block only through a contiguous run of state blocks,
-            # which the null blocks of a chunk spanning several blocks interrupt.
-            # Free these blocks on the same processed-token basis.
-            stale_state_block_idxs = self.stale_state_block_idxs.get(request_id)
-            if stale_state_block_idxs:
-                blocks = self.req_to_blocks[request_id]
-                num_skipped_blocks = (
-                    cdiv(processed_computed_tokens, self.block_size) - 1
-                )
-                num_passed = 0
-                freed: list[KVCacheBlock] = []
-                # The indices were recorded in increasing order.
-                for block_idx in stale_state_block_idxs:
-                    if block_idx >= num_skipped_blocks:
-                        break
-                    num_passed += 1
-                    if blocks[block_idx] != self._null_block:
-                        freed.append(blocks[block_idx])
-                        blocks[block_idx] = self._null_block
-                del stale_state_block_idxs[:num_passed]
-                if freed:
-                    # Tail blocks first, as in `free`.
-                    self.block_pool.free_blocks(reversed(freed))
+            # `last_state_block_idx` to free the appropriate blocks and replace
+            # them with null blocks. Under async scheduling the step scheduled
+            # just before this one is still in flight, so
+            # `processed_computed_tokens` lags by one more step and the block
+            # recorded last is still the copy source of that step: keep it
+            # pending (a later call frees it) instead of forgetting it, which
+            # would leak one block per prefill chunk until the request ends.
+            release_before = cdiv(processed_computed_tokens, self.block_size) - 1
+            blocks = self.req_to_blocks[request_id]
+            keep: list[int] = []
+            for idx in pending:
+                if idx < release_before:
+                    if blocks[idx] != self._null_block:
+                        self.block_pool.free_blocks([blocks[idx]])
+                        blocks[idx] = self._null_block
+                else:
+                    keep.append(idx)
+            self.last_state_block_idx[request_id] = keep
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
@@ -1484,28 +1466,19 @@ class MambaManager(SingleTypeKVCacheManager):
             else:
                 prev_block_len = len(req_blocks)
                 blocks_allocated = request_id in self._allocated_block_reqs
-                # [本地 X2 2026-10-03] The index recorded by the previous
-                # allocation is replaced below. Keep it if
-                # `remove_skipped_blocks` could not free that block yet.
-                stale_state_block_idx = self.last_state_block_idx.get(request_id)
-                if (
-                    stale_state_block_idx is not None
-                    and req_blocks[stale_state_block_idx] != self._null_block
-                ):
-                    self.stale_state_block_idxs.setdefault(request_id, []).append(
-                        stale_state_block_idx
-                    )
                 # Record the last state block
                 if blocks_allocated:
                     # We always save the running state at the last
                     # (1 + num_speculative_blocks) block
-                    self.last_state_block_idx[request_id] = (
+                    self.last_state_block_idx.setdefault(request_id, []).append(
                         prev_block_len - 1 - self.num_speculative_blocks
                     )
                 elif prev_block_len > 0:
                     # When a new request hits the prefix cache, the last block
                     # saves the hit state.
-                    self.last_state_block_idx[request_id] = prev_block_len - 1
+                    self.last_state_block_idx.setdefault(request_id, []).append(
+                        prev_block_len - 1
+                    )
 
                 num_skipped_blocks = (
                     num_required_blocks - self.num_speculative_blocks - 1
@@ -1543,8 +1516,6 @@ class MambaManager(SingleTypeKVCacheManager):
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
-            # [本地 X2 2026-10-03] Drop the tracked superseded block indices.
-            self.stale_state_block_idxs.pop(request_id, None)
             # A hand-off is valid only while its source still belongs to this
             # request. Drop offers that have not reached the connector before
             # returning the request's blocks to the pool.
@@ -1589,10 +1560,17 @@ class MambaManager(SingleTypeKVCacheManager):
             first = (start_block + per_segment) // per_segment * per_segment - 1
             for i in range(first - start_block, len(mask), per_segment):
                 mask[i] = True
+        # Upstream #59146: a prompt's final chunk caches only up to its last
+        # full block, so its prompt-end checkpoint is the reusable boundary
+        # rather than a transient one. Without this the checkpoint is dropped
+        # and the next request extending the prompt misses the whole prefix.
         for boundary in reachable_boundaries:
             aligned = boundary // alignment_tokens * alignment_tokens
             block = aligned // block_size - 1
             if start_block <= block < end_block:
+                mask[block - start_block] = True
+            elif block == end_block - 1 and block >= 0:
+                # The prompt-end boundary can land exactly at the chunk edge.
                 mask[block - start_block] = True
         return mask
 

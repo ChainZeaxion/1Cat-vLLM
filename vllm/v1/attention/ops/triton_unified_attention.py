@@ -31,7 +31,7 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
 from vllm.v1.kv_cache_interface import KVQuantMode
 
 logger = init_logger(__name__)
-is_batch_invariant = envs.VLLM_BATCH_INVARIANT
+is_batch_invariant = envs.VLLM_BATCH_INVARIANT or envs.VLLM_SPECULATIVE_TOKEN_PARITY
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
 

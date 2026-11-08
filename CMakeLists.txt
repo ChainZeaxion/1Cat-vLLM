@@ -317,6 +317,9 @@ set(VLLM_EXT_SRC
   "csrc/cuda_utils_kernels.cu"
   "csrc/custom_all_reduce.cu"
   "csrc/torch_bindings.cpp"
+  "csrc/ple_disk_rows.cpp"
+  "csrc/ple_fast_lane.cpp"
+  "csrc/gguf_dmv13_pack.cpp"
   "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu")
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
@@ -365,6 +368,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   set(VLLM_SM70_TURBOMIND_INCLUDE_DIRS "")
   cuda_archs_loose_intersection(SM70_TURBOMIND_ARCHS "7.0" "${CUDA_ARCHS}")
   if (SM70_TURBOMIND_ARCHS)
+    # SM70 ring collectives (ported from v153, see P3-D).
+    list(APPEND VLLM_EXT_SRC "csrc/sm70_ring_collectives.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "csrc/sm70_ring_collectives.cu"
+      CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
     set(VLLM_SM70_TURBOMIND_ROOT
         "${CMAKE_CURRENT_LIST_DIR}/csrc/sm70_turbomind")
     set(VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT
@@ -409,7 +417,42 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_qpn2_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/glm53_fp16_gemv_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/glm53_cublaslt_sm70.cpp"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/dflash2_fp16_m8_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_sm70_gemm.cu")
+
+    # GGUF native kernels (ported from v153). See v153移植计划-20261027.md P2a.
+    list(APPEND VLLM_SM70_TURBOMIND_SRCS
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_dequant_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_lattice_dequant_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_lattice_decode_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_small_grouped_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_lattice_raw_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_prefill_transcode_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_dp4a_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_shared_expert_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_iq3_signed_pair_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_native_linear_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_dmv_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_dmvq_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_moe_gu_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_qkvz_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_small_output_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_native_pair_sm70.cu")
+
+    # Non-GGUF kernels referenced by base Python but missing from csrc (P2c).
+    list(APPEND VLLM_SM70_TURBOMIND_SRCS
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/qsa_dense_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/skinny_moe_qpn_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/mtp_local_top1_sm70.cu")
+
+    # Flash-Next non-GGUF kernels referenced by base Python (P3-D).
+    list(APPEND VLLM_SM70_TURBOMIND_SRCS
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/hcx_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gdn_verify_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/top1x_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/sm70_router.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/hc_ll_shard_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/compact_half_topk_sm70.cu")
 
     set_gencode_flags_for_srcs(
       SRCS "${VLLM_SM70_TURBOMIND_SRCS}"
@@ -727,7 +770,8 @@ endif()
 if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
   set(VLLM_SM70_SAMPLER_FRAGMENT_SRCS
     "csrc/sm70_turbomind/ops/sm70_top20_philox_fragment.cpp"
-    "csrc/sm70_turbomind/ops/sm70_top20_philox_sampler.cu")
+    "csrc/sm70_turbomind/ops/sm70_top20_philox_sampler.cu"
+    "csrc/sm70_turbomind/ops/sm70_sampler_graph_branch.cu")
   set_gencode_flags_for_srcs(
     SRCS "${VLLM_SM70_SAMPLER_FRAGMENT_SRCS}"
     CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
@@ -747,6 +791,16 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
     CUDA_EXTENSIONS OFF)
+  # [port 1.5.2 #1393] The sampler-graph operator hands a device function to
+  # cudaGraphAddNode, which needs the resolved device address rather than the
+  # host __device_stub__; without this the add-node call fails with
+  # cudaErrorInvalidValue.
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8")
+    set_target_properties(_sm70_sampler_C PROPERTIES
+      CUDA_ARCHITECTURES 70
+      CUDA_SEPARABLE_COMPILATION ON
+      CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  endif()
   target_compile_definitions(_sm70_sampler_C PRIVATE
     TORCH_API_INCLUDE_EXTENSION_H
     $<$<COMPILE_LANGUAGE:CUDA>:__CUDA_NO_HALF_OPERATORS__>
@@ -806,6 +860,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
 endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
+  if(VLLM_GPU_LANG STREQUAL "CUDA")
+    include(csrc/quantization/gguf_upstream/CMakeLists.txt)
+  endif()
   #
   # _C_stable_libtorch extension (ops registered via STABLE_TORCH_LIBRARY)
   #

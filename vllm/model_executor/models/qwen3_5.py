@@ -1057,6 +1057,13 @@ class Qwen3_5ForCausalLMBase(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        _r = self.logits_processor(self.lm_head, hidden_states)
+        return _r
+
+    def _old_compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
     def get_mrope_input_positions(

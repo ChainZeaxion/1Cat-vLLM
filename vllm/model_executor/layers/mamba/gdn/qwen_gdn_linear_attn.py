@@ -5575,12 +5575,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 mixed_qkv_spec = mixed_qkv
                 mixed_qkv_non_spec = None
+                # Upstream #62851: ordinary decode rows must read gathered
+                # gates, so keep them in step with their QKV rows.
+                a_non_spec, b_non_spec = None, None
             else:
                 mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
                 mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
+                a_non_spec = a.index_select(0, non_spec_token_indx)
+                b_non_spec = b.index_select(0, non_spec_token_indx)
         else:
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
+            a_non_spec, b_non_spec = a, b
 
         if mixed_qkv_non_spec is not None:
             _sm70_gdn_graph_buffer_copy(
@@ -5874,13 +5880,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert mixed_qkv_non_spec is not None, (
                 "mixed_qkv_non_spec must be provided for prefill path"
             )
-            if spec_sequence_masks is not None:
-                a_non_spec = a.index_select(0, non_spec_token_indx)
-                b_non_spec = b.index_select(0, non_spec_token_indx)
-            else:
-                a_non_spec = a
-                b_non_spec = b
-
             if self.enable_sm70_legacy_prefill_prep:
                 query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
                     mixed_qkv_non_spec

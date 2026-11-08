@@ -33,8 +33,17 @@ class EmulationMxfp8LinearKernel(Mxfp8LinearKernel):
 
         weight_scale = layer.weight_scale.data[:N, :scale_k].contiguous()
 
-        layer.weight = Parameter(weight.contiguous(), requires_grad=False)
+        # Dequantize once here rather than per forward. Keeping an fp8 tensor on
+        # the module would put fp8e4nv into the captured graph, which SM70
+        # cannot lower; and the emulation path would otherwise rebuild the
+        # whole FP16 weight matrix on every step.
+        dequantized = dequant_mxfp8_to_bf16(
+            weight.contiguous(), weight_scale
+        ).to(torch.float16)
+
+        layer.weight = Parameter(dequantized, requires_grad=False)
         layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+        layer._mxfp8_predequantized = True
 
     def apply_weights(
         self,
@@ -42,19 +51,26 @@ class EmulationMxfp8LinearKernel(Mxfp8LinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        weight_scale = layer.weight_scale
-        if weight_scale.dtype != MXFP8_SCALE_DTYPE:
-            raise ValueError(
-                f"Emulation backend requires {MXFP8_SCALE_DTYPE} "
-                f"weight_scale dtype, got {weight_scale.dtype}."
-            )
-        if weight_scale.ndim != 2:
-            raise ValueError(
-                f"Emulation backend requires 2D weight_scale, "
-                f"got {weight_scale.ndim}D. "
-                f"Ensure process_weights_after_loading was called."
-            )
+        weight = layer.weight
+        # process_weights_after_loading already materialized the FP16 weight.
+        if not getattr(layer, "_mxfp8_predequantized", False):
+            weight_scale = layer.weight_scale
+            if weight_scale.dtype != MXFP8_SCALE_DTYPE:
+                raise ValueError(
+                    f"Emulation backend requires {MXFP8_SCALE_DTYPE} "
+                    f"weight_scale dtype, got {weight_scale.dtype}."
+                )
+            if weight_scale.ndim != 2:
+                raise ValueError(
+                    f"Emulation backend requires 2D weight_scale, "
+                    f"got {weight_scale.ndim}D. "
+                    f"Ensure process_weights_after_loading was called."
+                )
+            weight = dequant_mxfp8_to_bf16(weight, weight_scale)
 
-        weight_bf16 = dequant_mxfp8_to_bf16(layer.weight, weight_scale)
-        output = torch.nn.functional.linear(x, weight_bf16, bias)
+        # Follow the activation dtype: SM70 devices run FP16, where a BF16
+        # weight would not match mat1 and torch rejects the GEMM outright.
+        if weight.dtype != x.dtype:
+            weight = weight.to(x.dtype)
+        output = torch.nn.functional.linear(x, weight, bias)
         return output.to(x.dtype)

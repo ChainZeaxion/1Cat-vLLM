@@ -909,6 +909,18 @@ class SpeculativeConfig:
                 self.prompt_lookup_max = 0
                 self.prompt_lookup_min = 0
 
+            # [gguf-lineb] dflash family 不走上方 mtp/eagle 的 quantization 继承
+            # 分支。草稿是本地 .gguf 文件时必须以 "gguf" 量化方法构造
+            # draft_model_config，否则 get_draft_quant_config 返回 None，
+            # fc 等 linear 落 UnquantizedLinearMethod，而 GGUF 权重迭代器
+            # 仍产出 fc.qweight_type → KeyError。
+            if (
+                not self.quantization
+                and self.model is not None
+                and is_gguf(self.model)
+            ):
+                self.quantization = "gguf"
+
             if self.model is not None:
                 self.draft_model_config = ModelConfig(
                     model=self.model,

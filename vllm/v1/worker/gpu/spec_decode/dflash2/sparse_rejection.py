@@ -92,13 +92,13 @@ def _compact_target_reference_rows_kernel(
     tl.store(reference_rows + row, reference)
 
 
-def _compact_target_reference_rows_gpu(
+def _compact_target_reference_flags(
     probe: torch.Tensor,
     temperatures: torch.Tensor,
     top_ps: torch.Tensor,
     row_to_request: torch.Tensor,
-) -> np.ndarray:
-    """Copy only fallback decisions, preserving the request-slot parameter map."""
+) -> torch.Tensor:
+    """Compute graph-capturable fallback flags with the request-slot map."""
     rows, width = probe.shape
     result = torch.empty(rows, device=probe.device, dtype=torch.bool)
     _compact_target_reference_rows_kernel[(rows,)](
@@ -113,7 +113,21 @@ def _compact_target_reference_rows_gpu(
         triton.next_power_of_2(width),
         num_warps=1,
     )
-    return result.cpu().numpy()
+    return result
+
+
+def _compact_target_reference_rows_gpu(
+    probe: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ps: torch.Tensor,
+    row_to_request: torch.Tensor,
+) -> np.ndarray:
+    """Copy only fallback decisions, preserving the request-slot parameter map."""
+    return (
+        _compact_target_reference_flags(probe, temperatures, top_ps, row_to_request)
+        .cpu()
+        .numpy()
+    )
 
 
 def _compact_target_reference_rows(
@@ -403,6 +417,8 @@ def try_dflash2_sparse_target_rejection(
     sample_hidden_states: torch.Tensor,
     input_batch: InputBatch,
     grammar_output: GrammarOutput | None,
+    *,
+    allow_graph: bool = True,
 ) -> SamplerOutput | DFlash2LogitsFallback | None:
     """Sample compact supports or retain computed logits for exact fallback."""
     if not sm70_dflash2_enabled(
@@ -425,12 +441,31 @@ def try_dflash2_sparse_target_rejection(
     sparse_draft_logits = speculator.get_sparse_draft_logits()
     if sparse_draft_logits is None:
         return None
+    if allow_graph:
+        from .sampler_graph import try_graph_rejection
+
+        # Exact device-side dispatch; returns None for any unsupported shape or
+        # contract so the host-decision path below stays the fallback.
+        graph_result = try_graph_rejection(
+            model,
+            speculator,
+            rejection_sampler,
+            sample_hidden_states,
+            input_batch,
+            sparse_draft_logits,
+        )
+        if graph_result is not None:
+            return graph_result
     draft_topk_ids, draft_topk_logits = sparse_draft_logits
     idx = input_batch.idx_mapping_np
     states = rejection_sampler.sampler.sampling_states
-    # Preserve the small single-request path. The large-vocabulary reference
-    # uses stable radix order; retain the existing fallback for other sorts.
-    retain_ties = idx.size > 1 and getattr(states, "vocab_size", 0) >= 32768
+    # The reference sampler dispatches on logit rows, not request count.
+    # A single q8 verifier has eight rows and uses the same large-vocabulary
+    # radix tie order as a batch. Retain every cutoff tie in that case too.
+    retain_ties = (
+        int(input_batch.cu_num_logits_np[-1]) >= 2
+        and getattr(states, "vocab_size", 0) >= 32768
+    )
     probe_k = _TARGET_PROBE_K if retain_ties else _TARGET_TOP_K + 1
     fallback = None
     if hasattr(model, "get_topk_tokens_and_logits_with_fallback"):
@@ -439,6 +474,22 @@ def try_dflash2_sparse_target_rejection(
                 sample_hidden_states, probe_k
             )
         )
+        import os as _os
+        if _os.environ.get("VLLM_GGUF_CAND_PROBE") and (not hasattr(model, "_vprobe_n") or model._vprobe_n < 4):
+            model._vprobe_n = getattr(model, "_vprobe_n", 0) + 1
+            try:
+                import vllm.logger as _vl
+                _lg = _vl.init_logger(__name__)
+                _hs = sample_hidden_states
+                _lg.info("VERIFY_PROBE rows=%s k=%s hidden[absmax=%.3g mean=%.3g nan=%s] ids0=%s vals0=%s",
+                         tuple(_hs.shape), probe_k,
+                         float(_hs.float().abs().max()), float(_hs.float().mean()),
+                         bool(torch.isnan(_hs.float()).any().item()),
+                         target_topk_ids[0, :6].tolist(),
+                         [round(v,2) for v in target_topk_logits[0, :6].tolist()])
+            except Exception as _e:
+                import vllm.logger as _vl
+                _vl.init_logger(__name__).info("VERIFY_PROBE err %s", _e)
     else:
         target_topk_ids, target_topk_logits = model.get_topk_tokens_and_logits(
             sample_hidden_states, probe_k

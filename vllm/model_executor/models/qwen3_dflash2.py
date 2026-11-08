@@ -273,6 +273,27 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             **conv_args, prefix=maybe_prefix(prefix, "mlp_conv")
         )
 
+        if (
+            self.use_sm70_bf16_emulation
+            and get_tensor_model_parallel_world_size() == 4
+            and current_platform.is_device_capability(
+                70, device_id=torch.accelerator.current_device_index()
+            )
+        ):
+            for projection in (
+                self.self_attn.qkv_proj,
+                self.self_attn.o_proj,
+                self.mlp.gate_up_proj,
+                self.mlp.down_proj,
+                self.attention_conv.kernel_projection,
+                self.mlp_conv.kernel_projection,
+            ):
+                if isinstance(projection.quant_method, UnquantizedLinearMethod):
+                    projection._sm70_dflash2_fp16_m8 = True
+                    projection._sm70_dflash2_fp8_m8 = (
+                        get_dflash_model_draft_tokens(speculative_config) == 7
+                    )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -532,6 +553,29 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
                 logits[..., -num_pad:] = -float("inf")
             values, ids = _topk(logits, selector.top_k)
             ids = ids.to(torch.int64) + self.lm_head.shard_indices.org_vocab_start_index
+            import os as _os
+            if _os.environ.get("VLLM_GGUF_CAND_PROBE"):
+                _r = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                if _r == 0 and (not hasattr(self, "_cand_probe_n") or self._cand_probe_n < 8):
+                    self._cand_probe_n = getattr(self, "_cand_probe_n", 0) + 1
+                    try:
+                        import vllm.logger as _vl
+                        _lg = _vl.init_logger(__name__)
+                        _hf = hidden_states.float()
+                        _lg.info("HIDDEN_PROBE rows=%s mean=%.4g absmax=%.4g nan=%s",
+                                 tuple(hidden_states.shape), float(_hf.mean()), float(_hf.abs().max()),
+                                 bool(torch.isnan(_hf).any().item()))
+                    except Exception as _e:
+                        pass
+                    _flat = ids[0].tolist()
+                    try:
+                        from transformers import AutoTokenizer as _AT
+                        _tk = _AT.from_pretrained(_os.environ.get("VLLM_GGUF_CAND_TOK", "/mnt/data1/modelfiles/Swift-1.5-Qwen3.8-27B-heretic-GSQ-RCO-GGUF"))
+                        _dbg = [(_i, _tk.decode([_i]), round(_v, 2)) for _i, _v in zip(_flat[:5], values[0, :5].tolist())]
+                    except Exception as _e:
+                        _dbg = _flat[:5]
+                    import vllm.logger as _vl
+                    _vl.init_logger(__name__).info("CAND_PROBE r=%s vals=%s %s", _r, [round(_v,2) for _v in values[0,:5].tolist()], _dbg)
         else:
             values, ids = local_candidates
 

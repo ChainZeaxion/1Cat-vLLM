@@ -153,14 +153,33 @@ class DFlashCudaGraphManager(CudaGraphManager):
                 warm_q = torch.zeros(
                     (1, 64, 128), dtype=torch.float16, device=device
                 )
+                # [2026-10-23] 形状必须与生产 ABI 逐项一致，否则等于没预热。
+                # part 核的 KS0/KS1/KS2 = k.stride(0..2)、PAGE = k.shape[1] 全是
+                # tl.constexpr ⇒ stride 不同就是全新编译变体。生产 paged KV 是
+                # (num_blocks, block_size, kv_heads_per_rank, head_dim)
+                # = (N, 1024, 2, 128)（draft num_kv_heads=8 / TP4 = 2），
+                # 旧值 (1, 1, 1024, 128) 编出 PAGE=1、KS1=131072 的错误变体，
+                # 生产首次调用仍要编译 ⇒ 在捕获流里 load_binary 报
+                # "operation not permitted when stream is capturing"。
                 warm_k = torch.zeros(
-                    (1, 1, 1024, 128), dtype=torch.float16, device=device
+                    (1, 1024, 2, 128), dtype=torch.float16, device=device
                 )
                 warm_v = torch.zeros_like(warm_k)
-                warm_tbl = torch.zeros((1, 1), dtype=torch.int32, device=device)
+                # [2026-10-23] SCALE 与 TS 也必须是生产的真实值，二者同为
+                # tl.constexpr，任一不同都编出无关变体（实测：SCALE 传 0.125
+                # 而生产是 128**-0.5≈0.0884 ⇒ 预热无效，捕获期照样首编崩溃）。
+                #   SCALE = self.scale = head_dim ** -0.5
+                #   TS    = block_table.stride(0)，即 max_num_blocks_per_req；
+                #           直接复用引擎的真实 block table 张量，避免猜宽度。
+                warm_tbl = block_tables.get_dummy_block_tables(1)[0]
                 warm_len = torch.full((1,), 8, dtype=torch.int32, device=device)
                 _split_fwd(
-                    warm_q, warm_k, warm_v, warm_tbl, warm_len, 0.125,
+                    warm_q,
+                    warm_k,
+                    warm_v,
+                    warm_tbl,
+                    warm_len,
+                    128 ** -0.5,
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning_once(

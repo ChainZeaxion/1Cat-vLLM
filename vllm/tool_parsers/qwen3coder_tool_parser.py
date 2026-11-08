@@ -40,6 +40,7 @@ from vllm.tool_parsers.utils import (
     extract_types_from_schema,
     find_common_prefix,
     find_tool_properties,
+    json_dumps_safe as _u_json_dumps_safe,
     missing_required_args as _u_missing_required_args,
     opt22d_should_force_all as _u_opt22d_should_force_all,
     registered_tool_names as _u_registered_tool_names,
@@ -122,6 +123,28 @@ _EX_TAGS = ("<example>", "</example>", "<etool_call>", "</etool_call>")
 # 用于判断本轮出现的工具是否落在需要流式增量显示的白名单内。
 # 要求右尖括号：分片中的 <function=Wri 不算已确名的工具，避免误判。
 _FN_TAG_RE = re.compile(r"<function=([A-Za-z0-9_.\-]+)>")
+
+# [2026-11-05] 并发工具调用的发送策略开关（**运行时文件开关，热重载即生效**）。
+#   默认（文件不存在）= coalesce：非白名单工具推迟到 finish，
+#       一次 delta 发出全部调用 ⇒ 客户端看到真并发（多个 tool_calls 同帧到达）。
+#   文件存在 = streaming：思考结束后即刻流式增量（10-21 f60ccfc 引入的行为），
+#       首帧延迟低，但多个调用会逐帧分离到达。
+#
+# 切换方式（无需重启）：
+#   touch  <flag>   # 切到 streaming（单发）
+#   rm -f  <flag>   # 切回 coalesce（并发）
+#   curl -X POST :8000/v1/internal/reload -d '{}'
+#
+# 先在函数内实时检查文件，热重载时也重新求值，双重保险。
+_TOOL_CALLS_STREAM_FLAG = os.environ.get(
+    "VLLM_TOOL_CALLS_STREAM_FLAG",
+    "/home/zeaxion/myproject/1cat-vllm-v130/.tool_calls_streaming",
+)
+
+
+def _coalesce_tool_calls() -> bool:
+    """True = 并发（一次发全部）；False = 流式逐帧（单发）。"""
+    return not os.path.exists(_TOOL_CALLS_STREAM_FLAG)
 
 # [2026-10-20] 思考域结束标记。Qwen3.5+ 的模板把 `<think>` 放在 prompt 里，
 # 生成侧只会出现 `</think>`；两种风格都用这一个判据即可。
@@ -997,6 +1020,15 @@ class Qwen3CoderToolParser(ToolParser):
         names = set(_FN_TAG_RE.findall(text))
         if not names:
             return False
+        if _coalesce_tool_calls():
+            # 并发模式：**非白名单**工具推迟到 finish，一次性发出全部调用。
+            # [2026-11-05] 白名单工具（Write/Edit/WebFetch）**必须保持流式**：
+            # 它们的 input_json_delta 就是客户端「打字机效果」的数据源
+            # （实测推迟后 1 个增量 vs 流式 30 个增量）。
+            # 故只在批次里出现非白名单工具时推迟；纯 Write/Edit 批次走流式
+            # ——这类批次的并发靠模型一次生成多个调用实现，客户端会拿到
+            # 连续的多个 tool_use 块。
+            return bool(names - self._STREAMING_TOOLS)
         if _THINK_CLOSE in text or self._thinking_ended:
             # 思考域已结束：之后的标签属正文，按普通调用流式解析。
             return False
@@ -1095,6 +1127,7 @@ class Qwen3CoderToolParser(ToolParser):
         # 非 _STREAMING_TOOLS 的工具不在流式阶段产出，统一推迟到 finish
         # 用完整文本解析（避免 thinking 内的标签被误当真实调用执行）。
         self._thinking_enabled: bool = True
+        self._coalesce_mode: bool = False
         self._deferred_used: bool = False
         # opt22e：EOS 强制收尾所需状态（见 `flush_streaming_finish`）
         self._opt22e_last_text: str = ""
@@ -2101,7 +2134,7 @@ class Qwen3CoderToolParser(ToolParser):
         return ToolCall(
             type="function",
             function=FunctionCall(
-                name=function_name, arguments=json.dumps(param_dict, ensure_ascii=False)
+                name=function_name, arguments=_u_json_dumps_safe(param_dict)
             ),
         )
 
@@ -2138,7 +2171,7 @@ class Qwen3CoderToolParser(ToolParser):
             type="function",
             function=FunctionCall(
                 name=name,
-                arguments=json.dumps(arguments, ensure_ascii=False),
+                arguments=_u_json_dumps_safe(arguments),
             ),
         )
 
@@ -2363,7 +2396,7 @@ class Qwen3CoderToolParser(ToolParser):
             if not isinstance(_args, str):
                 # [2026-10-20] 零参调用没有 `arguments` 键 ⇒ 缺省当 `{}`，
                 # 否则会下发字符串 "null"（下游 json.loads 得到 None）。
-                _args = json.dumps({} if _args is None else _args, ensure_ascii=False)
+                _args = _u_json_dumps_safe({} if _args is None else _args)
             tcs.append(
                 ToolCall(
                     type="function",
@@ -2570,8 +2603,17 @@ class Qwen3CoderToolParser(ToolParser):
         # 故必须在此处用「原始列表下标」做确定性编号。
         kept = []
         self._deferred_indices: list[int] = []
+        # [2026-11-05] 只有**确实有白名单工具走过流式路径**时才剔除它们。
+        # 混合批次（Read+Bash+Write+Edit）整体被推迟时，流式路径一个都没发过
+        # ⇒ 若无条件剔除，Write/Edit 会被流式和 deferred 两边都漏掉
+        # （实测：Read+Bash+Write+Edit 只返回 Read+Bash）。
+        _stream_path_sent = len(getattr(self, "streamed_args_for_tool", []) or []) > 0
         for _orig_idx, tc in enumerate(info.tool_calls or []):
-            if tc.function and tc.function.name in self._STREAMING_TOOLS:
+            if (
+                _stream_path_sent
+                and tc.function
+                and tc.function.name in self._STREAMING_TOOLS
+            ):
                 continue
             kept.append(tc)
             self._deferred_indices.append(_orig_idx)
@@ -2662,7 +2704,12 @@ class Qwen3CoderToolParser(ToolParser):
         # 推迟到 finish 用完整文本解析。拦截点放在 impl 之前——impl 的状态机
         # 不被推进，因而不会与 opt23 的 partial streaming（_partial_*）状态错位。
         self._thinking_enabled = self._thinking_enabled_of(request)
-        if self._thinking_enabled and self._should_defer_parsing(cur_m):
+        # [2026-11-05] 并发模式（_coalesce_tool_calls）不依赖思考开关：
+        # cc-haha 等客户端传 enable_thinking=false 时，原门控会让 deferred
+        # 整条路径不执行 ⇒ 多个工具调用退化成逐帧流式（实测间隔 200~650ms），
+        # 客户端看到的就是「一个个串行执行」。
+        self._coalesce_mode = _coalesce_tool_calls()
+        if (self._coalesce_mode or self._thinking_enabled) and self._should_defer_parsing(cur_m):
             self._deferred_used = True
             return None
         self._opt22d_force_all = self._opt22d_should_force_all(request, current_text)

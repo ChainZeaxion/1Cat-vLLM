@@ -17,6 +17,7 @@ from typing import Any, Literal
 
 import torch
 
+from vllm import envs
 from vllm.platforms import current_platform
 from vllm.triton_utils import triton
 
@@ -29,6 +30,56 @@ SUPPRESS_LEVEL = int(os.getenv("GDN_RECOMPUTE_SUPPRESS_LEVEL", "0"))
 
 # Default chunk size used across FLA triton kernels (kda, chunk, chunk_o, etc.)
 FLA_CHUNK_SIZE = 64
+
+
+def _pick_parity_config(configs, key_names, key_vals):
+    """Choose one deterministic config without falling back to the slowest.
+
+    Parity mode needs every process to run the *same* kernel config, but it
+    does not need that config to be the first (usually smallest) entry. Pick
+    the entry whose ``num_warps`` best matches the reduction width so the
+    single fixed config is also close to the tuned optimum.
+    """
+    # Width heuristic: derive the tile width from the autotune key values.
+    if key_names and key_vals:
+        key = dict(zip(key_names, key_vals))
+        width = key.get("D") or key.get("BD") or key.get("BT") or key.get("BS")
+    else:
+        width = None
+
+    def score(cfg):
+        warps = cfg.num_warps or 1
+        stages = cfg.num_stages or 1
+        if isinstance(width, int) and width > 0:
+            # One lane per element is the ideal: 32 lanes == 1 warp.
+            ideal = max(1.0, width / 32.0)
+            warp_penalty = abs(warps - ideal)
+        else:
+            # No width info: prefer the middle of the range (4 warps).
+            warp_penalty = abs(warps - 4)
+        # Fewer stages wins ties (lower smem pressure, same math).
+        return (warp_penalty, stages)
+
+    return min(configs, key=score)
+
+
+def parity_autotune(*args, **kwargs):
+    """Keep reduction tiles stable across processes in experimental parity mode.
+
+    Upstream pins ``configs[:1]``, which for these kernels is the smallest
+    ``num_warps`` in the list and costs a large throughput hit. We keep the
+    determinism requirement (exactly one config, identical on every rank) but
+    select the config that best fits the reduction width instead.
+    """
+    if envs.VLLM_SPECULATIVE_TOKEN_PARITY:
+        configs = kwargs.get("configs") or []
+        if len(configs) > 1:
+            kwargs["configs"] = [
+                _pick_parity_config(
+                    configs, kwargs.get("key"), ()
+                )
+            ]
+    return triton.autotune(*args, **kwargs)
 
 
 def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:

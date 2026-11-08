@@ -30,4 +30,9 @@ std::array<const LayoutConverter*, 2> GetConverters(DataType data_type,
 void* MakeStridedPtrs(const std::vector<std::pair<void*, int>>& ptrs, cudaStream_t stream);
 void* MakeBlockedPtrs(const std::vector<std::pair<void*, int>>& ptrs, cudaStream_t stream);
 
+// GGUF native layouts (ported from v153, see v153移植计划-20261027.md).
+std::array<const LayoutConverter*, 2> GetGgufBitPlaneConverters(int low_bits, int sm);
+std::array<const LayoutConverter*, 2> GetGgufLut4Converters(int sm);
+std::array<const LayoutConverter*, 2> GetGgufLatticeConverters(int source_type, int sm);
+
 }  // namespace turbomind::gemm

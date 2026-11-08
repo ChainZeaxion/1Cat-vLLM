@@ -114,9 +114,34 @@ def mxfp8_e4m3_quantize(
     return torch.ops.vllm.mxfp8_quantize(x, is_sf_swizzled_layout, alignment)
 
 
+def _e4m3fn_bits_to_float32(bits: torch.Tensor) -> torch.Tensor:
+    """Decode E4M3FN byte values held in a uint8 tensor to float32.
+
+    SM70 has no native FP8, so Triton refuses any kernel that touches a
+    float8_e4m3fn tensor. Decoding the raw byte stream with integer ops keeps
+    the value out of the fp8 dtype entirely and lets the graph compile.
+    """
+    raw = bits.to(torch.int32)
+    sign = (raw >> 7) & 0x1
+    exponent = (raw >> 3) & 0xF
+    mantissa = raw & 0x7
+    mantissa_f32 = mantissa.to(torch.float32)
+    normal = (1.0 + mantissa_f32 * 0.125) * torch.exp2(exponent.to(torch.float32) - 7.0)
+    subnormal = mantissa_f32 * 0.001953125  # 2**-9
+    magnitude = torch.where(exponent == 0, subnormal, normal)
+    value = torch.where(sign == 1, -magnitude, magnitude)
+    is_nan = (exponent == 0xF) & (mantissa == 0x7)
+    return torch.where(is_nan, torch.nan, value)
+
+
 def dequant_mxfp8_to_bf16(x: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     """Dequantize MXFP8 tensor to BF16."""
-    x_float = x.to(torch.float32)
+    # Read the fp8 payload as bytes: an fp8 dtype here would drag an fp8e4nv
+    # value into the generated Triton kernel, which SM70 cannot lower. The
+    # byte copy is deliberate -- a bare .view() stays an alias of the fp8
+    # tensor, so Inductor still sees fp8e4nv as a graph input.
+    bits = x.view(torch.uint8).to(torch.uint8)
+    x_float = _e4m3fn_bits_to_float32(bits)
 
     num_blocks = x.shape[-1] // MXFP8_BLOCK_SIZE
     x_blocked = x_float.view(*x.shape[:-1], num_blocks, MXFP8_BLOCK_SIZE)

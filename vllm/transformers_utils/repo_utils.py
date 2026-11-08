@@ -263,11 +263,15 @@ def _try_download_from_hf_hub(
     except huggingface_hub.errors.OfflineModeIsEnabled:
         return None
     except (
+        huggingface_hub.errors.HFValidationError,
         RepositoryNotFoundError,
         RevisionNotFoundError,
         EntryNotFoundError,
         LocalEntryNotFoundError,
     ) as e:
+        # [gguf-lineb] 草稿是本地 .gguf 文件路径时（非 repo id / 目录），
+        # mask_embedding.pt 这类可选附件查找会先落进这里；HFValidationError
+        # （非法 repo id）必须当"文件不存在"处理而不是往上炸。
         logger.debug("File or repository not found in hf_hub_download: %s", e)
         return None
     except HfHubHTTPError as e:

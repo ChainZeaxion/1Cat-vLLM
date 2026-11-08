@@ -973,7 +973,12 @@ def override_envs_for_invariance():
 
 def init_batch_invariance():
     # this will hit all the csrc overrides as well
-    if envs.VLLM_BATCH_INVARIANT:
+    # Upstream #62851: speculative token parity reuses the batch-invariant
+    # matmul/softmax paths, so it needs the same init. Without this the
+    # `linear_batch_invariant` calls stay half-wired (no Triton persistent
+    # matmul override, no deterministic cuBLAS), which both loses the
+    # invariance and slows capture.
+    if envs.VLLM_BATCH_INVARIANT or envs.VLLM_SPECULATIVE_TOKEN_PARITY:
         override_envs_for_invariance()
         enable_batch_invariant_mode()
 

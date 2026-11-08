@@ -550,6 +550,11 @@ class Sm70GgufConfig:
     banks are transcoded once per chunk; sub-batches bound the routed
     activations (about 50 KiB per token at top-10)."""
 
+    expert_load_prefetch_banks: int = Field(default=4, ge=1, le=4)
+    """Banks queued in pinned host memory during original expert loading.
+    One reduces startup transient reservation; runtime expert placement,
+    weights and computation remain unchanged."""
+
     dense_storage: Literal["canonical", "original"] = "canonical"
     """Keep calibrated canonical projections or dispatch original packed rows."""
 
@@ -1123,6 +1128,8 @@ class KernelConfig:
                 entries.pop("active", None)
                 entries.pop("sources", None)
                 entries.pop("legacy", None)
+                if family == "gguf":
+                    entries.pop("expert_load_prefetch_banks", None)
                 for field, alias in getattr(
                     getattr(self, name), "loader_aliases", {}
                 ).items():

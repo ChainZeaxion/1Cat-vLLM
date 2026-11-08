@@ -227,6 +227,7 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    VLLM_SPECULATIVE_TOKEN_PARITY: bool = False
     VLLM_TRITON_ATTN_USE_TD: bool | None = None
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
@@ -1513,6 +1514,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "Enable batch-invariant mode: deterministic results regardless of "
             "batch composition. Requires NVIDIA GPU with compute capability >="
             " 9.0."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_SPECULATIVE_TOKEN_PARITY": env_var(
+        lambda: bool(int(os.getenv("VLLM_SPECULATIVE_TOKEN_PARITY", "0"))),
+        description=(
+            "Experimental common arithmetic for target-only/speculative "
+            "comparisons. Narrower than batch invariance and does not enable "
+            "GDN batch-invariant cumulative reductions."
         ),
         category="configuration",
         declared_default="False",

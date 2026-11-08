@@ -127,9 +127,21 @@ class KVCacheCoordinator(ABC):
             return (request.num_tokens - 1, request.num_tokens)
         resend = (request.num_tokens - 1) // alignment * alignment
         extension = request.num_tokens // alignment * alignment
-        return tuple(
-            sorted({max(resend - alignment, 0), max(extension - alignment, 0)})
-        )
+        # Upstream #59146/#59175: keep the prompt-end boundary itself. Shifting
+        # every candidate one block earlier (the previous behaviour) skipped
+        # the reusable prompt-end checkpoint, so the next request extending
+        # this prompt missed the whole prefix. Keep the earlier neighbour too,
+        # which still serves an exact resend.
+        boundaries = {
+            max(resend, 0),
+            max(extension, 0),
+            max(resend - alignment, 0),
+            max(extension - alignment, 0),
+        }
+        if not request.num_output_tokens:
+            # Prefill chunk: drop anything beyond the current prompt frontier.
+            boundaries = {b for b in boundaries if b <= request.num_tokens}
+        return tuple(sorted(boundaries))
 
     def _cache_manager_blocks(
         self,

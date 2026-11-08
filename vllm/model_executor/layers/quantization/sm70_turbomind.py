@@ -9,6 +9,7 @@ import torch
 from vllm import envs
 from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
     register_layer_workspace,
+    workspace_pool,
 )
 from vllm.platforms import current_platform
 
@@ -50,7 +51,7 @@ _nvfp4_qpn4_dense_workspaces: dict[tuple, torch.Tensor] = {}
 
 def clear_sm70_turbomind_workspaces() -> None:
     """Release process-global NVFP4 QPN4 dense workspaces."""
-    _nvfp4_qpn4_dense_workspaces.clear()
+    workspace_pool("_nvfp4_qpn4_dense_workspaces", _nvfp4_qpn4_dense_workspaces).clear()
     from vllm.model_executor.layers.quantization.utils.nvfp4_qpn2_dequant import (
         clear_nvfp4_qpn2_dense_workspaces,
     )
@@ -682,7 +683,9 @@ def get_nvfp4_qpn4_dense_workspace(weight: torch.Tensor) -> torch.Tensor | None:
         device_index = torch.accelerator.current_device_index()
     elements = max(NVFP4_QPN4_DENSE_WORKSPACE_ELEMENTS, weight.numel() * 2)
     cache_key = (device_index, torch.float16, elements)
-    workspace = _nvfp4_qpn4_dense_workspaces.get(cache_key)
+    workspace = workspace_pool(
+        "_nvfp4_qpn4_dense_workspaces", _nvfp4_qpn4_dense_workspaces
+    ).get(cache_key)
     if workspace is not None:
         return workspace
     try:
@@ -693,7 +696,9 @@ def get_nvfp4_qpn4_dense_workspace(weight: torch.Tensor) -> torch.Tensor | None:
         )
     except torch.OutOfMemoryError:
         return None
-    _nvfp4_qpn4_dense_workspaces[cache_key] = workspace
+    workspace_pool("_nvfp4_qpn4_dense_workspaces", _nvfp4_qpn4_dense_workspaces)[
+        cache_key
+    ] = workspace
     return workspace
 
 

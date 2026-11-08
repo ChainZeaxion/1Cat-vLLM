@@ -439,7 +439,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
         sm70_out = _maybe_sm70_dense_forward(layer, x, bias)
         if sm70_out is not None:
             return sm70_out
-        if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
+        if (
+            envs.VLLM_BATCH_INVARIANT or envs.VLLM_SPECULATIVE_TOKEN_PARITY
+        ) and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
         # [共存门控 2026-10-16] 原为 `layer._layer_trace.unquant_debug` /
         # `layer._layer_execution_policy.dense_max_m`（另一会话新增的

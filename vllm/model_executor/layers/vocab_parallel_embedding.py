@@ -774,7 +774,9 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         sm70_out = _maybe_sm70_lm_head_forward(layer, x, bias)
         if sm70_out is not None:
             return sm70_out
-        if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
+        if (
+            envs.VLLM_BATCH_INVARIANT or envs.VLLM_SPECULATIVE_TOKEN_PARITY
+        ) and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 

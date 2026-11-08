@@ -1134,7 +1134,10 @@ class OpenAIServingChat(OpenAIServing):
                             tool_parser
                             and previous_texts is not None
                             and reasoning_parser is not None
-                            and getattr(tool_parser, "_thinking_enabled", False)
+                            and (
+                                getattr(tool_parser, "_thinking_enabled", False)
+                                or getattr(tool_parser, "_coalesce_mode", False)
+                            )
                             and getattr(tool_parser, "_deferred_used", False)
                         ):
                             # [本地 2026-10-13] 捕获「已流式下发」的调用数，供下方

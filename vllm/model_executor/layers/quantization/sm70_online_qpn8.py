@@ -18,6 +18,9 @@ from vllm import _sm70_ops as sm70_ops
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
+    workspace_pool,
+)
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 
@@ -95,12 +98,13 @@ def _workspace(weight: torch.Tensor) -> torch.Tensor:
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
     key = (device_index, weight.dtype)
-    workspace = _workspaces.get(key)
+    pool = workspace_pool("online_qpn8", _workspaces)
+    workspace = pool.get(key)
     if workspace is None:
         workspace = torch.empty(
             (_WORKSPACE_ELEMENTS,), dtype=torch.float16, device=weight.device
         )
-        _workspaces[key] = workspace
+        pool[key] = workspace
     return workspace
 
 
@@ -108,14 +112,15 @@ def _hc_workspace(weight: torch.Tensor) -> torch.Tensor:
     device_index = weight.device.index
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
-    partials = _hc_partials.get(device_index)
+    pool = workspace_pool("online_qpn8_hc", _hc_partials)
+    partials = pool.get(device_index)
     if partials is None:
         partials = torch.empty(
             (32 * _HC_DOWN_PADDED_N,),
             dtype=torch.float32,
             device=weight.device,
         )
-        _hc_partials[device_index] = partials
+        pool[device_index] = partials
     return partials
 
 

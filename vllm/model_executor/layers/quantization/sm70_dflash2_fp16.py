@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Exact FP16 storage for the small DFlash2 verifier's dense projections."""
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -20,8 +22,15 @@ _GEOMETRY = {
 }
 
 
+def _m8_enabled() -> bool:
+    """Runtime gate for the ported M8 route (see patches/opt-m8-fp16)."""
+    return os.getenv("VLLM_SM70_DFLASH2_FP16_M8", "0") == "1"
+
+
 def prepare_dflash2_fp16_m8(layer: torch.nn.Module) -> bool:
     if not getattr(layer, "_sm70_dflash2_fp16_m8", False):
+        return False
+    if not _m8_enabled():
         return False
     if envs.VLLM_BATCH_INVARIANT:
         return False
@@ -82,7 +91,7 @@ def apply_dflash2_fp16_m8(
         or not x.is_contiguous()
     ):
         return None
-    if not torch.compiler.is_compiling() and x.shape[0] != 8:
+    if x.shape[0] != 8:
         return None
     output = x.new_empty((x.shape[0], layer.weight.shape[0]))
     tile, warps = layer._sm70_dflash2_fp16_geometry
